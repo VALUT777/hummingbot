@@ -18,6 +18,7 @@ from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_api_uti
     decimal_to_exchange_int,
     exact_int,
     extract_account_snapshot,
+    leverage_from_account_margin_percentage,
     markets_by_exchange_symbol,
     markets_by_id,
     markets_by_trading_pair,
@@ -995,11 +996,10 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             if size is None or sign is None or not sign.is_finite() or not valid_sign:
                 raise IOError("Lighter account snapshot contains an invalid position size or sign.")
             net_position += size * sign
-            fraction = strict_non_negative_decimal(raw_position.get("initial_margin_fraction"))
-            if fraction is not None and fraction > 1:
-                fraction /= Decimal("10000")
-            if fraction is not None and fraction > 0:
-                account_leverage = Decimal("1") / fraction
+            account_leverage = leverage_from_account_margin_percentage(
+                raw_position.get("initial_margin_fraction")
+            )
+            if account_leverage is not None:
                 leverage = account_leverage
                 leverage_confirmed = True
 
@@ -1073,7 +1073,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             )
         else:
             private_stream_connected = user_stream_last_recv_time > 0
-        order_book_data_source = getattr(getattr(self, "_order_book_tracker", None), "data_source", None)
+        order_book_data_source = getattr(getattr(self, "order_book_tracker", None), "data_source", None)
         public_ws = getattr(order_book_data_source, "_ws_assistant", None)
         public_last_recv_time = getattr(public_ws, "last_recv_time", 0)
         return {
@@ -1253,13 +1253,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         leverage = Decimal("1")
         initial_margin_fraction = raw_position.get("initial_margin_fraction")
         if initial_margin_fraction not in (None, "", "0", 0):
-            try:
-                margin_fraction = self._safe_decimal(initial_margin_fraction)
-                if margin_fraction > 1:
-                    margin_fraction /= Decimal("10000")
-                leverage = Decimal("1") / margin_fraction
-            except Exception:
-                leverage = Decimal("1")
+            leverage = leverage_from_account_margin_percentage(initial_margin_fraction) or Decimal("1")
 
         return Position(
             trading_pair=market.trading_pair,

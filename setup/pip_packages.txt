@@ -1,1 +1,2 @@
 eip712-structs
+appnope==0.1.4; sys_platform == "darwin"

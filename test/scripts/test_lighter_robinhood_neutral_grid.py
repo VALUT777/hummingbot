@@ -361,6 +361,54 @@ async def test_idle_private_heartbeat_older_than_data_age_is_still_healthy():
 
 
 @pytest.mark.asyncio
+async def test_freshness_pause_reason_identifies_each_failed_signal():
+    connector = FakeRobinhoodConnector()
+    connector.snapshots = [{
+        **snapshot("stale", fetched_at=80),
+        "request_started_at": Decimal("70"),
+        "public_data_last_recv_time": Decimal("60"),
+        "private_stream_last_recv_time": Decimal("20"),
+        "private_stream_connected": False,
+    }]
+    with patch("hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator"), patch(
+        "hummingbot.strategy.strategy_v2_base.MarketDataProvider"
+    ):
+        strategy = RecordingGrid({CONNECTOR: connector}, enabled_config())
+    strategy.start(MagicMock(), 99)
+    strategy.tick(100)
+    await asyncio.sleep(0)
+    strategy.tick(101)
+    await asyncio.sleep(0)
+    strategy.tick(102)
+
+    assert "request_age=32" in strategy._pause_reason
+    assert "fetch_age=22" in strategy._pause_reason
+    assert "request_duration=10" in strategy._pause_reason
+    assert "public_age=42" in strategy._pause_reason
+    assert "private_age=82" in strategy._pause_reason
+    assert "private_connected=False" in strategy._pause_reason
+    await strategy.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_nonfinite_freshness_timestamp_pauses_without_decimal_arithmetic():
+    connector = FakeRobinhoodConnector()
+    connector.snapshots = [{**snapshot("invalid-time"), "request_started_at": Decimal("sNaN")}]
+    with patch("hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator"), patch(
+        "hummingbot.strategy.strategy_v2_base.MarketDataProvider"
+    ):
+        strategy = RecordingGrid({CONNECTOR: connector}, enabled_config())
+    strategy.start(MagicMock(), 99)
+    for timestamp in (100, 101, 102):
+        strategy.tick(timestamp)
+        await asyncio.sleep(0)
+
+    assert strategy.state is GridState.PAUSED
+    assert "timestamps_finite=False" in strategy._pause_reason
+    await strategy.on_stop()
+
+
+@pytest.mark.asyncio
 async def test_throttled_snapshot_older_than_data_age_is_rejected():
     connector = FakeRobinhoodConnector()
     delayed = {**snapshot("delayed", fetched_at=100), "request_started_at": Decimal("80")}
@@ -1089,10 +1137,10 @@ async def test_real_lighter_snapshot_contract_reconciles_strategy_then_quotes():
     connector._trading_rules = {PAIR: market.trading_rule(collateral_token="USDG")}
     stream_time = time.time()
     connector._user_stream_tracker = SimpleNamespace(last_recv_time=stream_time)
-    connector._order_book_tracker = SimpleNamespace(
+    connector._set_order_book_tracker(SimpleNamespace(
         ready=True,
         data_source=SimpleNamespace(_ws_assistant=SimpleNamespace(last_recv_time=stream_time)),
-    )
+    ))
     connector.get_price = MagicMock(side_effect=lambda _pair, is_buy: Decimal("1.21" if is_buy else "1.19"))
     account = {
         "accounts": [{
@@ -1102,7 +1150,7 @@ async def test_real_lighter_snapshot_contract_reconciles_strategy_then_quotes():
                 "asset_id": 3, "symbol": "USDG", "margin_balance": "500", "locked_balance": "0"
             }],
             "positions": [{
-                "market_id": 5, "position": "0", "sign": 0, "initial_margin_fraction": 2000
+                "market_id": 5, "position": "0", "sign": 0, "initial_margin_fraction": "20.00"
             }],
         }]
     }

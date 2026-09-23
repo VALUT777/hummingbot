@@ -87,6 +87,7 @@ export MAMBA_ROOT_PREFIX="$HB_RUNTIME_ROOT/mamba-root"
   -f setup/environment.yml python=3.12
 "$HB_RUNTIME_ROOT/env/bin/python" -m pip install \
   'numpy>=2.2.6,<2.3' 'numba==0.61.2' 'cryptography>=48.0.1,<49'
+"$HB_RUNTIME_ROOT/env/bin/python" -m pip install --no-deps -r setup/pip_packages.txt
 "$HB_RUNTIME_ROOT/env/bin/python" -m pip check
 "$HB_RUNTIME_ROOT/env/bin/python" setup.py build_ext --inplace
 ln -sfn "$PWD/bin/hbot" "$HB_RUNTIME_ROOT/env/bin/hbot"

@@ -298,14 +298,33 @@ class LighterRobinhoodNeutralGrid(StrategyV2Base):
         now = Decimal(str(self._now))
         max_age = Decimal(str(self.config.max_data_age_seconds))
         private_max_age = Decimal(str(self.PRIVATE_STREAM_MAX_AGE_SECONDS))
-        if (not fetched_at.is_finite() or not request_started_at.is_finite()
-                or not public_at.is_finite() or not private_at.is_finite()
-                or request_started_at <= 0 or fetched_at < request_started_at or now < fetched_at
-                or now - request_started_at > max_age or fetched_at - request_started_at > max_age
-                or now - fetched_at > max_age or now - public_at > max_age
-                or now - private_at > private_max_age
-                or account_snapshot.get("private_stream_connected") is not True):
-            self._pause("stale or disconnected public/private data", drain=True)
+        private_connected = account_snapshot.get("private_stream_connected") is True
+        timestamps_finite = all(
+            value.is_finite() for value in (fetched_at, request_started_at, public_at, private_at)
+        )
+        if timestamps_finite:
+            request_age = now - request_started_at
+            request_duration = fetched_at - request_started_at
+            fetch_age = now - fetched_at
+            public_age = now - public_at
+            private_age = now - private_at
+            freshness_failed = (
+                request_started_at <= 0 or request_duration < 0 or fetch_age < 0
+                or request_age > max_age or request_duration > max_age or fetch_age > max_age
+                or public_age > max_age or private_age > private_max_age or not private_connected
+            )
+        else:
+            request_age = fetch_age = request_duration = public_age = private_age = "nonfinite"
+            freshness_failed = True
+        if freshness_failed:
+            self._pause(
+                "stale or disconnected public/private data: "
+                f"request_age={request_age}s, fetch_age={fetch_age}s, "
+                f"request_duration={request_duration}s, public_age={public_age}s, "
+                f"private_age={private_age}s, private_connected={private_connected}, "
+                f"timestamps_finite={timestamps_finite}",
+                drain=True,
+            )
             return
         known_ids = self._owned_order_ids | self._recovery_order_ids
         if self.state is GridState.DRAINING and revision != self._last_cancel_retry_revision:

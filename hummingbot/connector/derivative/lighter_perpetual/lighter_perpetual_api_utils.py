@@ -26,6 +26,17 @@ def exact_int(value: Any, field_name: str) -> int:
     raise ValueError(f"{field_name} must be an exact integer")
 
 
+def leverage_from_account_margin_percentage(value: Any) -> Optional[Decimal]:
+    """Convert the account-position margin percentage (for example ``20.00``) to leverage."""
+    try:
+        percentage = Decimal(str(value))
+    except Exception:
+        return None
+    if not percentage.is_finite() or percentage <= 0:
+        return None
+    return Decimal("100") / percentage
+
+
 @dataclass(frozen=True)
 class LighterMarketInfo:
     market_id: int

@@ -143,10 +143,10 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
         self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
         self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
         self.exchange._user_stream_tracker = SimpleNamespace(last_recv_time=123.0)
-        self.exchange._order_book_tracker = SimpleNamespace(
+        self.exchange._set_order_book_tracker(SimpleNamespace(
             ready=True,
             data_source=SimpleNamespace(_ws_assistant=SimpleNamespace(last_recv_time=124.0)),
-        )
+        ))
         account = {
             "accounts": [{
                 "account_index": self.ACCOUNT_INDEX,
@@ -156,7 +156,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
                 }],
                 "positions": [{
                     "market_id": 1, "position": "12", "sign": -1,
-                    "initial_margin_fraction": 2000,
+                    "initial_margin_fraction": "20.00",
                 }],
             }]
         }
@@ -387,7 +387,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
                     "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "30"
                 }],
                 "positions": [{
-                    "market_id": 1, "position": "0", "sign": 0, "initial_margin_fraction": 2000
+                    "market_id": 1, "position": "0", "sign": 0, "initial_margin_fraction": "20.00"
                 }],
             }]
         }
@@ -611,7 +611,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
         self.assertEqual("unknown", snapshot["orders_by_client_id"]["991"]["status"])
         self.assertTrue(snapshot["pending_submissions_unknown"])
 
-    def test_robinhood_position_parses_basis_point_margin_fraction_as_leverage(self):
+    def test_robinhood_position_parses_percentage_margin_fraction_as_leverage(self):
         position = self.exchange._parse_position(
             {
                 "market_id": 1,
@@ -619,7 +619,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
                 "sign": 1,
                 "unrealized_pnl": "3.5",
                 "avg_entry_price": "0.50",
-                "initial_margin_fraction": 2000,
+                "initial_margin_fraction": "20.00",
             }
         )
 
@@ -1015,7 +1015,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
                     "position": str(order.amount),
                     "avg_entry_price": str(order.price),
                     "unrealized_pnl": str(unrealized_pnl),
-                    "initial_margin_fraction": str(Decimal("1") / lev),
+                    "initial_margin_fraction": str(Decimal("100") / lev),
                 }
             },
         }
@@ -1872,7 +1872,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
             "position": "2",
             "avg_entry_price": "2500",
             "unrealized_pnl": "12.5",
-            "initial_margin_fraction": "0.1",
+            "initial_margin_fraction": "10.00",
         }
         position = self.exchange._parse_position(raw)
         self.assertIsNotNone(position)
