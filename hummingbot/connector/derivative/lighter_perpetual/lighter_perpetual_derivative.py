@@ -800,7 +800,13 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             ),
             self._api_get(
                 path_url=CONSTANTS.TRADES_PATH_URL,
-                params={"account_index": self._account_index, "market_id": market.market_id, "limit": 100},
+                params={
+                    "account_index": self._account_index,
+                    "market_id": market.market_id,
+                    "sort_by": "trade_id",
+                    "sort_dir": "desc",
+                    "limit": 100,
+                },
                 is_auth_required=True,
             ),
             self._api_get(path_url=CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL),

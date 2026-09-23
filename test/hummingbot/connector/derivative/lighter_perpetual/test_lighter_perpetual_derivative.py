@@ -170,8 +170,11 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
             "ask_client_id_str": "11", "ask_id_str": "21", "is_maker_ask": True,
         }
         trades = {"trades": {"1": [trade, dict(trade)]}}
+        trade_request_params = []
 
         async def api_get(path_url, **kwargs):
+            if path_url == CONSTANTS.TRADES_PATH_URL:
+                trade_request_params.append(kwargs.get("params"))
             return {
                 CONSTANTS.BALANCE_PATH_URL: account,
                 CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: active,
@@ -206,6 +209,16 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
         self.assertTrue(snapshot["market_tradable"])
         self.assertFalse(snapshot["force_reduce_only"])
         self.assertLessEqual(snapshot["request_started_at"], snapshot["fetched_at"])
+        self.assertEqual(
+            [{
+                "account_index": self.ACCOUNT_INDEX,
+                "market_id": 1,
+                "sort_by": "trade_id",
+                "sort_dir": "desc",
+                "limit": 100,
+            }],
+            trade_request_params,
+        )
 
     def test_grid_snapshot_fails_closed_on_malformed_terminal_fill_and_missing_positions(self):
         self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN

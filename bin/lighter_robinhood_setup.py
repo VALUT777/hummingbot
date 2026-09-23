@@ -310,6 +310,11 @@ def run_wizard(services: Services, console: Console, *, config_path: Path = CONF
                 "Найден зашифрованный API-ключ. Использовать его без повторного ввода? [Y/n]: "
             ).strip().lower()
             reuse_saved = choice in ("", "y", "yes", "д", "да")
+            if reuse_saved:
+                console.tell(
+                    "Будет использован сохранённый зашифрованный API-ключ; "
+                    "вводить ключ и индексы заново не нужно."
+                )
 
         credentials: Optional[CollectedCredentials] = None
         if not reuse_saved:
@@ -415,6 +420,8 @@ def run_wizard(services: Services, console: Console, *, config_path: Path = CONF
         reloaded = services.load_credentials()
         if not _same_credentials(credentials, reloaded):
             raise RuntimeError("Проверка зашифрованного сохранения не совпала с введёнными индексами/ключом")
+        if needs_persist:
+            console.tell("API-ключ и индексы сохранены в зашифрованном хранилище для следующих запусков.")
 
         required = getattr(report, "required_margin_usdg", None)
         console.tell(

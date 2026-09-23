@@ -128,6 +128,32 @@ def test_wizard_accepts_live_ready_report_with_margin_warning(tmp_path):
     assert "LIVE READY WITH MARGIN WARNING" in "\n".join(console.output)
 
 
+def test_default_saved_credentials_reuse_skips_all_api_key_fields(tmp_path):
+    credential = CollectedCredentials(0, 4, "ab" * 40)
+    services = Services(
+        running=lambda: False,
+        new_password_required=lambda: False,
+        unlock=lambda password: None,
+        load_credentials=lambda: credential,
+        persist_credentials=lambda value: pytest.fail("saved credentials must not be rewritten"),
+        preflight=lambda candidate, credentials: Report(True),
+        launch=lambda password: pytest.fail("user canceled before launch"),
+        credentials_exist=lambda: True,
+    )
+    console = ScriptedConsole(
+        ["", "5", "5.5", "10", "25", "1000", "OFF", "cancel"],
+        ["storage-password"],
+    )
+
+    assert run_wizard(services, console, config_path=tmp_path / "grid.yml") == 0
+    prompts = [prompt for kind, prompt in console.events if kind in ("ask", "hidden")]
+    assert not any("Account Index" in prompt for prompt in prompts)
+    assert not any("API Key Index" in prompt for prompt in prompts)
+    assert not any("API Private Key" in prompt for prompt in prompts)
+    assert prompts.count("[10/10] Пароль Hummingbot: ") == 1
+    assert any("вводить ключ и индексы заново не нужно" in message for message in console.output)
+
+
 def test_actual_hummingbot_encryption_round_trip_contains_no_plaintext_key(tmp_path):
     path = tmp_path / "lighter_perpetual_robinhood.yml"
     private_key = "ab" * 40
@@ -356,6 +382,7 @@ def test_start_requires_two_live_preflights_and_reloaded_encrypted_credentials(t
     assert len(preflights) == 2
     assert stored == [CollectedCredentials(0, 4, "ab" * 40)]
     assert launches == ["storage-password"]
+    assert any("сохранены в зашифрованном хранилище" in message for message in console.output)
 
 
 def test_second_preflight_failure_never_enables_disk_config(tmp_path):
