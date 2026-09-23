@@ -245,9 +245,41 @@ def test_config_bounds_quantization_mins_and_cap_fail_closed(changes, expected):
     assert expected in report.summary()
 
 
+def test_nondefault_order_size_and_grid_levels_pass_public_config_validation():
+    config = {**CONFIG, "order_amount_base": "25", "grid_levels": 9}
+
+    report = run(run_public_preflight(FakePublicClient(), SuccessfulSdkProbe(), config=config))
+
+    assert report.exit_code(public_only=True) == 0
+    assert not any(check.status == "FAIL" and check.name.startswith("config") for check in report.checks)
+
+
+@pytest.mark.parametrize(
+    "changes, expected",
+    [
+        ({"grid_levels": 1}, "at least 2"),
+        ({"grid_levels": 20002}, "distinct exchange price ticks"),
+        ({"order_amount_base": "1000.01"}, "position cap"),
+    ],
+)
+def test_dynamic_grid_parameters_respect_technical_and_exposure_bounds(changes, expected):
+    report = run(run_public_preflight(
+        FakePublicClient(), SuccessfulSdkProbe(), config={**CONFIG, **changes}
+    ))
+
+    assert report.exit_code(public_only=True) == 1
+    assert expected in report.summary()
+
+
 @pytest.mark.parametrize(
     "field, value",
-    [("grid_levels", 21.5), ("grid_levels", True), ("leverage", 5.5), ("max_open_orders", 2.0)],
+    [
+        ("grid_levels", 21.5),
+        ("grid_levels", True),
+        ("grid_levels", "21"),
+        ("leverage", 5.5),
+        ("max_open_orders", 2.0),
+    ],
 )
 def test_config_integer_fields_reject_fractional_float_and_boolean_values(field, value):
     report = run(run_public_preflight(

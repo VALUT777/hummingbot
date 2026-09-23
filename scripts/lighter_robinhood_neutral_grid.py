@@ -1,12 +1,12 @@
 import asyncio
 import math
 import os
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from pydantic import model_validator
+from pydantic import StrictInt, model_validator
 
 from hummingbot import data_path
 from hummingbot.connector.connector_base import ConnectorBase
@@ -47,7 +47,7 @@ class LighterRobinhoodNeutralGridConfig(StrategyV2ConfigBase):
     trading_pair: str = TRADING_PAIR
     lower_price: Optional[Decimal] = None
     upper_price: Optional[Decimal] = None
-    grid_levels: int = 21
+    grid_levels: StrictInt = 21
     order_amount_base: Decimal = Decimal("10")
     max_abs_net_position: Decimal = Decimal("1000")
     leverage: int = 5
@@ -65,8 +65,12 @@ class LighterRobinhoodNeutralGridConfig(StrategyV2ConfigBase):
             raise ValueError("order amount and position cap must be finite and positive")
         if self.max_abs_net_position > Decimal("1000"):
             raise ValueError("max_abs_net_position cannot exceed 1000 LIT")
-        if self.grid_levels != 21 or self.max_open_orders != 2 or self.leverage != 5:
-            raise ValueError("this script requires 21 levels, two orders, and 5x leverage")
+        if self.grid_levels < 2:
+            raise ValueError("grid_levels must be an exact integer of at least 2")
+        if self.order_amount_base > self.max_abs_net_position:
+            raise ValueError("order_amount_base cannot exceed max_abs_net_position")
+        if self.max_open_orders != 2 or self.leverage != 5:
+            raise ValueError("this script requires two orders and 5x leverage")
         if (not math.isfinite(self.refresh_seconds) or not math.isfinite(self.max_data_age_seconds)
                 or self.refresh_seconds <= 0 or self.max_data_age_seconds <= 0):
             raise ValueError("refresh and freshness intervals must be positive")
@@ -98,11 +102,18 @@ def eligible_grid_prices(
 ) -> Tuple[Optional[Decimal], Optional[Decimal], List[Decimal]]:
     if count < 2 or price_increment <= 0:
         raise ValueError("grid needs at least two levels and a positive price increment")
+    first_tick = (lower / price_increment).to_integral_value(rounding=ROUND_CEILING)
+    last_tick = (upper / price_increment).to_integral_value(rounding=ROUND_FLOOR)
+    distinct_ticks = max(0, int(last_tick - first_tick + 1))
+    if count > distinct_ticks:
+        raise ValueError("grid_levels exceeds distinct exchange price ticks within bounds")
     step = (upper - lower) / Decimal(count - 1)
     levels = sorted(level for level in {
         ((lower + step * index) / price_increment).to_integral_value(rounding=ROUND_DOWN) * price_increment
         for index in range(count)
     } if lower <= level <= upper)
+    if len(levels) != count:
+        raise ValueError("grid levels collapse after runtime price quantization")
     midpoint = (best_bid + best_ask) / Decimal("2")
     bids = [level for level in levels if level > 0 and level < best_ask and level < midpoint]
     asks = [level for level in levels if level > best_bid and level > midpoint]
@@ -442,13 +453,13 @@ class LighterRobinhoodNeutralGrid(StrategyV2Base):
             return
         try:
             price_increment = self._price_increment(best_ask)
+            bid, ask, _ = eligible_grid_prices(
+                self.config.lower_price, self.config.upper_price, self.config.grid_levels,
+                price_increment, best_bid, best_ask,
+            )
         except ValueError as exc:
             self._pause(str(exc), drain=True)
             return
-        bid, ask, _ = eligible_grid_prices(
-            self.config.lower_price, self.config.upper_price, self.config.grid_levels,
-            price_increment, best_bid, best_ask,
-        )
         side_capacity = {
             "BUY": self.epoch.cap - self.epoch.baseline - self.epoch.reserved_buy,
             "SELL": self.epoch.cap + self.epoch.baseline - self.epoch.reserved_sell,

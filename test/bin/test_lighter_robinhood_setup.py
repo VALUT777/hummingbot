@@ -3,6 +3,7 @@ import getpass
 import warnings
 
 import pytest
+import typer
 import yaml
 
 from bin.lighter_robinhood_setup import (
@@ -25,12 +26,14 @@ from hummingbot.client.config.config_helpers import load_connector_config_map_fr
 from hummingbot.client.config.security import Security
 
 
-@pytest.mark.parametrize("value,minimum,maximum", [("0", 0, None), ("4", 4, 254), ("254", 4, 254)])
+@pytest.mark.parametrize(
+    "value,minimum,maximum", [("0", 0, None), (" 4 ", 4, 254), ("254", 4, 254)]
+)
 def test_parse_index_accepts_only_canonical_integers(value, minimum, maximum):
     assert parse_index(value, "index", minimum, maximum) == int(value)
 
 
-@pytest.mark.parametrize("value", ["", "01", "+4", "4.0", " 4", "4 ", "255", "True"])
+@pytest.mark.parametrize("value", ["", "01", "+4", "4.0", "255", "True"])
 def test_api_index_rejects_ambiguous_or_out_of_range_input(value):
     with pytest.raises(ValueError):
         parse_index(value, "API Key Index", 4, 254)
@@ -80,6 +83,16 @@ def test_candidate_is_live_in_memory_while_persisted_config_stays_disabled(tmp_p
     assert saved["margin_reserve_usdg"] == "100"
 
 
+def test_candidate_preserves_custom_order_size_and_integer_grid_levels():
+    candidate = build_candidate(
+        Decimal("4.5"), Decimal("6.5"), Decimal("100"), Decimal("12.5"), 31
+    )
+
+    assert candidate["order_amount_base"] == "12.5"
+    assert candidate["grid_levels"] == 31
+    assert type(candidate["grid_levels"]) is int
+
+
 def test_actual_hummingbot_encryption_round_trip_contains_no_plaintext_key(tmp_path):
     path = tmp_path / "lighter_perpetual_robinhood.yml"
     private_key = "ab" * 32
@@ -109,15 +122,135 @@ class ScriptedConsole:
         self.answers = iter(answers)
         self.secrets = iter(hidden)
         self.output = []
+        self.events = []
 
     def ask(self, prompt):
+        self.events.append(("ask", prompt))
         return next(self.answers)
 
     def hidden(self, prompt):
+        self.events.append(("hidden", prompt))
         return next(self.secrets)
 
     def tell(self, message=""):
+        self.events.append(("tell", message))
         self.output.append(message)
+
+
+def test_new_user_prompts_one_field_at_a_time_retrying_only_invalid_field(tmp_path):
+    config = tmp_path / "grid.yml"
+    stored = []
+    services = Services(
+        running=lambda: False,
+        new_password_required=lambda: False,
+        unlock=lambda password: None,
+        load_credentials=lambda: stored[-1] if stored else None,
+        persist_credentials=stored.append,
+        preflight=lambda candidate, credentials: Report(True),
+        launch=lambda password: pytest.fail("user canceled before launch"),
+    )
+    services.credentials_exist = lambda: False
+    console = ScriptedConsole(
+        ["bad-index", "0", " 4 ", "4.5", "6.5", "10", "21", "100", "OFF", "cancel"],
+        ["not-a-private-key", "  " + "ab" * 32 + "  ", "storage-password"],
+    )
+
+    assert run_wizard(services, console, config_path=config) == 0
+    prompts = [(kind, text) for kind, text in console.events if kind in ("ask", "hidden")]
+    labels = [text for _, text in prompts]
+    assert labels[:6] == [
+        "[1/10] Account Index: ",
+        "[1/10] Account Index: ",
+        "[2/10] API Key Index: ",
+        "[3/10] API Private Key (скрыто): ",
+        "[3/10] API Private Key (скрыто): ",
+        "[4/10] Нижняя цена LIT: ",
+    ]
+    assert labels.index("[10/10] Пароль Hummingbot: ") > labels.index("[9/10] Maker Only — введите OFF: ")
+    assert stored == [CollectedCredentials(0, 4, "ab" * 32)]
+
+
+def test_wrong_keystore_password_retries_after_all_values_without_reasking_key(tmp_path):
+    config = tmp_path / "grid.yml"
+    stored = []
+    attempts = []
+
+    def unlock(password):
+        attempts.append(password)
+        if password == "wrong-password":
+            raise typer.Exit(code=4)
+
+    services = Services(
+        running=lambda: False,
+        new_password_required=lambda: False,
+        unlock=unlock,
+        load_credentials=lambda: stored[-1] if stored else None,
+        persist_credentials=stored.append,
+        preflight=lambda candidate, credentials: Report(True),
+        launch=lambda password: pytest.fail("user canceled before launch"),
+        credentials_exist=lambda: False,
+    )
+    console = ScriptedConsole(
+        ["0", "4", "4.5", "6.5", "10", "21", "100", "OFF", "cancel"],
+        ["ab" * 32, "wrong-password", "correct-password"],
+    )
+
+    assert run_wizard(services, console, config_path=config) == 0
+    assert attempts == ["wrong-password", "correct-password"]
+    assert [event for event in console.events if event == ("hidden", "[3/10] API Private Key (скрыто): ")] == [
+        ("hidden", "[3/10] API Private Key (скрыто): ")
+    ]
+
+
+def test_fatal_keystore_error_does_not_loop_or_reset(tmp_path):
+    attempts = []
+
+    def unlock(password):
+        attempts.append(password)
+        raise OSError("keystore permission denied")
+
+    services = Services(
+        running=lambda: False,
+        new_password_required=lambda: False,
+        unlock=unlock,
+        load_credentials=lambda: None,
+        persist_credentials=lambda value: pytest.fail("must not persist"),
+        preflight=lambda candidate, credentials: pytest.fail("must not preflight"),
+        launch=lambda password: pytest.fail("must not launch"),
+        credentials_exist=lambda: False,
+    )
+    console = ScriptedConsole(
+        ["0", "4", "4.5", "6.5", "10", "21", "100", "OFF"],
+        ["ab" * 32, "storage-password"],
+    )
+
+    assert run_wizard(services, console, config_path=tmp_path / "grid.yml") == 1
+    assert attempts == ["storage-password"]
+    assert "permission denied" in "\n".join(console.output)
+
+
+def test_cancel_at_private_key_never_unlocks_or_starts(tmp_path):
+    config = tmp_path / "grid.yml"
+
+    class CancelAtPrivateKey(ScriptedConsole):
+        def hidden(self, prompt):
+            self.events.append(("hidden", prompt))
+            raise KeyboardInterrupt
+
+    services = Services(
+        running=lambda: False,
+        new_password_required=lambda: pytest.fail("password stage must not be reached"),
+        unlock=lambda password: pytest.fail("must not unlock"),
+        load_credentials=lambda: None,
+        persist_credentials=lambda value: pytest.fail("must not persist"),
+        preflight=lambda candidate, credentials: pytest.fail("must not preflight"),
+        launch=lambda password: pytest.fail("must not launch"),
+        credentials_exist=lambda: False,
+    )
+    console = CancelAtPrivateKey(["0", "4"], [])
+
+    assert run_wizard(services, console, config_path=config) == 130
+    assert not config.exists()
 
 
 class Report:
@@ -130,7 +263,7 @@ class Report:
 
 
 def _answers(start="START"):
-    return ["0", "4", "OFF", "4.5", "6.5", "100", start]
+    return ["0", "4", "4.5", "6.5", "10", "21", "100", "OFF", start]
 
 
 def test_failed_preflight_keeps_config_disabled_and_does_not_replace_credentials(tmp_path):
@@ -146,7 +279,7 @@ def test_failed_preflight_keeps_config_disabled_and_does_not_replace_credentials
         preflight=lambda candidate, credentials: Report(False),
         launch=lambda password: launched.append(password) or 0,
     )
-    console = ScriptedConsole(_answers(), ["storage-password", "storage-password", "ab" * 32])
+    console = ScriptedConsole(_answers(), ["ab" * 32, "storage-password", "storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 1
     assert yaml.safe_load(config.read_text())["enabled"] is False
@@ -182,7 +315,7 @@ def test_start_requires_two_live_preflights_and_reloaded_encrypted_credentials(t
         preflight=preflight,
         launch=launch,
     )
-    console = ScriptedConsole(_answers(), ["storage-password", "storage-password", "ab" * 32])
+    console = ScriptedConsole(_answers(), ["ab" * 32, "storage-password", "storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 0
     assert len(preflights) == 2
@@ -199,11 +332,12 @@ def test_second_preflight_failure_never_enables_disk_config(tmp_path):
         new_password_required=lambda: False,
         unlock=lambda password: None,
         load_credentials=lambda: credential,
+        credentials_exist=lambda: True,
         persist_credentials=lambda value: pytest.fail("existing credentials must not be rewritten"),
         preflight=lambda candidate, credentials: next(reports),
         launch=lambda password: pytest.fail("must not launch"),
     )
-    console = ScriptedConsole(["", "OFF", "4.5", "6.5", "100", "START"], ["storage-password"])
+    console = ScriptedConsole(["", "4.5", "6.5", "10", "21", "100", "OFF", "START"], ["storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 1
     assert yaml.safe_load(config.read_text())["enabled"] is False
@@ -218,11 +352,12 @@ def test_own_enabled_config_from_previous_stopped_run_can_be_reused(tmp_path):
         new_password_required=lambda: False,
         unlock=lambda password: None,
         load_credentials=lambda: credential,
+        credentials_exist=lambda: True,
         persist_credentials=lambda value: pytest.fail("must reuse"),
         preflight=lambda candidate, credentials: Report(True),
         launch=lambda password: pytest.fail("canceled before launch"),
     )
-    console = ScriptedConsole(["", "OFF", "", "", "", "cancel"], ["storage-password"])
+    console = ScriptedConsole(["", "", "", "", "", "", "OFF", "cancel"], ["storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 0
     assert yaml.safe_load(config.read_text())["enabled"] is False
@@ -236,11 +371,12 @@ def test_launch_exception_rolls_back_enabled_and_redacts_secret(tmp_path):
         new_password_required=lambda: False,
         unlock=lambda password: None,
         load_credentials=lambda: credential,
+        credentials_exist=lambda: True,
         persist_credentials=lambda value: pytest.fail("must reuse"),
         preflight=lambda candidate, credentials: Report(True),
         launch=lambda password: (_ for _ in ()).throw(OSError(f"failed with {credential.api_private_key}")),
     )
-    console = ScriptedConsole(["", "OFF", "4.5", "6.5", "100", "START"], ["storage-password"])
+    console = ScriptedConsole(["", "4.5", "6.5", "10", "21", "100", "OFF", "START"], ["storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 1
     assert yaml.safe_load(config.read_text())["enabled"] is False
@@ -255,11 +391,12 @@ def test_launch_output_is_redacted_before_display(tmp_path):
         new_password_required=lambda: False,
         unlock=lambda password: None,
         load_credentials=lambda: credential,
+        credentials_exist=lambda: True,
         persist_credentials=lambda value: None,
         preflight=lambda candidate, credentials: Report(True),
         launch=lambda password: LaunchResult(0, f"native output {credential.api_private_key}", True, True),
     )
-    console = ScriptedConsole(["", "OFF", "4.5", "6.5", "100", "START"], ["storage-password"])
+    console = ScriptedConsole(["", "4.5", "6.5", "10", "21", "100", "OFF", "START"], ["storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 0
     output = "\n".join(console.output)
@@ -275,11 +412,12 @@ def test_zero_return_without_fresh_matching_process_is_not_reported_started(tmp_
         new_password_required=lambda: False,
         unlock=lambda password: None,
         load_credentials=lambda: credential,
+        credentials_exist=lambda: True,
         persist_credentials=lambda value: None,
         preflight=lambda candidate, credentials: Report(True),
         launch=lambda password: LaunchResult(0, "accepted", False, False),
     )
-    console = ScriptedConsole(["", "OFF", "4.5", "6.5", "100", "START"], ["storage-password"])
+    console = ScriptedConsole(["", "4.5", "6.5", "10", "21", "100", "OFF", "START"], ["storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 1
     assert yaml.safe_load(config.read_text())["enabled"] is False
@@ -301,12 +439,13 @@ def test_nonzero_launch_does_not_trust_unrelated_running_bot(tmp_path):
         new_password_required=lambda: False,
         unlock=lambda password: None,
         load_credentials=lambda: credential,
+        credentials_exist=lambda: True,
         persist_credentials=lambda value: None,
         preflight=lambda candidate, credentials: Report(True),
         launch=lambda password: LaunchResult(1, "failed", False, False),
         running_this=lambda: False,
     )
-    console = ScriptedConsole(["", "OFF", "4.5", "6.5", "100", "START"], ["storage-password"])
+    console = ScriptedConsole(["", "4.5", "6.5", "10", "21", "100", "OFF", "START"], ["storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 1
     assert yaml.safe_load(config.read_text())["enabled"] is False
@@ -320,11 +459,12 @@ def test_nonzero_launch_with_exact_matching_process_is_reported_uncertain(tmp_pa
         new_password_required=lambda: False,
         unlock=lambda password: None,
         load_credentials=lambda: credential,
+        credentials_exist=lambda: True,
         persist_credentials=lambda value: None,
         preflight=lambda candidate, credentials: Report(True),
         launch=lambda password: LaunchResult(1, "timeout", True, False),
     )
-    console = ScriptedConsole(["", "OFF", "4.5", "6.5", "100", "START"], ["storage-password"])
+    console = ScriptedConsole(["", "4.5", "6.5", "10", "21", "100", "OFF", "START"], ["storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 2
     assert yaml.safe_load(config.read_text())["enabled"] is True

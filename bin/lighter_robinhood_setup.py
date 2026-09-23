@@ -45,8 +45,9 @@ class SecretInputUnavailable(RuntimeError):
 
 
 def parse_index(value: str, label: str, minimum: int, maximum: Optional[int] = None) -> int:
+    value = value.strip()
     if not _INTEGER.fullmatch(value):
-        raise ValueError(f"{label}: введите целое число без пробелов и знака +")
+        raise ValueError(f"{label}: введите целое число без знака +")
     parsed = int(value)
     if parsed < minimum or (maximum is not None and parsed > maximum):
         limit = f"{minimum}…{maximum}" if maximum is not None else f"не меньше {minimum}"
@@ -55,6 +56,7 @@ def parse_index(value: str, label: str, minimum: int, maximum: Optional[int] = N
 
 
 def normalize_api_private_key(value: str) -> str:
+    value = value.strip()
     normalized = value[2:] if value.startswith(("0x", "0X")) else value
     if not _HEX_KEY.fullmatch(normalized):
         raise ValueError("API Private Key должен содержать ровно 64 шестнадцатеричных символа")
@@ -85,9 +87,19 @@ def read_hidden(prompt: str, *, stdin=sys.stdin, getter=getpass.getpass) -> str:
         raise SecretInputUnavailable("Terminal не смог обеспечить скрытый ввод") from exc
 
 
-def build_candidate(lower: Decimal, upper: Decimal, reserve: Decimal) -> Dict[str, Any]:
+def build_candidate(
+    lower: Decimal,
+    upper: Decimal,
+    reserve: Decimal,
+    order_amount: Decimal = Decimal("10"),
+    grid_levels: int = 21,
+) -> Dict[str, Any]:
     if lower <= 0 or upper <= lower:
         raise ValueError("Нижняя граница должна быть больше нуля и меньше верхней")
+    if not order_amount.is_finite() or order_amount <= 0 or order_amount > Decimal("1000"):
+        raise ValueError("Размер заявки должен быть больше 0 и не больше 1000 LIT")
+    if isinstance(grid_levels, bool) or not isinstance(grid_levels, int) or grid_levels < 2:
+        raise ValueError("Количество уровней сетки должно быть целым числом не меньше 2")
     return {
         "script_file_name": "lighter_robinhood_neutral_grid.py",
         "controllers_config": [],
@@ -96,8 +108,8 @@ def build_candidate(lower: Decimal, upper: Decimal, reserve: Decimal) -> Dict[st
         "trading_pair": "LIT-USDG",
         "lower_price": str(lower),
         "upper_price": str(upper),
-        "grid_levels": 21,
-        "order_amount_base": "10",
+        "grid_levels": grid_levels,
+        "order_amount_base": str(order_amount),
         "max_abs_net_position": "1000",
         "leverage": 5,
         "max_open_orders": 2,
@@ -181,6 +193,7 @@ class Services:
     preflight: Callable[[Dict[str, Any], CollectedCredentials], Any]
     launch: Callable[[str], Any]
     running_this: Optional[Callable[[], bool]] = None
+    credentials_exist: Optional[Callable[[], bool]] = None
 
 
 @dataclass(frozen=True)
@@ -208,14 +221,12 @@ def _read_existing_config(path: Path) -> Dict[str, Any]:
         "controllers_config": [],
         "connector_name": DOMAIN,
         "trading_pair": "LIT-USDG",
-        "grid_levels": 21,
         "max_open_orders": 2,
         "leverage": 5,
     }
     if any(loaded.get(key) != value for key, value in expected.items()):
         raise RuntimeError("Существующая конфигурация не совпадает с безопасным LIT-профилем")
     numeric_expected = {
-        "order_amount_base": Decimal("10"),
         "max_abs_net_position": Decimal("1000"),
         "refresh_seconds": Decimal("30"),
         "max_data_age_seconds": Decimal("10"),
@@ -225,15 +236,52 @@ def _read_existing_config(path: Path) -> Dict[str, Any]:
             raise RuntimeError("Существующая конфигурация изменяет фиксированные защитные параметры")
     except (InvalidOperation, TypeError):
         raise RuntimeError("Существующая конфигурация имеет неверные защитные параметры") from None
+    try:
+        amount = parse_nonnegative_decimal(str(loaded.get("order_amount_base")), "order_amount_base", positive=True)
+        raw_levels = loaded.get("grid_levels")
+        if type(raw_levels) is not int or raw_levels < 2:
+            raise ValueError("grid_levels должен быть некавыченным целым числом не меньше 2")
+        levels = raw_levels
+    except ValueError as exc:
+        raise RuntimeError(f"Существующая конфигурация: {exc}") from None
+    if amount > Decimal("1000") or levels < 2:
+        raise RuntimeError("Существующая конфигурация имеет небезопасный размер или число уровней")
     return loaded
 
 
 def _prompt_decimal(console: Console, label: str, default: Any, *, positive: bool) -> Decimal:
-    suffix = f" [{default}]" if default not in (None, "") else ""
-    value = console.ask(f"{label}{suffix}: ")
-    if not value and default not in (None, ""):
-        value = str(default)
-    return parse_nonnegative_decimal(value, label, positive=positive)
+    while True:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        value = console.ask(f"{label}{suffix}: ").strip()
+        if not value and default not in (None, ""):
+            value = str(default)
+        try:
+            return parse_nonnegative_decimal(value, label, positive=positive)
+        except ValueError as exc:
+            console.tell(f"Ошибка поля: {exc}. Повторите то же поле.")
+
+
+def _prompt_index(
+    console: Console, prompt: str, label: str, minimum: int, maximum: Optional[int] = None,
+    default: Any = None,
+) -> int:
+    while True:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        value = console.ask(f"{prompt}{suffix}: ")
+        if not value.strip() and default not in (None, ""):
+            value = str(default)
+        try:
+            return parse_index(value, label, minimum, maximum)
+        except ValueError as exc:
+            console.tell(f"Ошибка поля: {exc}. Повторите то же поле.")
+
+
+def _prompt_private_key(console: Console) -> str:
+    while True:
+        try:
+            return normalize_api_private_key(console.hidden("[3/10] API Private Key (скрыто): "))
+        except ValueError as exc:
+            console.tell(f"Ошибка поля: {exc}. Повторите то же поле.")
 
 
 def _same_credentials(left: CollectedCredentials, right: Optional[CollectedCredentials]) -> bool:
@@ -255,53 +303,95 @@ def run_wizard(services: Services, console: Console, *, config_path: Path = CONF
         if services.running():
             raise RuntimeError("Hummingbot уже запущен. Остановите его отдельным ярлыком и повторите")
         existing_config = _read_existing_config(config_path)
-        first_password = services.new_password_required()
-        if first_password:
-            console.tell("Создайте НОВЫЙ локальный пароль хранилища Hummingbot (это не ключ кошелька/API).")
-        else:
-            console.tell("Введите пароль существующего локального хранилища Hummingbot.")
-        console.tell("При скрытом вводе Terminal не показывает даже точки — это нормально.")
-        password = console.hidden("Пароль Hummingbot: ")
-        secrets.append(password)
-        if not password:
-            raise ValueError("Пароль не может быть пустым")
-        if first_password:
-            confirmation = console.hidden("Повторите пароль Hummingbot: ")
-            secrets.append(confirmation)
-            if password != confirmation:
-                raise ValueError("Пароли не совпадают")
-        services.unlock(password)
+        has_saved_credentials = services.credentials_exist is not None and services.credentials_exist()
+        reuse_saved = False
+        if has_saved_credentials:
+            choice = console.ask(
+                "Найден зашифрованный API-ключ. Использовать его без повторного ввода? [Y/n]: "
+            ).strip().lower()
+            reuse_saved = choice in ("", "y", "yes", "д", "да")
 
-        credentials = services.load_credentials()
-        if credentials is not None:
-            reuse = console.ask("Найдены зашифрованные данные Robinhood Lighter. Использовать их? [Y/n]: ").strip().lower()
-            if reuse not in ("", "y", "yes", "д", "да"):
-                credentials = None
-        needs_persist = credentials is None
-        if credentials is None:
-            console.tell("Введите API Private Key с экрана API Robinhood Lighter, не приватный ключ кошелька. Public Key не нужен.")
-            account = parse_index(console.ask("Account Index: "), "Account Index", 0)
-            api_key = parse_index(console.ask("API Key Index (4–254): "), "API Key Index", 4, 254)
-            private = normalize_api_private_key(console.hidden("API Private Key (скрыто): "))
+        credentials: Optional[CollectedCredentials] = None
+        if not reuse_saved:
+            console.tell("[1/10] Account Index — номер аккаунта из Robinhood Lighter.")
+            account = _prompt_index(console, "[1/10] Account Index", "Account Index", 0)
+            console.tell("[2/10] API Key Index — номер API-ключа; 4 допустим, диапазон 4–254.")
+            api_key = _prompt_index(console, "[2/10] API Key Index", "API Key Index", 4, 254)
+            console.tell("[3/10] API Private Key — скрытый API-секрет. Public Key и ключ кошелька не нужны.")
+            console.tell("При скрытом вводе Terminal не показывает даже точки — это нормально.")
+            private = _prompt_private_key(console)
             secrets.extend((private, "0x" + private))
             credentials = CollectedCredentials(account, api_key, private)
+
+        lower = _prompt_decimal(
+            console, "[4/10] Нижняя цена LIT", existing_config.get("lower_price"), positive=True
+        )
+        while True:
+            upper = _prompt_decimal(
+                console, "[5/10] Верхняя цена LIT", existing_config.get("upper_price"), positive=True
+            )
+            if upper > lower:
+                break
+            console.tell("Ошибка поля: верхняя цена должна быть выше нижней. Повторите то же поле.")
+        while True:
+            order_amount = _prompt_decimal(
+                console, "[6/10] Размер одной заявки, LIT", existing_config.get("order_amount_base", 10), positive=True
+            )
+            if order_amount <= Decimal("1000"):
+                break
+            console.tell("Ошибка поля: размер заявки не может превышать 1000 LIT. Повторите то же поле.")
+        grid_levels = _prompt_index(
+            console, "[7/10] Количество уровней сетки", "grid_levels", 2,
+            default=existing_config.get("grid_levels", 21),
+        )
+        reserve = _prompt_decimal(
+            console, "[8/10] Явный резерв USDG", existing_config.get("margin_reserve_usdg"), positive=False
+        )
+        while console.ask("[9/10] Maker Only — введите OFF: ").strip() != "OFF":
+            console.tell("Ошибка поля: Maker Only должен быть выключен. Повторите OFF.")
+
+        first_password = services.new_password_required()
+        if first_password:
+            console.tell("[10/10] Создайте новый локальный пароль Hummingbot — это не API-ключ и не ключ кошелька.")
         else:
+            console.tell("[10/10] Разблокируйте существующее локальное хранилище Hummingbot.")
+        console.tell("Скрытый ввод не показывает даже точки — это нормально.")
+        while True:
+            password = console.hidden("[10/10] Пароль Hummingbot: ")
+            secrets.append(password)
+            if not password:
+                console.tell("Ошибка поля: пароль не может быть пустым. Повторите то же поле.")
+                continue
+            if first_password:
+                confirmation = console.hidden("[10/10] Повторите пароль Hummingbot: ")
+                secrets.append(confirmation)
+                if password != confirmation:
+                    console.tell("Ошибка поля: пароли не совпадают. Повторите этап пароля.")
+                    continue
+            try:
+                services.unlock(password)
+                break
+            except Exception as exc:
+                import typer
+                from hummingbot.cli.output import ExitCode
+
+                if isinstance(exc, typer.Exit) and exc.exit_code == int(ExitCode.CONFIG_ERROR):
+                    console.tell("Пароль Hummingbot не подошёл. Повторите то же поле; хранилище не сбрасывается.")
+                    continue
+                raise
+
+        if reuse_saved:
+            loaded = services.load_credentials()
+            if loaded is None:
+                raise RuntimeError("Зашифрованный API-ключ не удалось прочитать")
             credentials = CollectedCredentials(
-                parse_index(str(credentials.account_index), "Account Index", 0),
-                parse_index(str(credentials.api_key_index), "API Key Index", 4, 254),
-                normalize_api_private_key(credentials.api_private_key),
+                parse_index(str(loaded.account_index), "Account Index", 0),
+                parse_index(str(loaded.api_key_index), "API Key Index", 4, 254),
+                normalize_api_private_key(loaded.api_private_key),
             )
             secrets.extend((credentials.api_private_key, "0x" + credentials.api_private_key))
-
-        maker = console.ask("Убедитесь, что Maker Only в Robinhood выключен. Введите OFF: ").strip()
-        if maker != "OFF":
-            raise ValueError("Maker Only должен быть выключен; требуется точный ответ OFF")
-        lower = _prompt_decimal(console, "Нижняя цена LIT", existing_config.get("lower_price"), positive=True)
-        upper = _prompt_decimal(console, "Верхняя цена LIT", existing_config.get("upper_price"), positive=True)
-        reserve = _prompt_decimal(
-            console, "Явный резерв USDG", existing_config.get("margin_reserve_usdg"), positive=False
-        )
-        candidate = build_candidate(lower, upper, reserve)
+        needs_persist = not reuse_saved
+        candidate = build_candidate(lower, upper, reserve, order_amount, grid_levels)
         _validate_candidate(candidate)
         if services.running():
             raise RuntimeError("Hummingbot был запущен в другом окне; конфигурация не изменена")
@@ -323,7 +413,8 @@ def run_wizard(services: Services, console: Console, *, config_path: Path = CONF
 
         required = getattr(report, "required_margin_usdg", None)
         console.tell(
-            f"Готово: account {credentials.account_index}, LIT {lower}…{upper}, лимит 1000 LIT, плечо 5x, "
+            f"Готово: account {credentials.account_index}, LIT {lower}…{upper}, заявка {order_amount} LIT, "
+            f"уровней {grid_levels}, лимит 1000 LIT, плечо 5x, "
             f"требование USDG {required if required is not None else 'проверено preflight'}."
         )
         if console.ask("Для реального запуска ордеров введите START: ").strip() != "START":
@@ -413,6 +504,12 @@ def _load_credentials() -> Optional[CollectedCredentials]:
         values["lighter_perpetual_robinhood_api_key_index"],
         values["lighter_perpetual_robinhood_api_private_key"],
     )
+
+
+def _credentials_exist() -> bool:
+    from hummingbot.client.config.config_helpers import get_connector_config_yml_path
+
+    return get_connector_config_yml_path(DOMAIN).is_file()
 
 
 def _persist_credentials(credentials: CollectedCredentials) -> None:
@@ -526,6 +623,7 @@ def _default_services() -> Services:
         preflight=lambda candidate, credentials: asyncio.run(_authenticated_preflight(candidate, credentials)),
         launch=_launch,
         running_this=lambda: _matching_bot(time.time() - 180, require_ready=False),
+        credentials_exist=_credentials_exist,
     )
 
 

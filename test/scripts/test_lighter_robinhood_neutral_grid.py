@@ -87,14 +87,46 @@ def test_grid_has_21_inclusive_levels_and_chooses_nearest_strict_post_only_price
     assert bid < Decimal("1.0101") and ask > Decimal("1.0099")
 
 
-def test_collapsed_or_crossed_grid_levels_are_omitted():
+def test_nondefault_order_size_and_grid_levels_are_accepted_and_select_expected_prices():
+    config = enabled_config(grid_levels=5, order_amount_base=Decimal("25"))
+
     bid, ask, levels = eligible_grid_prices(
-        Decimal("1.001"), Decimal("1.009"), 21, Decimal("0.01"),
-        best_bid=Decimal("1.00"), best_ask=Decimal("1.01"),
+        config.lower_price, config.upper_price, config.grid_levels, Decimal("0.0001"),
+        best_bid=Decimal("1.19"), best_ask=Decimal("1.21"),
     )
-    assert levels == []
-    assert bid is None
-    assert ask is None
+
+    assert config.order_amount_base == Decimal("25")
+    assert levels == [Decimal("0.5000"), Decimal("0.7500"), Decimal("1.0000"),
+                      Decimal("1.2500"), Decimal("1.5000")]
+    assert bid == Decimal("1.0000")
+    assert ask == Decimal("1.2500")
+
+
+@pytest.mark.parametrize("grid_levels", [1, True, 2.5, "21"])
+def test_grid_levels_must_be_an_exact_integer_of_at_least_two(grid_levels):
+    with pytest.raises(ValidationError):
+        enabled_config(grid_levels=grid_levels)
+
+
+def test_order_amount_cannot_exceed_position_cap():
+    with pytest.raises(ValidationError):
+        enabled_config(order_amount_base=Decimal("1000.01"))
+
+
+def test_grid_level_count_cannot_exceed_distinct_runtime_price_ticks():
+    with pytest.raises(ValueError, match="distinct exchange price ticks"):
+        eligible_grid_prices(
+            Decimal("1.00"), Decimal("1.02"), 4, Decimal("0.01"),
+            best_bid=Decimal("1.00"), best_ask=Decimal("1.02"),
+        )
+
+
+def test_collapsed_grid_is_rejected_before_allocating_levels():
+    with pytest.raises(ValueError, match="distinct exchange price ticks"):
+        eligible_grid_prices(
+            Decimal("1.001"), Decimal("1.009"), 21, Decimal("0.01"),
+            best_bid=Decimal("1.00"), best_ask=Decimal("1.01"),
+        )
 
 
 def test_wide_external_spread_still_selects_coherent_levels_around_midpoint():
@@ -107,12 +139,12 @@ def test_wide_external_spread_still_selects_coherent_levels_around_midpoint():
     assert bid < ask
 
 
-def test_price_quantization_never_moves_a_level_below_requested_lower_bound():
-    _, _, levels = eligible_grid_prices(
-        Decimal("1.001"), Decimal("1.101"), 21, Decimal("0.01"),
-        best_bid=Decimal("1.04"), best_ask=Decimal("1.06"),
-    )
-    assert min(levels) >= Decimal("1.001")
+def test_runtime_quantization_cannot_silently_return_fewer_than_configured_levels():
+    with pytest.raises(ValueError, match="collapse after runtime price quantization"):
+        eligible_grid_prices(
+            Decimal("1.005"), Decimal("1.035"), 3, Decimal("0.01"),
+            best_bid=Decimal("1.01"), best_ask=Decimal("1.03"),
+        )
 
 
 class FakeRobinhoodConnector(MockPaperExchange):
@@ -499,6 +531,53 @@ async def test_near_cap_quantizes_order_down_to_remaining_side_capacity():
     assert buys[0][2] == Decimal("5.00")
     assert sells[0][2] == Decimal("10.00")
     assert strategy.epoch.baseline + strategy.epoch.reserved_buy == Decimal("1000.00")
+    await strategy.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_nondefault_grid_strategy_submits_configured_size_at_expected_prices():
+    connector = FakeRobinhoodConnector()
+    connector.get_price = MagicMock(
+        side_effect=lambda _pair, is_buy: Decimal("1.21" if is_buy else "1.19")
+    )
+    with patch("hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator"), patch(
+        "hummingbot.strategy.strategy_v2_base.MarketDataProvider"
+    ):
+        strategy = RecordingGrid({CONNECTOR: connector}, enabled_config(
+            grid_levels=5, order_amount_base=Decimal("25"),
+        ))
+    from scripts.lighter_robinhood_grid_risk import ExposureEpoch
+    strategy.epoch = ExposureEpoch(Decimal("0"), Decimal("1000"), Decimal("0.01"))
+
+    strategy._quote_if_safe(Decimal("1000"))
+
+    buy = next(mutation for mutation in strategy.mutations if mutation[0] == "buy")
+    sell = next(mutation for mutation in strategy.mutations if mutation[0] == "sell")
+    assert (buy[2], buy[4]) == (Decimal("25.00"), Decimal("1.0000"))
+    assert (sell[2], sell[4]) == (Decimal("25.00"), Decimal("1.2500"))
+    await strategy.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_runtime_grid_larger_than_distinct_ticks_pauses_before_submitting():
+    connector = FakeRobinhoodConnector()
+    connector.get_price = MagicMock(
+        side_effect=lambda _pair, is_buy: Decimal("1.0002" if is_buy else "1.0000")
+    )
+    with patch("hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator"), patch(
+        "hummingbot.strategy.strategy_v2_base.MarketDataProvider"
+    ):
+        strategy = RecordingGrid({CONNECTOR: connector}, enabled_config(
+            lower_price=Decimal("1.0000"), upper_price=Decimal("1.0002"), grid_levels=4,
+        ))
+    from scripts.lighter_robinhood_grid_risk import ExposureEpoch
+    strategy.epoch = ExposureEpoch(Decimal("0"), Decimal("1000"), Decimal("0.01"))
+
+    strategy._quote_if_safe(Decimal("1000"))
+
+    assert strategy.state is GridState.PAUSED
+    assert "distinct exchange price ticks" in strategy._pause_reason
+    assert not any(mutation[0] in {"buy", "sell"} for mutation in strategy.mutations)
     await strategy.on_stop()
 
 

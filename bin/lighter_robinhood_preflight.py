@@ -18,7 +18,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol
@@ -370,7 +370,7 @@ def _validate_config(config: Dict[str, Any], market: Market, report: PreflightRe
             report.add("FAIL", "config", detail)
 
     parsed_integers: Dict[str, int] = {}
-    for field_name, expected in {"leverage": LEVERAGE, "grid_levels": 21, "max_open_orders": 2}.items():
+    for field_name, expected in {"leverage": LEVERAGE, "max_open_orders": 2}.items():
         try:
             actual = _exact_integer(config.get(field_name), field_name)
             parsed_integers[field_name] = actual
@@ -379,6 +379,13 @@ def _validate_config(config: Dict[str, Any], market: Market, report: PreflightRe
         except PreflightError as exc:
             report.add("FAIL", "config", str(exc))
 
+    grid_levels = config.get("grid_levels")
+    if type(grid_levels) is not int:
+        report.add("FAIL", "config", "grid_levels must be an exact integer")
+    else:
+        parsed_integers["grid_levels"] = grid_levels
+
+    configured_cap = None
     try:
         configured_cap = _decimal(config.get("max_abs_net_position"), "max_abs_net_position")
         if configured_cap <= 0 or configured_cap > POSITION_CAP:
@@ -426,13 +433,20 @@ def _validate_config(config: Dict[str, Any], market: Market, report: PreflightRe
         report.add("FAIL", "config.minimums", f"Order amount is below the {market.min_base_amount} minimum size")
     if amount * lower < market.min_quote_amount:
         report.add("FAIL", "config.minimums", f"Order at lower bound is below the {market.min_quote_amount} minimum notional")
+    if configured_cap is not None and amount > configured_cap:
+        report.add("FAIL", "config.exposure", "order_amount_base must not exceed the configured position cap")
     levels = parsed_integers.get("grid_levels")
     if levels is not None and levels < 2:
         report.add("FAIL", "config.grid", "grid_levels must be at least 2")
     elif levels is not None and upper > lower:
-        spacing = (upper - lower) / Decimal(levels - 1)
-        if spacing < market.price_increment:
-            report.add("FAIL", "config.grid", "Grid levels collapse after exchange price quantization")
+        first_tick = (lower / market.price_increment).to_integral_value(rounding=ROUND_CEILING)
+        last_tick = (upper / market.price_increment).to_integral_value(rounding=ROUND_FLOOR)
+        distinct_ticks = max(0, int(last_tick - first_tick + 1))
+        if levels > distinct_ticks:
+            report.add(
+                "FAIL", "config.grid",
+                f"grid_levels exceeds the {distinct_ticks} distinct exchange price ticks within bounds",
+            )
     leverage = parsed_integers.get("leverage")
     if leverage is not None and Decimal(leverage) > market.max_leverage:
         report.add("FAIL", "config.leverage", f"Configured leverage exceeds market maximum leverage {market.max_leverage}")
