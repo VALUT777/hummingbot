@@ -117,6 +117,17 @@ class LighterPerpetualAPIOrderBookDataSourceTests(TestCase):
         self.assertEqual(ws, connected_ws)
         self.assertEqual(CONSTANTS.PUBLIC_WS_PING_INTERVAL, ws.connect_calls[0]["ping_timeout"])
 
+    def test_robinhood_websocket_connects_to_robinhood_host(self):
+        ws = MockWSAssistant()
+        api_factory = SimpleNamespace(get_ws_assistant=AsyncMock(return_value=ws))
+        data_source = LighterPerpetualAPIOrderBookDataSource(
+            ["LIT-USDG"], SimpleNamespace(), api_factory, domain=CONSTANTS.ROBINHOOD_DOMAIN
+        )
+
+        asyncio.run(data_source._connected_websocket_assistant())
+
+        self.assertEqual("wss://api.rh.lighter.xyz/stream", ws.connect_calls[0]["ws_url"])
+
     def test_subscribe_channels_sends_public_requests(self):
         market = SimpleNamespace(market_id=1)
         connector = SimpleNamespace(market_info_for_trading_pair=MagicMock(return_value=market))

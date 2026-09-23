@@ -1,0 +1,36 @@
+{
+  "captured_at": "2026-09-23",
+  "source": "https://api.rh.lighter.xyz",
+  "order_book_details": [
+    {
+      "symbol": "LIT",
+      "market_id": 5,
+      "market_type": "perp",
+      "base_asset_id": 0,
+      "quote_asset_id": 0,
+      "status": "active",
+      "maker_fee": "0.0000",
+      "taker_fee": "0.0000",
+      "min_base_amount": "5.00",
+      "min_quote_amount": "10.000000",
+      "supported_size_decimals": 2,
+      "supported_price_decimals": 4,
+      "supported_quote_decimals": 6,
+      "default_initial_margin_fraction": 5000,
+      "min_initial_margin_fraction": 2000,
+      "maintenance_margin_fraction": 1200,
+      "market_config": {
+        "hidden": false,
+        "force_reduce_only": false
+      }
+    }
+  ],
+  "asset_details": [
+    {
+      "asset_id": 3,
+      "symbol": "USDG",
+      "decimals": 6,
+      "margin_mode": "enabled"
+    }
+  ]
+}
