@@ -13,10 +13,10 @@ if [[ ! -x "$PYTHON" ]]; then
   exit 1
 fi
 
-"$PYTHON" -m bin.lighter_robinhood_setup
+"$PYTHON" -m bin.lighter_robinhood_multi_grid_strike_launch
 rc=$?
 print
-print "Мастер завершён (код $rc)."
+print "Запуск Multi Grid Strike завершён (код $rc)."
 print -n "Нажмите Enter, чтобы закрыть окно..."
 read
 exit $rc

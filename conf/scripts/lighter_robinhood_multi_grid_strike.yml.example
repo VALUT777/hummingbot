@@ -1,0 +1,5 @@
+script_file_name: lighter_robinhood_multi_grid_strike.py
+controllers_config:
+  - lighter_robinhood_multi_grid_strike.yml
+max_global_drawdown_quote: null
+max_controller_drawdown_quote: null
