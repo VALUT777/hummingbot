@@ -19,8 +19,8 @@ grids:
     side: 1
     amount_quote_pct: '1'
     enabled: true
-min_spread_between_orders: '0.018'
-min_order_amount_quote: '250'
+min_spread_between_orders: '0.0036'
+min_order_amount_quote: '50'
 max_open_orders: 2
 max_orders_per_batch: 1
 order_frequency: 3

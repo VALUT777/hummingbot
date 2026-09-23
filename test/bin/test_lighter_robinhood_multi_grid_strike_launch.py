@@ -60,7 +60,7 @@ def test_launch_validates_then_uses_native_hidden_password_prompt(tmp_path):
     assert all("password" not in argument.lower() for argument in calls[0])
     rendered = "\n".join(output)
     assert "3000 USDG" in rendered
-    assert "примерно 11" in rendered
+    assert "примерно 55" in rendered
     assert "пароль Hummingbot" in rendered
     assert "на диапазон" in rendered
     assert "заблокирует новую сетку" in rendered
