@@ -1,0 +1,185 @@
+# Lighter Robinhood: запуск на macOS
+
+Эта сборка предназначена для Robinhood Lighter mainnet, домена
+`lighter_perpetual_robinhood` и рынка `LIT-USDG`. Подготовка не совершает сделок.
+Пример конфигурации выключен, а ценовые границы намеренно пусты.
+
+## Проверенная среда
+
+На этом Mac проверена нативная arm64-сборка с Python 3.12.14 и
+`lighter-sdk==1.1.4`. Среда полностью отделена от системного Python:
+
+```bash
+cd "/Users/mikhail/Documents/AI workshop/hummingbot-robinhood"
+export HB_RUNTIME_ROOT="$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d"
+export MAMBA_ROOT_PREFIX="$HB_RUNTIME_ROOT/mamba-root"
+"$HB_RUNTIME_ROOT/tools/bin/micromamba" run -p "$HB_RUNTIME_ROOT/env" hbot --help
+```
+
+Для повторной установки скачайте официальный micromamba только в каталог этой
+задачи, создайте Python 3.12-среду по файлу проекта и соберите расширения:
+
+```bash
+cd "/Users/mikhail/Documents/AI workshop/hummingbot-robinhood"
+export HB_RUNTIME_ROOT="$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d"
+mkdir -p "$HB_RUNTIME_ROOT/tools"
+curl -Ls https://micro.mamba.pm/api/micromamba/osx-arm64/latest \
+  | tar -xj -C "$HB_RUNTIME_ROOT/tools" bin/micromamba
+export MAMBA_ROOT_PREFIX="$HB_RUNTIME_ROOT/mamba-root"
+"$HB_RUNTIME_ROOT/tools/bin/micromamba" create -y -p "$HB_RUNTIME_ROOT/env" \
+  -f setup/environment.yml python=3.12
+"$HB_RUNTIME_ROOT/env/bin/python" -m pip install \
+  'numpy>=2.2.6,<2.3' 'numba==0.61.2' 'cryptography>=48.0.1,<49'
+"$HB_RUNTIME_ROOT/env/bin/python" -m pip check
+"$HB_RUNTIME_ROOT/env/bin/python" setup.py build_ext --inplace
+ln -sfn "$PWD/bin/hbot" "$HB_RUNTIME_ROOT/env/bin/hbot"
+```
+
+Команды не меняют глобальный Python и shell-профиль. Для будущего Linux-сервера
+повторите установку в отдельном каталоге с подходящим официальным архивом
+micromamba и сначала заново выполните сборку и preflight. Автозапуск сервисом здесь
+не настраивается.
+
+## Ключи и учётная запись
+
+Нужны индекс существующего Lighter-аккаунта, индекс API-ключа и **API private
+key**. Seed phrase и приватный ключ кошелька Hummingbot не нужны. Если API-ключ ещё
+не привязан, выполните привязку самостоятельно через официальный процесс Lighter
+с подписью своего кошелька. Общая последовательность и допустимые индексы описаны
+в [руководстве Hummingbot по Lighter](https://hummingbot.org/exchanges/lighter/),
+а официальный интерфейс Robinhood-развёртывания доступен на
+[lighter.xyz](https://lighter.xyz/). Ключ и индекс аккаунта должны принадлежать
+именно Robinhood-развёртыванию: ключи Core с `app.lighter.xyz` не взаимозаменяемы
+с ними. Путь меню в Robinhood-интерфейсе здесь не предполагается проверенным.
+Preflight не создаёт и не привязывает ключи; не используйте сторонние генераторы
+ключей.
+
+Сначала посмотрите имена полей, затем сохраните данные в зашифрованном хранилище
+Hummingbot через интерактивные запросы:
+
+```bash
+"$HB_RUNTIME_ROOT/tools/bin/micromamba" run -p "$HB_RUNTIME_ROOT/env" \
+  hbot connect lighter_perpetual_robinhood --fields
+"$HB_RUNTIME_ROOT/tools/bin/micromamba" run -p "$HB_RUNTIME_ROOT/env" \
+  hbot connect lighter_perpetual_robinhood
+```
+
+Не передавайте API private key аргументом командной строки и не записывайте его в
+YAML. Если одному адресу принадлежат несколько аккаунтов, укажите нужный индекс
+явно.
+
+## Конфигурация и публичная проверка
+
+Создайте рабочую копию примера, если её ещё нет. Команда не перезаписывает уже
+заполненный локальный файл:
+
+```bash
+test -e conf/scripts/lighter_robinhood_neutral_grid.yml || \
+  cp conf/scripts/lighter_robinhood_neutral_grid.yml.example \
+    conf/scripts/lighter_robinhood_neutral_grid.yml
+```
+
+Впишите выбранные вами `lower_price` и `upper_price`. Оставьте `enabled: false`,
+пока все проверки не завершены. Остальные безопасные границы примера: leverage 5,
+ONEWAY, максимум абсолютной нетто-позиции 1000 LIT, ордер 10 LIT, 21 уровень и не
+более двух открытых ордеров.
+
+Публичный preflight не требует ключа. Он заново находит текущий market ID LIT,
+проверяет активность рынка, шаги цены/размера, минимумы, USDG asset 3 с 6 знаками,
+домен, signing chain 466324, нативный SDK и свежий двусторонний WebSocket-стак:
+
+```bash
+"$HB_RUNTIME_ROOT/env/bin/python" bin/lighter_robinhood_preflight.py \
+  --public-only --config conf/scripts/lighter_robinhood_neutral_grid.yml
+```
+
+Код возврата 0 означает только успешные публичные проверки. В отчёте всё равно
+будет `NOT LIVE-READY`, пока не выполнены приватные проверки и не включена стратегия.
+Поле `quote_asset_id=0` у perpetual синтетическое; collateral определяется как
+USDG asset 3, а market ID не закреплён навечно и обнаруживается при каждом запуске.
+
+## Приватная проверка только для чтения
+
+Приватный preflight не отправляет транзакции, не отменяет ордера, не меняет плечо,
+не переводит средства и не меняет ключи. Без ключей разработчик эту проверку не
+запускал. С `enabled: false` команда ниже безопасно покажет приватные результаты,
+но ожидаемо завершится ненулевым кодом и `NOT LIVE-READY`. Она запросит API
+private key без отображения:
+
+```bash
+"$HB_RUNTIME_ROOT/env/bin/python" bin/lighter_robinhood_preflight.py \
+  --authenticated \
+  --config conf/scripts/lighter_robinhood_neutral_grid.yml \
+  --account-index YOUR_ACCOUNT_INDEX \
+  --api-key-index YOUR_API_KEY_INDEX \
+  --margin-reserve-usdg YOUR_EXPLICIT_RESERVE
+```
+
+Проверяются связь ключа с выбранным аккаунтом, приватная WebSocket-подписка,
+доступный USDG margin, позиция в пределах 1000 LIT и отсутствие неизвестных
+активных ордеров. Требование по margin считается консервативно как
+`upper_price × 1000 / 5 + margin_reserve_usdg`. Это требование полной ёмкости с
+явным резервом на комиссии/funding, а не рекомендация по депозиту или бюджету.
+Доступный USDG ограничивается меньшим из общего `available_balance` аккаунта и
+фактически незаблокированного баланса USDG asset 3; другой collateral не выдаётся
+за USDG. Приватный режим возвращает код 0 только при итоговом `LIVE READY`, любое
+неполное или неуспешное обязательное условие возвращает ненулевой код. Когда все
+поля и результаты проверены, вручную измените только `enabled: true` и повторите
+ту же приватную команду. Это всё ещё только чтение и само по себе не запускает
+торговлю. Ожидаемый финальный результат — `LIVE READY` и код 0.
+
+Стратегия запрашивает принудительный account snapshot не чаще одного раза в 10
+секунд. Для приватного WebSocket heartbeat применяется отдельное окно 65 секунд;
+`max_data_age_seconds: 10` продолжает ограничивать возраст публичного стакана и
+REST snapshot и не должен ошибочно отключать здоровое, но спокойное соединение.
+
+## Осознанный запуск и остановка
+
+Даже после `LIVE READY` запуск требует отдельного явного действия:
+
+```bash
+bin/run_lighter_robinhood.sh start \
+  "$PWD/conf/scripts/lighter_robinhood_neutral_grid.yml"
+```
+
+Обёртка без аргументов делает только публичный preflight и сделок не запускает:
+
+```bash
+bin/run_lighter_robinhood.sh
+```
+
+Остановка:
+
+```bash
+bin/run_lighter_robinhood.sh stop
+```
+
+Остановка отменяет ордера этого бота, но не ликвидирует позицию автоматически.
+Оставшаяся LIT-позиция сохраняется и должна быть проверена оператором. Неизвестные
+ручные ордера, другой бот на том же аккаунте, устаревшие данные, закрытый рынок или
+неясное состояние заявки останавливают новые котировки. Клиентский лимит не может
+защитить от параллельной торговли на том же аккаунте или ошибки биржи, поэтому
+этому боту нужен эксклюзивный контроль аккаунта и рынка.
+
+Намерения на отправку ордеров сохраняются атомарно в постоянном файле
+`<Hummingbot data_path>/lighter_robinhood_neutral_grid_intents.json` (при обычном
+запуске из этого checkout это каталог `data/` репозитория). После перезапуска бот
+автоматически продолжает работу только тогда, когда журнал относится к тому же
+домену, паре и индексу аккаунта, все записанные ордера получили подтверждённое
+терминальное состояние, а исходная позиция из журнала плюс итоговые исполнения
+дважды подряд совпала со свежей позицией аккаунта. Непривязанное намерение,
+чужой/ручной ордер или восстановленный трекером ID без записи журнала требует
+ручной проверки аккаунта и ордеров. Не удаляйте журнал вслепую: это может скрыть
+ещё не выясненный результат отправки.
+
+Успешный preflight подтверждает текущие данные аккаунта и готовность конфигурации,
+но не отменяет эти проверки восстановления стратегии и не доказывает, что старое
+ожидающее намерение уже разрешено. После `LIVE READY` всё равно проверьте статус
+первого запуска; торговля начинается только отдельной командой `start`.
+
+Robinhood rewards — отдельная программа. Для этой интеграции не подтверждены ни
+участие/атрибуция сделок через API в программе, ни множитель 2×. Совпадение
+аккаунта или адреса кошелька само по себе не доказывает Wallet-атрибуцию. См.
+[Lighter on Robinhood Chain Points](https://docs.lighter.xyz/points-program/lighter-on-robinhood-chain-points)
+и [Robinhood Lighter Domains](https://docs.robinhood.com/chain/lighter-domains/).
+Код не подменяет атрибуцию и не создаёт искусственный объём.
