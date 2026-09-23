@@ -24,7 +24,7 @@ min_order_amount_quote: '50'
 max_open_orders: 2
 max_orders_per_batch: 1
 order_frequency: 3
-activation_bounds: null
+activation_bounds: '0.005'
 keep_position: true
 triple_barrier_config:
   stop_loss: null
