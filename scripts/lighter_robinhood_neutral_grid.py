@@ -148,6 +148,8 @@ class LighterRobinhoodNeutralGrid(StrategyV2Base):
         self._now = 0.0
         self._submission_sequence = 0
         self._pause_reason = ""
+        self._margin_warning: Optional[str] = None
+        self._margin_warning_active = False
         self._journal: Optional[IntentJournal] = None
         self._journal_error: Optional[str] = None
         try:
@@ -335,9 +337,10 @@ class LighterRobinhoodNeutralGrid(StrategyV2Base):
         if not net_position.is_finite() or abs(net_position) > self.config.max_abs_net_position:
             self._pause("position is invalid or above the configured cap", drain=True)
             return
-        if not margin.is_finite() or margin < self._required_margin():
-            self._pause("insufficient available USDG margin", drain=True)
+        if not margin.is_finite() or margin < 0:
+            self._pause("available USDG margin is invalid", drain=True)
             return
+        self._update_margin_warning(margin)
         if self._owned_order_ids and not self._live_book_is_in_range():
             self._pause("market is outside configured bounds", drain=True)
             return
@@ -483,10 +486,10 @@ class LighterRobinhoodNeutralGrid(StrategyV2Base):
         if not prices:
             self._pause("grid order is dust under runtime market metadata", drain=False)
             return
-        required_margin = self._required_margin()
-        if not available_margin.is_finite() or available_margin < required_margin:
-            self._pause("insufficient available USDG margin", drain=False)
+        if not available_margin.is_finite() or available_margin < 0:
+            self._pause("available USDG margin is invalid", drain=False)
             return
+        self._update_margin_warning(available_margin)
         for side, price in (("BUY", bid), ("SELL", ask)):
             if price is not None:
                 self._reserve_then_submit(side, amounts[side], price)
@@ -710,6 +713,23 @@ class LighterRobinhoodNeutralGrid(StrategyV2Base):
             + self.config.margin_reserve_usdg
         )
 
+    def _update_margin_warning(self, available_margin: Decimal) -> None:
+        required_margin = self._required_margin()
+        if available_margin < required_margin:
+            self._margin_warning = (
+                f"available USDG {available_margin} is below conservative estimate {required_margin}; "
+                "this comparison is advisory and does not block quoting"
+            )
+            if not self._margin_warning_active:
+                self.logger().warning(f"Margin advisory: {self._margin_warning}")
+            self._margin_warning_active = True
+        else:
+            self._margin_warning = None
+            self._margin_warning_active = False
+
     def format_status(self) -> str:
         baseline = self.epoch.baseline if self.epoch is not None else "unreconciled"
-        return f"Robinhood neutral grid: {self.state.value}; baseline={baseline}; reason={self._pause_reason or 'none'}"
+        status = f"Robinhood neutral grid: {self.state.value}; baseline={baseline}; reason={self._pause_reason or 'none'}"
+        if self._margin_warning is not None:
+            status += f"; margin warning={self._margin_warning}"
+        return status

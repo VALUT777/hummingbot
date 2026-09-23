@@ -109,7 +109,10 @@ class PreflightReport:
 
     @property
     def live_ready(self) -> bool:
-        return self.private_checked and bool(self.checks) and all(check.status == "PASS" for check in self.checks)
+        def accepted(check: Check) -> bool:
+            return check.status == "PASS" or (check.status == "WARN" and check.name == "private.margin")
+
+        return self.private_checked and bool(self.checks) and all(accepted(check) for check in self.checks)
 
     def exit_code(self, public_only: bool = False) -> int:
         if not public_only:
@@ -121,7 +124,13 @@ class PreflightReport:
         lines = [f"[{check.status}] {check.name}: {check.detail}" for check in self.checks]
         lines.append("PUBLIC CHECKS PASSED" if self.public_ready else "PUBLIC CHECKS FAILED")
         if self.live_ready:
-            lines.append("LIVE READY: authenticated, configured, and read-only checks passed.")
+            if any(check.status == "WARN" and check.name == "private.margin" for check in self.checks):
+                lines.append(
+                    "LIVE READY WITH MARGIN WARNING: required checks passed; "
+                    "the conservative margin comparison is informational."
+                )
+            else:
+                lines.append("LIVE READY: authenticated, configured, and read-only checks passed.")
         elif not self.private_checked:
             lines.append("NOT LIVE-READY: private account checks were not run.")
         else:
@@ -534,7 +543,13 @@ def evaluate_private_snapshot(
     else:
         report.add("PASS", "private.websocket", "Authenticated private WebSocket subscription succeeded")
     net_position = _decimal(snapshot.net_position_lit, "private net position")
-    available_usdg = _decimal(snapshot.available_usdg, "private available USDG")
+    available_usdg: Optional[Decimal]
+    margin_data_error: Optional[str] = None
+    try:
+        available_usdg = _decimal(snapshot.available_usdg, "private available USDG")
+    except PreflightError as exc:
+        available_usdg = None
+        margin_data_error = str(exc)
     if abs(net_position) > POSITION_CAP:
         report.add("FAIL", "private.position", f"Net position exceeds the {POSITION_CAP} LIT cap")
     else:
@@ -565,21 +580,28 @@ def evaluate_private_snapshot(
             if reserve < 0:
                 report.add("FAIL", "private.margin", "margin_reserve_usdg must be nonnegative")
             else:
-                required = upper * POSITION_CAP / Decimal(LEVERAGE) + reserve
+                base_requirement = upper * POSITION_CAP / Decimal(LEVERAGE)
+                required = base_requirement + reserve
                 report.required_margin_usdg = required
-                if available_usdg < 0:
+                if margin_data_error is not None or available_usdg is None:
+                    report.add("FAIL", "private.margin", margin_data_error or "Available USDG is missing")
+                elif available_usdg < 0:
                     report.add("FAIL", "private.margin", "Available USDG must be nonnegative")
                 elif available_usdg < required:
                     report.add(
-                        "FAIL",
+                        "WARN",
                         "private.margin",
-                        f"Available USDG {available_usdg} is below conservative requirement {required}",
+                        "Informational conservative margin shortfall: "
+                        f"available={available_usdg}, base={base_requirement}, "
+                        f"reserve={reserve}, total={required}",
                     )
                 else:
                     report.add(
                         "PASS",
                         "private.margin",
-                        f"Available USDG {available_usdg} covers conservative requirement {required}",
+                        "Conservative margin comparison: "
+                        f"available={available_usdg}, base={base_requirement}, "
+                        f"reserve={reserve}, total={required}",
                     )
     return report
 

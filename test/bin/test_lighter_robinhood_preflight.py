@@ -335,6 +335,76 @@ def test_authenticated_read_only_snapshot_can_be_live_ready():
     assert "secret" not in report.summary()
 
 
+def test_known_margin_shortfall_is_advisory_and_live_ready():
+    config = {
+        **CONFIG,
+        "enabled": True,
+        "lower_price": "5",
+        "upper_price": "5.5",
+        "grid_levels": 25,
+        "margin_reserve_usdg": "1000",
+    }
+    credentials = PreflightCredentials(account_index=42, api_key_index=4, api_private_key="secret")
+    snapshot = PrivateSnapshot(
+        account_index=42,
+        key_association_valid=True,
+        private_subscription_valid=True,
+        available_usdg=Decimal("1000"),
+        net_position_lit=Decimal("0"),
+        active_orders=[],
+    )
+
+    report = evaluate_private_snapshot(
+        run(run_public_preflight(FakePublicClient(), SuccessfulSdkProbe(), config=config)),
+        credentials,
+        snapshot,
+        Decimal("1000"),
+    )
+
+    margin = next(check for check in report.checks if check.name == "private.margin")
+    assert margin.status == "WARN"
+    assert "available=1000" in margin.detail
+    assert "base=1100.0" in margin.detail
+    assert "reserve=1000" in margin.detail
+    assert "total=2100.0" in margin.detail
+    assert report.live_ready is True
+    assert report.exit_code(public_only=False) == 0
+    assert "LIVE READY WITH MARGIN WARNING" in report.summary()
+
+
+def test_margin_warning_does_not_override_active_orders_failure():
+    config = {**CONFIG, "enabled": True, "margin_reserve_usdg": "1000"}
+    credentials = PreflightCredentials(account_index=42, api_key_index=4, api_private_key="secret")
+    snapshot = PrivateSnapshot(42, True, True, Decimal("1"), Decimal("0"), [{"order_id": 99}])
+
+    report = evaluate_private_snapshot(
+        run(run_public_preflight(FakePublicClient(), SuccessfulSdkProbe(), config=config)),
+        credentials,
+        snapshot,
+        Decimal("1000"),
+    )
+
+    assert next(check for check in report.checks if check.name == "private.margin").status == "WARN"
+    assert next(check for check in report.checks if check.name == "private.orders").status == "FAIL"
+    assert report.live_ready is False
+
+
+def test_arbitrary_warning_and_invalid_margin_data_still_block_readiness():
+    report = run(run_public_preflight(
+        FakePublicClient(), SuccessfulSdkProbe(), config={**CONFIG, "enabled": True}
+    ))
+    report.private_checked = True
+    report.checks = [check for check in report.checks if not check.name.startswith("private.")]
+    report.add("WARN", "private.position", "unexpected advisory")
+    assert report.live_ready is False
+
+    credentials = PreflightCredentials(account_index=42, api_key_index=4, api_private_key="secret")
+    snapshot = PrivateSnapshot(42, True, True, Decimal("NaN"), Decimal("0"), [])
+    malformed = evaluate_private_snapshot(report, credentials, snapshot, Decimal("100"))
+    assert next(check for check in malformed.checks if check.name == "private.margin").status == "FAIL"
+    assert malformed.live_ready is False
+
+
 def test_authenticated_exit_code_requires_full_live_readiness():
     public_only = run(run_public_preflight(FakePublicClient(), SuccessfulSdkProbe(), config=CONFIG))
 

@@ -315,11 +315,10 @@ async def test_enabled_reconciles_twice_then_reserves_and_schedules_one_bid_and_
 
 
 @pytest.mark.asyncio
-async def test_external_order_or_stale_or_insufficient_margin_pauses_without_quoting():
+async def test_external_order_or_stale_or_disconnected_data_pauses_without_quoting():
     cases = [
         snapshot("external", active_orders=[{"client_order_id": "manual"}]),
         {**snapshot("stale", fetched_at=1), "public_data_last_recv_time": Decimal("1")},
-        snapshot("margin", margin="0"),
         {**snapshot("disconnect"), "private_stream_connected": False},
         {**snapshot("private-stale"), "private_stream_last_recv_time": Decimal("1")},
     ]
@@ -409,6 +408,8 @@ async def test_authoritative_snapshot_requests_are_bounded_to_ten_second_cadence
         {"leverage": None, "leverage_confirmed": False},
         {"net_position": None, "net_position_known": False},
         {"available_margin": None, "available_margin_known": False},
+        {"available_margin": Decimal("NaN"), "available_margin_known": True},
+        {"available_margin": Decimal("-1"), "available_margin_known": True},
     ],
 )
 async def test_unknown_authoritative_account_fields_pause_without_crashing(update):
@@ -857,9 +858,12 @@ def test_default_intent_journal_uses_stable_hummingbot_data_path(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_margin_loss_while_quoting_drains_owned_orders_using_full_cap_requirement():
+async def test_known_margin_below_conservative_estimate_still_quotes_with_warning():
     connector = FakeRobinhoodConnector()
-    connector.snapshots = [snapshot("r1"), snapshot("r2", fetched_at=101)]
+    connector.snapshots = [
+        snapshot("r1", margin="309.99"),
+        snapshot("r2", margin="309.99", fetched_at=101),
+    ]
     with patch("hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator"), patch(
         "hummingbot.strategy.strategy_v2_base.MarketDataProvider"
     ):
@@ -869,19 +873,15 @@ async def test_margin_loss_while_quoting_drains_owned_orders_using_full_cap_requ
         strategy.tick(timestamp)
         await asyncio.sleep(0)
     assert strategy.state is GridState.QUOTING
-
-    connector.snapshots = [snapshot("low-margin", margin="309.99", fetched_at=103)]
-    for timestamp in (103, 103.1, 104):
-        strategy.tick(timestamp)
-        await asyncio.sleep(0)
-
-    assert strategy.state is GridState.DRAINING
-    assert len([m for m in strategy.mutations if m[0] == "cancel"]) == 2
+    assert len([m for m in strategy.mutations if m[0] in {"buy", "sell"}]) == 2
+    assert not any(m[0] == "cancel" for m in strategy.mutations)
+    assert "available USDG 309.99" in strategy.format_status()
+    assert "conservative estimate 310.00" in strategy.format_status()
     await strategy.on_stop()
 
 
 @pytest.mark.asyncio
-async def test_persistent_low_margin_retries_cancels_still_authoritatively_active():
+async def test_persistent_low_margin_warns_once_and_clears_when_resolved():
     connector = FakeRobinhoodConnector()
     connector.snapshots = [snapshot("r1"), snapshot("r2", fetched_at=101)]
     with patch("hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator"), patch(
@@ -903,13 +903,24 @@ async def test_persistent_low_margin_retries_cancels_still_authoritatively_activ
         {**snapshot("low2", margin="309.99", active_orders=active_orders, fetched_at=104),
          "orders_by_client_id": evidence},
     ]
-    for timestamp in (103, 103.1, 104, 104.1, 105):
+    logger = MagicMock()
+    with patch.object(strategy, "logger", return_value=logger):
+        for timestamp in (103, 103.1, 104, 104.1, 105):
+            strategy.tick(timestamp)
+            await asyncio.sleep(0)
+
+    assert logger.warning.call_count == 1
+    assert "available USDG 309.99" in strategy.format_status()
+    assert not any(m[0] == "cancel" for m in strategy.mutations)
+
+    connector.snapshots = [{
+        **snapshot("recovered", margin="310", active_orders=active_orders, fetched_at=106),
+        "orders_by_client_id": evidence,
+    }]
+    for timestamp in (106, 106.1, 107):
         strategy.tick(timestamp)
         await asyncio.sleep(0)
-
-    cancels = [m for m in strategy.mutations if m[0] == "cancel"]
-    assert len(cancels) >= 4
-    assert {cancel[1] for cancel in cancels} == strategy._owned_order_ids
+    assert "margin warning" not in strategy.format_status().lower()
     await strategy.on_stop()
 
 

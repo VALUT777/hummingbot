@@ -6,6 +6,7 @@ import pytest
 import typer
 import yaml
 from lighter.signer_client import create_api_key
+from bin.lighter_robinhood_preflight import PreflightReport
 
 from bin.lighter_robinhood_setup import (
     CollectedCredentials,
@@ -100,6 +101,31 @@ def test_candidate_preserves_custom_order_size_and_integer_grid_levels():
     assert candidate["order_amount_base"] == "12.5"
     assert candidate["grid_levels"] == 31
     assert type(candidate["grid_levels"]) is int
+
+
+def test_wizard_accepts_live_ready_report_with_margin_warning(tmp_path):
+    credential = CollectedCredentials(0, 4, "ab" * 40)
+    report = PreflightReport(private_checked=True, required_margin_usdg=Decimal("2100"))
+    report.add("PASS", "domain", "ok")
+    report.add("PASS", "private.identity", "ok")
+    report.add("WARN", "private.margin", "informational shortfall")
+    services = Services(
+        running=lambda: False,
+        new_password_required=lambda: False,
+        unlock=lambda password: None,
+        load_credentials=lambda: credential,
+        persist_credentials=lambda value: pytest.fail("must reuse"),
+        preflight=lambda candidate, credentials: report,
+        launch=lambda password: pytest.fail("user canceled before launch"),
+        credentials_exist=lambda: True,
+    )
+    console = ScriptedConsole(
+        ["", "5", "5.5", "10", "25", "1000", "OFF", "cancel"],
+        ["storage-password"],
+    )
+
+    assert run_wizard(services, console, config_path=tmp_path / "grid.yml") == 0
+    assert "LIVE READY WITH MARGIN WARNING" in "\n".join(console.output)
 
 
 def test_actual_hummingbot_encryption_round_trip_contains_no_plaintext_key(tmp_path):

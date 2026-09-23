@@ -344,8 +344,13 @@ def run_wizard(services: Services, console: Console, *, config_path: Path = CONF
             console, "[7/10] Количество уровней сетки", "grid_levels", 2,
             default=existing_config.get("grid_levels", 21),
         )
+        console.tell(
+            "[8/10] Это дополнительный резерв сверх расчётной маржи полной позиции; "
+            "сравнение будет справочным и не заблокирует запуск при известных корректных данных."
+        )
         reserve = _prompt_decimal(
-            console, "[8/10] Явный резерв USDG", existing_config.get("margin_reserve_usdg"), positive=False
+            console, "[8/10] Дополнительный резерв USDG (для справочной оценки)",
+            existing_config.get("margin_reserve_usdg"), positive=False,
         )
         while console.ask("[9/10] Maker Only — введите OFF: ").strip() != "OFF":
             console.tell("Ошибка поля: Maker Only должен быть выключен. Повторите OFF.")
@@ -415,7 +420,7 @@ def run_wizard(services: Services, console: Console, *, config_path: Path = CONF
         console.tell(
             f"Готово: account {credentials.account_index}, LIT {lower}…{upper}, заявка {order_amount} LIT, "
             f"уровней {grid_levels}, лимит 1000 LIT, плечо 5x, "
-            f"требование USDG {required if required is not None else 'проверено preflight'}."
+            f"справочная оценка маржи USDG {required if required is not None else 'проверена preflight'}."
         )
         if console.ask("Для реального запуска ордеров введите START: ").strip() != "START":
             console.tell("Запуск отменён. Конфигурация осталась выключенной.")
