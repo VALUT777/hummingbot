@@ -36,7 +36,7 @@ CONFIG_PATH = ROOT / "conf/scripts/lighter_robinhood_neutral_grid.yml"
 CONFIG_NAME = CONFIG_PATH.name
 DOMAIN = "lighter_perpetual_robinhood"
 LOCK_PATH = ROOT / "data/lighter_robinhood_setup.lock"
-_HEX_KEY = re.compile(r"[0-9a-fA-F]{64}\Z")
+_HEX_KEY = re.compile(r"[0-9a-fA-F]{80}\Z")
 _INTEGER = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 
 
@@ -59,7 +59,7 @@ def normalize_api_private_key(value: str) -> str:
     value = value.strip()
     normalized = value[2:] if value.startswith(("0x", "0X")) else value
     if not _HEX_KEY.fullmatch(normalized):
-        raise ValueError("API Private Key должен содержать ровно 64 шестнадцатеричных символа")
+        raise ValueError("API Private Key должен содержать ровно 80 шестнадцатеричных символов")
     return normalized.lower()
 
 

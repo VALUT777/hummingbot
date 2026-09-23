@@ -5,6 +5,7 @@ import warnings
 import pytest
 import typer
 import yaml
+from lighter.signer_client import create_api_key
 
 from bin.lighter_robinhood_setup import (
     CollectedCredentials,
@@ -39,11 +40,19 @@ def test_api_index_rejects_ambiguous_or_out_of_range_input(value):
         parse_index(value, "API Key Index", 4, 254)
 
 
-def test_private_key_accepts_optional_0x_and_requires_32_byte_hex():
-    raw = "a1" * 32
+def test_private_key_accepts_sdk_generated_40_byte_key_without_network():
+    private_key, public_key, error = create_api_key()
+    assert error is None
+    assert len(private_key.removeprefix("0x")) == 80
+    assert len(public_key.removeprefix("0x")) == 80
+    assert normalize_api_private_key(private_key) == private_key.removeprefix("0x").lower()
+
+
+def test_private_key_accepts_optional_prefix_case_and_whitespace_but_requires_exact_80_hex():
+    raw = "a1" * 40
     assert normalize_api_private_key(raw) == raw
-    assert normalize_api_private_key("0x" + raw) == raw
-    for bad in ("", "0x", "ab" * 31, "gg" * 32):
+    assert normalize_api_private_key("  0X" + raw.upper() + "  ") == raw
+    for bad in ("", "0x", "ab" * 32, "ab" * 39, "ab" * 41, "gg" * 40):
         with pytest.raises(ValueError):
             normalize_api_private_key(bad)
 
@@ -95,7 +104,7 @@ def test_candidate_preserves_custom_order_size_and_integer_grid_levels():
 
 def test_actual_hummingbot_encryption_round_trip_contains_no_plaintext_key(tmp_path):
     path = tmp_path / "lighter_perpetual_robinhood.yml"
-    private_key = "ab" * 32
+    private_key = "ab" * 40
     old_manager = Security.secrets_manager
     try:
         Security.secrets_manager = ETHKeyFileSecretManger("local-test-password")
@@ -111,7 +120,7 @@ def test_actual_hummingbot_encryption_round_trip_contains_no_plaintext_key(tmp_p
 
 
 def test_redaction_covers_plain_and_0x_key_in_exception_text():
-    key = "cd" * 32
+    key = "cd" * 40
     message = redact_message(RuntimeError(f"native signer rejected 0x{key} and {key}"), [key])
     assert key not in message
     assert "[REDACTED]" in message
@@ -152,7 +161,7 @@ def test_new_user_prompts_one_field_at_a_time_retrying_only_invalid_field(tmp_pa
     services.credentials_exist = lambda: False
     console = ScriptedConsole(
         ["bad-index", "0", " 4 ", "4.5", "6.5", "10", "21", "100", "OFF", "cancel"],
-        ["not-a-private-key", "  " + "ab" * 32 + "  ", "storage-password"],
+        ["not-a-private-key", "  " + "ab" * 40 + "  ", "storage-password"],
     )
 
     assert run_wizard(services, console, config_path=config) == 0
@@ -167,7 +176,7 @@ def test_new_user_prompts_one_field_at_a_time_retrying_only_invalid_field(tmp_pa
         "[4/10] Нижняя цена LIT: ",
     ]
     assert labels.index("[10/10] Пароль Hummingbot: ") > labels.index("[9/10] Maker Only — введите OFF: ")
-    assert stored == [CollectedCredentials(0, 4, "ab" * 32)]
+    assert stored == [CollectedCredentials(0, 4, "ab" * 40)]
 
 
 def test_wrong_keystore_password_retries_after_all_values_without_reasking_key(tmp_path):
@@ -192,7 +201,7 @@ def test_wrong_keystore_password_retries_after_all_values_without_reasking_key(t
     )
     console = ScriptedConsole(
         ["0", "4", "4.5", "6.5", "10", "21", "100", "OFF", "cancel"],
-        ["ab" * 32, "wrong-password", "correct-password"],
+        ["ab" * 40, "wrong-password", "correct-password"],
     )
 
     assert run_wizard(services, console, config_path=config) == 0
@@ -221,7 +230,7 @@ def test_fatal_keystore_error_does_not_loop_or_reset(tmp_path):
     )
     console = ScriptedConsole(
         ["0", "4", "4.5", "6.5", "10", "21", "100", "OFF"],
-        ["ab" * 32, "storage-password"],
+        ["ab" * 40, "storage-password"],
     )
 
     assert run_wizard(services, console, config_path=tmp_path / "grid.yml") == 1
@@ -279,7 +288,7 @@ def test_failed_preflight_keeps_config_disabled_and_does_not_replace_credentials
         preflight=lambda candidate, credentials: Report(False),
         launch=lambda password: launched.append(password) or 0,
     )
-    console = ScriptedConsole(_answers(), ["ab" * 32, "storage-password", "storage-password"])
+    console = ScriptedConsole(_answers(), ["ab" * 40, "storage-password", "storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 1
     assert yaml.safe_load(config.read_text())["enabled"] is False
@@ -315,17 +324,17 @@ def test_start_requires_two_live_preflights_and_reloaded_encrypted_credentials(t
         preflight=preflight,
         launch=launch,
     )
-    console = ScriptedConsole(_answers(), ["ab" * 32, "storage-password", "storage-password"])
+    console = ScriptedConsole(_answers(), ["ab" * 40, "storage-password", "storage-password"])
 
     assert run_wizard(services, console, config_path=config) == 0
     assert len(preflights) == 2
-    assert stored == [CollectedCredentials(0, 4, "ab" * 32)]
+    assert stored == [CollectedCredentials(0, 4, "ab" * 40)]
     assert launches == ["storage-password"]
 
 
 def test_second_preflight_failure_never_enables_disk_config(tmp_path):
     config = tmp_path / "grid.yml"
-    credential = CollectedCredentials(0, 4, "ab" * 32)
+    credential = CollectedCredentials(0, 4, "ab" * 40)
     reports = iter([Report(True), Report(False)])
     services = Services(
         running=lambda: False,
@@ -346,7 +355,7 @@ def test_second_preflight_failure_never_enables_disk_config(tmp_path):
 def test_own_enabled_config_from_previous_stopped_run_can_be_reused(tmp_path):
     config = tmp_path / "grid.yml"
     config.write_text(yaml.safe_dump(build_candidate(Decimal("4.5"), Decimal("6.5"), Decimal("100"))))
-    credential = CollectedCredentials(0, 4, "ab" * 32)
+    credential = CollectedCredentials(0, 4, "ab" * 40)
     services = Services(
         running=lambda: False,
         new_password_required=lambda: False,
@@ -365,7 +374,7 @@ def test_own_enabled_config_from_previous_stopped_run_can_be_reused(tmp_path):
 
 def test_launch_exception_rolls_back_enabled_and_redacts_secret(tmp_path):
     config = tmp_path / "grid.yml"
-    credential = CollectedCredentials(0, 4, "ab" * 32)
+    credential = CollectedCredentials(0, 4, "ab" * 40)
     services = Services(
         running=lambda: False,
         new_password_required=lambda: False,
@@ -385,7 +394,7 @@ def test_launch_exception_rolls_back_enabled_and_redacts_secret(tmp_path):
 
 def test_launch_output_is_redacted_before_display(tmp_path):
     config = tmp_path / "grid.yml"
-    credential = CollectedCredentials(0, 4, "ab" * 32)
+    credential = CollectedCredentials(0, 4, "ab" * 40)
     services = Services(
         running=lambda: False,
         new_password_required=lambda: False,
@@ -406,7 +415,7 @@ def test_launch_output_is_redacted_before_display(tmp_path):
 
 def test_zero_return_without_fresh_matching_process_is_not_reported_started(tmp_path):
     config = tmp_path / "grid.yml"
-    credential = CollectedCredentials(0, 4, "ab" * 32)
+    credential = CollectedCredentials(0, 4, "ab" * 40)
     services = Services(
         running=lambda: False,
         new_password_required=lambda: False,
@@ -426,7 +435,7 @@ def test_zero_return_without_fresh_matching_process_is_not_reported_started(tmp_
 
 def test_nonzero_launch_does_not_trust_unrelated_running_bot(tmp_path):
     config = tmp_path / "grid.yml"
-    credential = CollectedCredentials(0, 4, "ab" * 32)
+    credential = CollectedCredentials(0, 4, "ab" * 40)
     running_calls = 0
 
     def unrelated_starts_after_launch():
@@ -453,7 +462,7 @@ def test_nonzero_launch_does_not_trust_unrelated_running_bot(tmp_path):
 
 def test_nonzero_launch_with_exact_matching_process_is_reported_uncertain(tmp_path):
     config = tmp_path / "grid.yml"
-    credential = CollectedCredentials(0, 4, "ab" * 32)
+    credential = CollectedCredentials(0, 4, "ab" * 40)
     services = Services(
         running=lambda: False,
         new_password_required=lambda: False,
@@ -475,8 +484,8 @@ def test_credential_replace_restores_previous_encrypted_file_on_reload_failure(t
     import hummingbot.client.config.config_helpers as helpers
 
     destination = tmp_path / "lighter_perpetual_robinhood.yml"
-    old = CollectedCredentials(0, 4, "11" * 32)
-    new = CollectedCredentials(1, 5, "22" * 32)
+    old = CollectedCredentials(0, 4, "11" * 40)
+    new = CollectedCredentials(1, 5, "22" * 40)
     old_manager = Security.secrets_manager
     old_cache = Security._secure_configs.copy()
     try:
@@ -505,8 +514,8 @@ def test_credential_replace_restores_previous_file_on_post_replace_mismatch(tmp_
     import hummingbot.client.config.config_helpers as helpers
 
     destination = tmp_path / "lighter_perpetual_robinhood.yml"
-    old = CollectedCredentials(0, 4, "33" * 32)
-    new = CollectedCredentials(1, 5, "44" * 32)
+    old = CollectedCredentials(0, 4, "33" * 40)
+    new = CollectedCredentials(1, 5, "44" * 40)
     old_manager = Security.secrets_manager
     old_cache = Security._secure_configs.copy()
     try:
