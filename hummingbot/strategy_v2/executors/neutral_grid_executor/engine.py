@@ -277,6 +277,7 @@ class NeutralGridEngine:
         self.margin_required: Optional[Decimal] = None
         self.position_reconciled = False
         self.startup_reconciled = False
+        self.normal_since_start = False       # per process: an unknown order at (re)start blocks everything
         self.bootstrap_probe: Optional[Dict[str, Any]] = None
         self.bootstrap_rows_seen = 0
         self.engine_state = EngineState.BOOTSTRAPPING
@@ -1266,7 +1267,7 @@ class NeutralGridEngine:
             tp.append("RECONCILING")
         if self.unknown_active:
             entry.append("UNKNOWN_ACTIVE_ORDER")
-            if not self.meta.ever_normal:
+            if not self.normal_since_start:
                 tp.append("UNKNOWN_ACTIVE_ORDER_AT_STARTUP")
         if not self.history_complete:
             entry.append(f"HISTORY_INCOMPLETE:{self.history_incomplete_reason}")
@@ -1324,7 +1325,7 @@ class NeutralGridEngine:
                 self.b_engine is not None and self.b_engine.manual_reconcile_required
                 and "conflict" in (self.b_engine.manual_reconcile_reason or "")):
             state = EngineState.FROZEN
-        elif self.meta.freezes or self.store_entry_blockers or (self.unknown_active and not self.meta.ever_normal) \
+        elif self.meta.freezes or self.store_entry_blockers or (self.unknown_active and not self.normal_since_start) \
                 or any(e.startswith(("NET_CAP", "GROSS_CAP", "MARGIN_UNKNOWN", "ACCOUNT_IDENTITY")) for e in entry):
             state = EngineState.RISK_BLOCKED
         elif not self.bootstrapped:
@@ -1340,6 +1341,7 @@ class NeutralGridEngine:
         else:
             state = EngineState.NORMAL
             self.meta.ever_normal = True
+            self.normal_since_start = True
         self.engine_state = state
         self.reasons = sorted(set(entry) | set(tp))
 
@@ -1439,8 +1441,14 @@ class NeutralGridEngine:
                                                    role=LegRole.ENTRY, cell_id=cell_id, seq=now_ms * 1000 + rank))
         owned = [router.RouterOrder.from_leg(leg) for leg in self.non_final_legs()]
         ep = risk.endpoints_from_ledgers(self.effective_baseline, list(self.cells.values()))
+        physical_free = plan.slots.cap - len(owned)
+        budget = router.SlotBudget.from_plan(plan)
+        if physical_free <= 0:
+            # Reservations exist only on paper once the effective (venue) cap shrank below the orders already
+            # resting: TPs must obtain a real slot via the emergency entry-cancel path (NG-RISK-005, AC-44).
+            budget = router.SlotBudget(free=0, cell_unused={})
         rplan = router.plan_submits([i for i, *_ in tp_items] + entry_items, owned, endpoints=ep,
-                                    limits=self.limits, slots=router.SlotBudget.from_plan(plan), mid=self.mid,
+                                    limits=self.limits, slots=budget, mid=self.mid,
                                     entries_allowed=not self.entry_blockers,
                                     entries_blocker=self.entry_blockers[0] if self.entry_blockers
                                     else "ENTRIES_BLOCKED",
@@ -1463,11 +1471,15 @@ class NeutralGridEngine:
             if self._submits_this_tick >= self.options.max_submits_per_tick or self.persistence_error:
                 self.cell_blockers.setdefault(cell_id, "TP_WAITS_THROTTLE")
                 continue
+            if len(self.non_final_legs()) >= plan.slots.cap:
+                self.cell_blockers.setdefault(cell_id, "TP_WAITS_VENUE_CAP")
+                continue
             await self._submit(self.cells[cell_id], LegRole.TP, generation, qty, now, since_ms=intent.seq)
         for intent in entry_items:
             if intent.key not in submits:
                 continue
-            if self._submits_this_tick >= self.options.max_submits_per_tick or self.persistence_error:
+            if self._submits_this_tick >= self.options.max_submits_per_tick or self.persistence_error \
+                    or len(self.non_final_legs()) >= plan.slots.cap:
                 break
             await self._submit(self.cells[intent.cell_id], LegRole.ENTRY, None, intent.qty, now,
                                reserved_slots=plan.reservations.get(intent.cell_id, 0))
