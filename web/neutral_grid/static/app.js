@@ -52,6 +52,22 @@
     ack_risk_blocked: "Блокировка по риску проверена (RISK_BLOCKED)",
     resolve_unknown_submit: "Ордер с неизвестным итогом не попал на биржу (по CID)"
   };
+  // Offered only when the committed snapshot shows they apply; each needs a typed confirmation phrase.
+  var EXTENDED_AUDIT_ACTIONS = {
+    retire_colliding_cid: "Списать CID, занятый чужим ордером (снять заморозку CID_ALLOCATION)",
+    migrate_grid: "Миграция спокойной сетки (старые циклы сохраняются, журнал не сбрасывается)"
+  };
+  function extendedAuditAvailable(summary) {
+    var out = [];
+    if (summary && summary.freezes && summary.freezes.CID_ALLOCATION) out.push("retire_colliding_cid");
+    if (summary && Array.isArray(summary.grid_mutation_blockers) && summary.grid_mutation_blockers.length === 0)
+      out.push("migrate_grid");
+    return out;
+  }
+  function confirmationPhrase(action, cid) {
+    if (action === "retire_colliding_cid") return "СПИСАТЬ CID " + (cid || "");
+    return "МИГРАЦИЯ СЕТКИ " + txt(S.state && S.state.engine_identity && S.state.engine_identity.grid_id);
+  }
   var COMMAND_HELP = {
     pause: "Новые входы и новые циклы запрещаются. Сверка с историей биржи и поддержка уже подтверждённых TP продолжаются.",
     resume: "Движок сначала проверит свежесть данных, риск и полноту сверки и только потом снова разрешит входы.",
@@ -542,16 +558,28 @@
       fields.appendChild(el("label", { for: "f-action", text: "Что проверено" }));
       var sel = el("select", { id: "f-action" });
       Object.keys(AUDIT_ACTIONS).forEach(function (a) { sel.appendChild(el("option", { value: a, text: AUDIT_ACTIONS[a] })); });
+      var summaryNow = (S.state && S.state.summary) || {};
+      extendedAuditAvailable(summaryNow).forEach(function (a) {
+        sel.appendChild(el("option", { value: a, text: EXTENDED_AUDIT_ACTIONS[a] }));
+      });
       fields.appendChild(sel);
       var obsLabel = el("label", { for: "f-observed", text: "Наблюдаемая позиция на бирже, со знаком (для rebase)" });
       var obs = el("input", { id: "f-observed", inputmode: "decimal", spellcheck: "false" });
-      var cidLabel = el("label", { for: "f-cid", text: "Client order ID (для «не попал на биржу»)" });
+      var cidLabel = el("label", { for: "f-cid", text: "Client order ID" });
       var cid = el("input", { id: "f-cid", inputmode: "numeric", spellcheck: "false", maxlength: "20" });
-      [obsLabel, obs, cidLabel, cid].forEach(function (n) { fields.appendChild(n); });
+      var confLabel = el("label", { for: "f-confirmation", text: "Фраза подтверждения" });
+      var conf = el("input", { id: "f-confirmation", spellcheck: "false", maxlength: "80", autocomplete: "off" });
+      var confHint = el("p", { cls: "hint", id: "f-confirmation-hint" });
+      [obsLabel, obs, cidLabel, cid, confLabel, conf, confHint].forEach(function (n) { fields.appendChild(n); });
       var sync = function () {
+        var extended = sel.value === "retire_colliding_cid" || sel.value === "migrate_grid";
         obsLabel.hidden = obs.hidden = sel.value !== "baseline";
-        cidLabel.hidden = cid.hidden = sel.value !== "resolve_unknown_submit";
+        cidLabel.hidden = cid.hidden = sel.value !== "resolve_unknown_submit" && sel.value !== "retire_colliding_cid";
+        confLabel.hidden = conf.hidden = confHint.hidden = !extended;
+        if (sel.value === "retire_colliding_cid" && !cid.value && summaryNow.colliding_cid) cid.value = summaryNow.colliding_cid;
+        confHint.textContent = extended ? "Введите точно: «" + confirmationPhrase(sel.value, cid.value.trim()) + "»" : "";
       };
+      cid.addEventListener("input", sync);
       sel.addEventListener("change", sync);
       sync();
       fields.appendChild(el("label", { for: "f-note", text: "Что именно проверено (обязательно)" }));
@@ -568,7 +596,8 @@
 
   // After a 409 the operator's inputs survive, so the re-issue with fresh revisions is a single click.
   var PREFILL_IDS = { reason: "f-reason", expected_initial_position: "f-baseline", confirm: "f-confirm",
-    action: "f-action", observed_position: "f-observed", note: "f-note", acknowledge: "f-ack", cid: "f-cid" };
+    action: "f-action", observed_position: "f-observed", note: "f-note", acknowledge: "f-ack", cid: "f-cid",
+    confirmation: "f-confirmation" };
   function applyPrefill(payload) {
     Object.keys(payload).forEach(function (k) {
       var node = PREFILL_IDS[k] && $(PREFILL_IDS[k]);
@@ -586,7 +615,10 @@
     if (kind === "baseline_audit") {
       var payload = { action: $("f-action").value, note: $("f-note").value.trim(), acknowledge: $("f-ack").checked };
       if (payload.action === "baseline") payload.observed_position = $("f-observed").value.trim();
-      if (payload.action === "resolve_unknown_submit") payload.cid = $("f-cid").value.trim();
+      if (payload.action === "resolve_unknown_submit" || payload.action === "retire_colliding_cid")
+        payload.cid = $("f-cid").value.trim();
+      if (payload.action === "retire_colliding_cid" || payload.action === "migrate_grid")
+        payload.confirmation = $("f-confirmation").value.trim();
       return payload;
     }
     var reason = $("f-reason") ? $("f-reason").value.trim() : "";

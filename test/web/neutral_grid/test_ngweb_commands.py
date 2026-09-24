@@ -139,7 +139,8 @@ async def test_start_requires_explicit_baseline_and_risk_confirmation(make_web):
     assert ok.status == 202, await ok.text()
     row = (await ok.json())["command"]
     assert row["payload"] == {"expected_initial_position": "0", "risk_acknowledged": True,
-                              "baseline_acknowledged": True, "preview_id": preview["preview_id"]}
+                              "baseline_acknowledged": True, "preview_id": preview["preview_id"],
+                              "material_id": preview["material_id"]}
 
 
 @pytest.mark.asyncio

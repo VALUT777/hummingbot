@@ -20,6 +20,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -178,7 +179,8 @@ def json_error(status: int, code: str, message: str, **extra: object) -> web.Res
     from web.neutral_grid import jsonsafe
     body = {"error": code, "message": message}
     body.update(extra)
-    return web.Response(status=status, text=jsonsafe.dumps(body), content_type="application/json")
+    safe = redact_tree(jsonsafe.make_safe(body))
+    return web.Response(status=status, text=jsonsafe.dumps(safe), content_type="application/json")
 
 
 SECURITY_HEADERS = {
@@ -268,3 +270,48 @@ def redact_text(text: str, secret_values: Iterable[str]) -> str:
         if secret and len(secret) >= 4:
             redacted = redacted.replace(secret, "[скрыто]")
     return redacted
+
+
+# ---------------------------------------------------------------------------------------------- free-text redaction
+# Engine-provided free text (errors, reasons, blockers, audit details, command results) may quote an exception
+# that embeds a URL with an auth token. Defence in depth (C1): strip URL query strings and any secret-looking
+# key/value or opaque blob before the text leaves the backend. Ids (pure digits) and short codes are kept.
+REDACTED = "[скрыто]"
+_URL_QUERY = re.compile(r"(https?://[^\s?#\"'<>]+)\?[^\s\"'<>]*")
+_SECRET_KV = re.compile(
+    r"(?i)\b((?:x-)?(?:auth(?:orization)?|(?:access_|refresh_|auth_)?token|api[_-]?key|apikey|secret|password|passwd"
+    r"|signature|sig|session|private[_-]?key|credential))(['\"]?\s*[=:]\s*['\"]?)(?:bearer\s+)?([^\s&'\",;}\])]+)")
+_BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_HEX_BLOB = re.compile(r"\b(?:0x)?[0-9a-fA-F]{40,}\b")
+_OPAQUE_BLOB = re.compile(r"(?<![A-Za-z0-9_+/=-])(?=[A-Za-z0-9_+/=-]*[A-Za-z])(?=[A-Za-z0-9_+/=-]*[0-9])"
+                          r"[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-])")
+
+
+def redact_free_text(text: str) -> str:
+    """Remove URL query strings, secret key/values, bearer tokens and opaque/hex blobs from free text."""
+    redacted = _URL_QUERY.sub(lambda m: m.group(1) + "?" + REDACTED, text)
+    redacted = _SECRET_KV.sub(lambda m: m.group(1) + m.group(2) + REDACTED, redacted)
+    redacted = _BEARER.sub("Bearer " + REDACTED, redacted)
+    redacted = _HEX_BLOB.sub(REDACTED, redacted)
+    return _OPAQUE_BLOB.sub(REDACTED, redacted)
+
+
+# Keys whose values (recursively) are engine/operator free text, never ids, cursors, prices or fingerprints.
+FREE_TEXT_KEYS = frozenset({
+    "message", "reasons", "entry_blockers", "tp_blockers", "admission_blocker", "persistence_error", "fatal_reason",
+    "incomplete_reason", "warning", "blocker", "detail", "note", "result", "errors", "freezes", "banner",
+    "last_tick_error", "stop_reason", "pause_reason", "reason", "cancel_reason", "transport", "state_reason",
+    "error", "store_blockers", "config_error", "manual_reconcile_reason", "outcome_detail",
+})
+
+
+def redact_tree(value, key: str = "", inside: bool = False):
+    """Redact every string under a free-text key; other strings (ids, cursors, decimals) are left exact."""
+    inside = inside or key in FREE_TEXT_KEYS
+    if isinstance(value, str):
+        return redact_free_text(value) if inside else value
+    if isinstance(value, dict):
+        return {k: redact_tree(v, str(k), inside) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_tree(v, key, inside) for v in value]
+    return value

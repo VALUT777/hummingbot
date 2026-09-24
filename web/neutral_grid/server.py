@@ -28,6 +28,7 @@ from web.neutral_grid.security import (
     build_security_middleware,
     clear_session_cookie,
     json_error,
+    redact_tree,
     set_session_cookie,
 )
 
@@ -93,7 +94,9 @@ def _snapshot(ctx: WebContext) -> Optional[Dict[str, Any]]:
 
 
 def _json(data: Any, status: int = 200) -> web.Response:
-    return web.Response(status=status, text=jsonsafe.dumps(data), content_type="application/json")
+    # Every API body passes through free-text redaction (C1): engine texts can quote URLs with auth tokens.
+    safe = redact_tree(jsonsafe.make_safe(data))
+    return web.Response(status=status, text=jsonsafe.dumps(safe), content_type="application/json")
 
 
 async def _read_json(request: web.Request) -> Any:
