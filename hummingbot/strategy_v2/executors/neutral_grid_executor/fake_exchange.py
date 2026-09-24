@@ -556,14 +556,13 @@ class FakeExchange:
         rows = [to_row(item[2]) for item in chunk]
         if self.duplicate_boundary[endpoint] and start > 0:
             rows.insert(0, to_row(items[start - 1][2]))
-        if endpoint == TRADES_ENDPOINT and self._conflicting_trades and page_no > 1:
-            for trade_id, size in list(self._conflicting_trades.items()):
-                for item in items[:start]:
-                    leg = item[2]
-                    if leg.trade_id == trade_id:
-                        rows.append(self._trade_row(leg, size_override=size))
-                        del self._conflicting_trades[trade_id]
-                        break
+        if endpoint == TRADES_ENDPOINT and self._conflicting_trades:
+            # The same dedupe key with a different payload, served right next to the original row.
+            for item in chunk:
+                leg = item[2]
+                size = self._conflicting_trades.pop(leg.trade_id, None)
+                if size is not None:
+                    rows.append(self._trade_row(leg, size_override=size))
         if self.reorder_pages[endpoint]:
             self._rng.shuffle(rows)
         more = start + limit < len(items)

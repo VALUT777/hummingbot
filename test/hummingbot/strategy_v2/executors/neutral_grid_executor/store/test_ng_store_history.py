@@ -271,3 +271,17 @@ def test_aggregated_tp_fill_allocation_is_exact_and_idempotent(store):
     assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("3") and store.unallocated_fills() == []
     assert store.verify_ledger() == []
     assert tp.role == LegRole.TP
+
+
+def test_caller_dedupe_keys_must_match_the_canonical_keys(store, live):
+    row = _trade(live, "t-1", "2")
+    with store.transaction() as tx:
+        result = store.apply_history_batch(tx, [row], dedupe_keys=[row.dedupe_key(DOMAIN)])
+    assert len(result.new_fills) == 1
+    with pytest.raises(ValueError, match="canonical"):
+        with store.transaction() as tx:
+            store.apply_history_batch(tx, [_trade(live, "t-2", "1")], dedupe_keys=[("other", 1)])
+    with pytest.raises(TypeError, match="by keyword"):
+        with store.transaction() as tx:
+            store.apply_history_batch(tx, [_trade(live, "t-3", "1")], [row.dedupe_key(DOMAIN)])
+    assert store.leg(live.cid).filled == Decimal("2")

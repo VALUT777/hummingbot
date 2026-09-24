@@ -31,7 +31,7 @@ class EngineOptions:
     stop_uncertain_after_s: float = 120.0        # draining longer than this without proofs => STOP_UNCERTAIN
     rules_refresh_s: float = 60.0                # trading rules re-read cadence
     rules_max_age_s: float = 180.0               # older rules block new exposure
-    weight_budget_per_min: int = 14400           # 80 % of the Standard 18000/min pool
+    weight_budget_per_min: int = 16200           # 90 % of the Standard 18000/min pool (configurable)
     scan_weight_budget: int = 1400               # max weight one scanner step may spend
     max_scan_pages_per_tick: Optional[int] = None
     max_submits_per_tick: int = 20
@@ -119,7 +119,7 @@ class EngineMeta:
     seq: int = 0
     ever_normal: bool = False
     bootstrap_floor_ms: Optional[int] = None
-    history_reset_floor_ms: Optional[int] = None                # audited retention-gap reconciliation
+    history_reset: Dict[str, int] = field(default_factory=dict)  # stream -> floor ms after audited retention gap
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)

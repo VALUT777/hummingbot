@@ -2915,6 +2915,7 @@ class NeutralGridStore:
                             cursor_updates: Sequence[CursorUpdate] = (),
                             ledger_transitions: Union[None, Sequence[LedgerTransition],
                                                       Callable[[Transaction, HistoryBatchResult], None]] = None, *,
+                            dedupe_keys: Optional[Sequence[Any]] = None,
                             batch_id: Optional[str] = None) -> HistoryBatchResult:
         """ONE transaction: normalized inbox rows + dedupe keys + exact-ID fill attribution + ledger transitions +
         cursor/high-water updates (NG-HIST-002). A crash anywhere rolls all of it back; replaying the same batch
@@ -2928,12 +2929,25 @@ class NeutralGridStore:
 
         ``ledger_transitions`` is either a list of transition records or ``callable(tx, result)`` invoked after the
         rows are classified, so the engine only derives transitions from genuinely new facts.
+
+        The store derives the canonical dedupe key of every row itself (``trade_dedupe_key``/``order_dedupe_key``).
+        ``dedupe_keys`` (keyword, optional, aligned with ``rows``) lets a caller assert that its keys -- the
+        ``ExchangeTradeRow.dedupe_key(domain)`` tuple or the canonical string -- are the same; any difference raises.
         """
+        cursor_updates = list(cursor_updates)
+        for update in cursor_updates:
+            if not isinstance(update, CursorUpdate):
+                raise TypeError("cursor_updates must be CursorUpdate records (pass dedupe_keys by keyword)")
+        if dedupe_keys is not None and len(dedupe_keys) != len(rows):
+            raise ValueError("dedupe_keys must be aligned with rows")
         with self._scope(tx) as scope:
             self._require_writer()
             engine = self.engine()
             if not engine.bootstrapped:
                 raise BootstrapError("history can only be applied after bootstrap (the cut defines pre-bootstrap rows)")
+            if dedupe_keys is not None:
+                for row, given in zip(rows, dedupe_keys):
+                    self._check_caller_key(engine.connector_domain, row, given)
             result = HistoryBatchResult()
             touched_orders: Set[int] = set()
             midpoint = len(rows) // 2
@@ -2954,6 +2968,17 @@ class NeutralGridStore:
                 self._apply_cursor_update(update)
             scope.after_commit("after_history_commit")
             return result
+
+    @staticmethod
+    def _check_caller_key(domain: str, row: Any, given: Any) -> None:
+        if isinstance(row, ExchangeTradeRow):
+            canonical, native = trade_dedupe_key(domain, row), tuple(row.dedupe_key(domain))
+        elif isinstance(row, ExchangeOrderRow):
+            canonical, native = order_dedupe_key(domain, row), None
+        else:
+            raise TypeError(f"unsupported history row {type(row).__name__}")
+        if given != canonical and (native is None or tuple(given) != native):
+            raise ValueError(f"caller dedupe key {given!r} differs from the canonical key {canonical}")
 
     def _apply_history_row(self, engine: EngineRecord, row: Any, batch_id: Optional[str],
                            result: HistoryBatchResult, touched_orders: Set[int]) -> None:
@@ -3595,11 +3620,15 @@ class NeutralGridStore:
     _SNAPSHOT_HEADER = ("snapshot_version", "config_revision", "engine_revision", "committed_at", "committed_at_ms",
                         "engine_state", "reasons")
 
-    def write_snapshot(self, tx: Optional[Transaction], snapshot: Union[Snapshot, Mapping[str, Any]], *,
+    def write_snapshot(self, tx: Optional[Transaction], snapshot: Union[Snapshot, Mapping[str, Any], str], *,
                        keep_last: int = 500) -> StoredSnapshot:
         """Commit a versioned snapshot for UI/CLI readers. ``snapshot_version`` is assigned here and strictly
         increases (also across pruning). Revisions must equal the committed engine row; Decimals and ids are
-        serialized as strings (ints beyond 2**53 too)."""
+        serialized as strings (ints beyond 2**53 too). Accepts a ``Snapshot``, a mapping or its JSON text."""
+        if isinstance(snapshot, str):
+            snapshot = json.loads(snapshot, parse_float=Decimal)
+            if not isinstance(snapshot, Mapping):
+                raise TypeError("snapshot JSON must be an object")
         if isinstance(snapshot, Snapshot):
             body = dict(snapshot.payload)
             state, reasons = snapshot.engine_state, list(snapshot.reasons)

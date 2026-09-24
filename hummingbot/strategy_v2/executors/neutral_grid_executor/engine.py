@@ -73,6 +73,8 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import (
 from hummingbot.strategy_v2.executors.neutral_grid_executor.history import (
     ENDPOINT_ACCOUNT,
     ENDPOINT_ACTIVE_ORDERS,
+    ENDPOINT_INACTIVE_ORDERS,
+    ENDPOINT_TRADES,
     ENDPOINT_TRADING_RULES,
     STREAM_ORDERS,
     STREAM_TRADES,
@@ -118,6 +120,13 @@ _C_TO_B = {STREAM_TRADES: B_TRADES, STREAM_ORDERS: B_ORDERS}
 
 def _ms(ts: float) -> int:
     return int(round(ts * 1000))
+
+
+def _retry_only(cycle: Cycle) -> bool:
+    """Every entry revision was proven unsent / definitively rejected with zero fill: the same cycle may retry
+    with a new revision (NG-DB-005); it is neither an open exposure nor a completed cycle."""
+    return (bool(cycle.entries) and not cycle.tps and cycle.E == 0
+            and all(e.state in (OrderState.REJECTED_UNSENT, OrderState.REJECTED_ZERO_FILL) for e in cycle.entries))
 
 
 # ------------------------------------------------------------------------------------------ row json helpers
@@ -187,7 +196,7 @@ class _CursorView:
         self._engine = engine
 
     def high_water(self, stream: str) -> Optional[str]:
-        if self._engine.meta.history_reset_floor_ms is not None:
+        if stream in self._engine.meta.history_reset:
             return None
         return self._engine.high_water.get(stream)
 
@@ -199,7 +208,7 @@ class _CursorView:
 
     def bootstrap_floor_ms(self, stream: str) -> Optional[int]:
         meta = self._engine.meta
-        return meta.history_reset_floor_ms if meta.history_reset_floor_ms is not None else meta.bootstrap_floor_ms
+        return meta.history_reset.get(stream, meta.bootstrap_floor_ms)
 
 
 class NeutralGridEngine:
@@ -276,8 +285,8 @@ class NeutralGridEngine:
         self.ticks = 0
         self.transport_calls = 0
         self.last_snapshot: Optional[Dict[str, Any]] = None
-        self._wake = False
         self._last_account_poll_at: Optional[float] = None
+        self._active_reconciled_at: Optional[float] = None
         self._submits_this_tick = 0
         self._last_degraded_probe: Optional[float] = None
         self._active_evidence_cache: Dict[int, Tuple[Optional[str], Decimal]] = {}
@@ -433,6 +442,7 @@ class NeutralGridEngine:
         self._load()
         self.reload_needed = False
         self._active_evidence_cache = {}
+        self._active_reconciled_at = None
 
     # ================================================================================== lookups / mirror
     def leg_by_cid(self, cid: int) -> Optional[Leg]:
@@ -508,12 +518,19 @@ class NeutralGridEngine:
 
     # ================================================================================== public API
     def wake(self, event: Optional[Dict[str, Any]] = None) -> None:
-        """Private WS signal: poll soon (coalesced). Never a fill/terminal proof (NG-HIST-001)."""
+        """Private WS signal: scan history soon (coalesced). Never a fill/terminal proof (NG-HIST-001).
+
+        Only executions and terminal/cancel events need authoritative history; an acceptance ack of our own
+        order does not, so it does not spend request weight (NG-HIST-003).
+        """
         now = self.clock()
-        self._wake = True
+        event = event or {}
+        status = str(event.get("status") or "")
+        if event.get("type") == "order" and status in ("open", "pending", "in-progress"):
+            return
         self.last_ws_event_at = now
         self.scanner.wake()
-        if event and event.get("type") == "trade":
+        if event.get("type") == "trade":
             label = str(event.get("trade_id") or event.get("client_order_id"))
             self.ws_pending.setdefault(label, now)
 
@@ -824,10 +841,12 @@ class NeutralGridEngine:
             self.meta.freezes.pop(FREEZE_INVARIANT, None)
             return CommandOutcome(CommandStatus.APPLIED, {"resolved_conflicts": ids}, reload=True)
         if action == "ack_retention_gap":
+            # The unreachable old boundary is replaced by the currently available history (audited); baseline,
+            # cells and fills are untouched (no reset, no rebaseline). Drift checks still apply afterwards.
             s.record_manual_reconciliation(tx, actor, note, evidence, clear_manual_reconcile=True)
-            self.meta.history_reset_floor_ms = _ms(now) - int(self.config.history_overlap_s * 1000)
-            return CommandOutcome(CommandStatus.APPLIED,
-                                  {"history_reset_floor_ms": self.meta.history_reset_floor_ms}, reload=True)
+            floor = _ms(now) - int(self.config.history_overlap_s * 1000)
+            self.meta.history_reset = {STREAM_TRADES: floor, STREAM_ORDERS: floor}
+            return CommandOutcome(CommandStatus.APPLIED, {"history_reset_floor_ms": floor}, reload=True)
         if action == "ack_risk_blocked":
             detail = self.meta.freezes.pop(FREEZE_RISK_BLOCKED, None)
             return CommandOutcome(CommandStatus.APPLIED, {"cleared": FREEZE_RISK_BLOCKED, "detail": detail},
@@ -874,8 +893,8 @@ class NeutralGridEngine:
                     self._error("RULES_UNAVAILABLE", f"{type(exc).__name__}: {exc}", now)
         due = (self._last_account_poll_at is None
                or now - self._last_account_poll_at >= float(self.config.poll_interval_s)
-               or (self._wake and now - self._last_account_poll_at >= self.options.min_wake_interval_s)
-               or not self.startup_reconciled)
+               or (not self.startup_reconciled
+                   and now - self._last_account_poll_at >= self.options.min_wake_interval_s))
         if not due:
             return
         weight = self.port.request_weight(ENDPOINT_ACCOUNT) + self.port.request_weight(ENDPOINT_ACTIVE_ORDERS)
@@ -884,7 +903,6 @@ class NeutralGridEngine:
             return
         self._charge(now, weight)
         self._last_account_poll_at = now
-        self._wake = False
         try:
             self.position = await self.port.position()
             self.position_at = now
@@ -901,7 +919,9 @@ class NeutralGridEngine:
     async def _scan_history(self, now: float) -> None:
         if not self.scanner.should_scan(now):
             return
-        if not self._can_spend(now, self.options.scan_weight_budget):
+        one_page_each = self.port.request_weight(ENDPOINT_TRADES) + self.port.request_weight(ENDPOINT_INACTIVE_ORDERS)
+        if not self._can_spend(now, one_page_each):
+            # Exhaustion delays new exposure (history goes stale), it never skips a proof (NG-HIST-003).
             self._error("WEIGHT_BUDGET", "history scan delayed by weight budget", now)
             return
         result = await self.scanner.scan()
@@ -1002,11 +1022,12 @@ class NeutralGridEngine:
                     self.meta.obligations.setdefault(f"{fill.cell_id}:{fill.generation}", now_ms)
             gaps = [c for c in conflicts if c.startswith("retention_gap")]
             others = [c for c in conflicts if not c.startswith("retention_gap")]
-            if gaps:
+            already = self.b_engine.manual_reconcile_required
+            if gaps and not already:
                 s.mark_manual_reconcile_required(tx, "history retention gap: required overlap boundary is older "
                                                      "than the venue's available history (AC-53)",
                                                  evidence={"conflicts": gaps[:10]})
-            if others:
+            if others and not already:
                 s.mark_manual_reconcile_required(tx, f"history conflict: {others[0]}"[:1900],
                                                  evidence={"conflicts": others[:10]})
             s.kv_set(tx, "engine_meta", self.meta.to_json())
@@ -1035,8 +1056,12 @@ class NeutralGridEngine:
                     self.high_water[c_stream] = hw
                     self.cursor_ts[c_stream] = max(self.cursor_ts.get(c_stream, 0),
                                                    HighWaterMark.decode(hw).timestamp_ms)
-            if self.meta.history_reset_floor_ms is not None:
-                self.meta.history_reset_floor_ms = None
+            cleared = [c for c, hw in ((STREAM_TRADES, result.trades_high_water),
+                                       (STREAM_ORDERS, result.orders_high_water))
+                       if hw is not None and c in self.meta.history_reset]
+            if cleared:
+                for c_stream in cleared:
+                    del self.meta.history_reset[c_stream]
                 with s.transaction() as tx:
                     s.kv_set(tx, "engine_meta", self.meta.to_json())
         self.last_history_commit_at = now
@@ -1045,8 +1070,10 @@ class NeutralGridEngine:
     # ================================================================================== active list
     def _reconcile_active(self, now: float) -> None:
         """Active list proves acceptance; disappearance is never a terminal proof (TERMINAL_UNKNOWN)."""
-        if self.active_rows is None or self.active_at != self._last_account_poll_at:
+        if self.active_rows is None or self.active_at is None or self.active_at == self._active_reconciled_at:
             return
+        self._active_reconciled_at = self.active_at
+        polled_ms = _ms(self.active_at)
         owned: Dict[int, ExchangeOrderRow] = {}
         unknown: List[ExchangeOrderRow] = []
         by_exchange = {leg.exchange_order_id: leg.cid for leg in self.all_legs() if leg.exchange_order_id}
@@ -1085,7 +1112,8 @@ class NeutralGridEngine:
                             and leg.cid not in self.terminal_rows:
                         s.set_leg_state(tx, leg.cid, OrderState.LIVE, reason="seen in active orders")
                         changed.add(leg.cid)
-                elif leg.state in (OrderState.LIVE, OrderState.CANCEL_PENDING, OrderState.CANCEL_UNKNOWN):
+                elif leg.state in (OrderState.LIVE, OrderState.CANCEL_PENDING, OrderState.CANCEL_UNKNOWN) \
+                        and self._sent_before(leg.cid, polled_ms):
                     s.set_leg_state(tx, leg.cid, OrderState.TERMINAL_UNKNOWN,
                                     reason="absent from active orders (not a terminal proof)")
                     changed.add(leg.cid)
@@ -1093,6 +1121,11 @@ class NeutralGridEngine:
             self._mirror(cid)
         if unknown or changed:
             self._refresh_store_facts()
+
+    def _sent_before(self, cid: int, polled_ms: int) -> bool:
+        """Only an active list fetched after the order was sent can say anything about its absence."""
+        meta = self.order_meta.get(cid)
+        return meta is not None and meta.intent_ms < polled_ms
 
     # ================================================================================== settlement
     def _settle(self, now: float) -> None:
@@ -1125,6 +1158,7 @@ class NeutralGridEngine:
                 for cid in terminal:
                     s.set_leg_state(tx, cid, OrderState.TERMINAL,
                                     reason="terminal row + complete scan + cumulative equality + settlement")
+                    self._close_open_outbox(tx, cid)
                 for c in conflicts:
                     s.mark_manual_reconcile_required(tx, f"settlement conflict {c}"[:1900])
             for cid in terminal:
@@ -1138,7 +1172,8 @@ class NeutralGridEngine:
             if rules_ok:
                 for gen, dust in ledger.refresh_dust(self.rules).items():
                     dust_changes.append((ledger.cell_id, gen, dust))
-            if ledger.current is not None and ledger.can_release(self.position_reconciled).ok:
+            if ledger.current is not None and not _retry_only(ledger.current) \
+                    and ledger.can_release(self.position_reconciled).ok:
                 releases.append(ledger.cell_id)
         if not dust_changes and not releases:
             return
@@ -1158,6 +1193,20 @@ class NeutralGridEngine:
             self.reservations[cell_id] = 0
             self.persisted_cell_state[cell_id] = (CellState.IDLE.value, None, 0)
 
+    def _close_open_outbox(self, tx, cid: int) -> None:
+        """A proven-final leg may still have an unresolved outbox row (crash between dispatch and result): record
+        what is known so the cycle can be released (NOT_SENT only for a never-dispatched PENDING row)."""
+        s = self.store
+        for row in s.outbox_for_cid(cid):
+            if row.status == "DONE":
+                continue
+            if row.status == "PENDING":
+                result = TransportResult(TransportOutcome.NOT_SENT, "leg proven terminal; request never dispatched")
+            else:
+                result = TransportResult(TransportOutcome.UNKNOWN, "leg proven terminal by history; transport "
+                                                                   "outcome of this request never recorded")
+            s.record_transport_result(tx, cid, result, kind=row.kind)
+
     # ================================================================================== drift
     def _detect_drift(self, now: float) -> None:
         if not self.bootstrapped:
@@ -1165,7 +1214,9 @@ class NeutralGridEngine:
             self.position_reconciled = False
             return
         self.endpoints = risk.endpoints_from_ledgers(self.effective_baseline, list(self.cells.values()))
-        if self.position is None or self._position_stale(now):
+        if self.position is None or self._position_stale(now) or (
+                self.last_history_commit_at is not None and self.position_at < self.last_history_commit_at):
+            # A position read older than the ledger cannot be compared with it (it may predate a committed fill).
             self.position_reconciled = False
             return
         venue = self.position.net_base
@@ -1221,33 +1272,35 @@ class NeutralGridEngine:
             entry.append(f"HISTORY_INCOMPLETE:{self.history_incomplete_reason}")
         elif self._history_stale(now):
             entry.append("HISTORY_STALE")
-        if self.position is None or self._position_stale(now):
-            entry.append("POSITION_UNKNOWN_OR_STALE")
         rule_errors = grid.rules_blockers(self.rules)
         if rule_errors:
-            entry.extend(rule_errors)
             tp.extend(rule_errors)
         elif self._rules_stale(now):
             entry.append("RULES_STALE")
         if self.mid is None:
             entry.append("BOOK_UNKNOWN")
-        if self.position is not None:
-            if self.position.leverage is None or self.position.margin_mode is None:
-                entry.append("LEVERAGE_OR_MODE_UNKNOWN")
-            elif self.position.leverage != self.config.leverage:
-                entry.append(f"LEVERAGE_MISMATCH:{self.position.leverage}!={self.config.leverage}")
         self.margin_warning = None
         self.margin_required = None
         if self.endpoints is not None:
             self.margin_required = risk.required_margin_estimate(
                 self.endpoints.P_min, self.endpoints.P_max, self.mid, self.config.leverage)
-            available = self.position.available_collateral if self.position is not None else None
-            warning, blocks = risk.margin_advisory(available, self.margin_required)
-            if blocks:
-                entry.append(warning or "MARGIN_UNKNOWN")
-            else:
-                self.margin_warning = warning
             entry.extend(risk.cap_violations(self.endpoints, self.limits))
+        position = self.position
+        fresh = position is not None and not self._position_stale(now)
+        exposure, self.margin_warning = risk.exposure_blockers(risk.ExposureInputs(
+            position_known=True if fresh else None,
+            leverage_ok=None if position is None or position.leverage is None
+            else position.leverage == self.config.leverage,
+            position_mode_ok=None if position is None or position.margin_mode is None else True,
+            market_active=None if self.mid is None or self.rules is None else bool(self.rules.supports_limit),
+            rules=self.rules,
+            history_complete=self.history_complete and not self._history_stale(now),
+            account_identity_ok=self.port.account_index == self.config.account_index,
+            data_age_s=None if self.position_at is None else Decimal(str(round(now - self.position_at, 3))),
+            freshness_limit_s=self.config.history_freshness_s,
+            margin_available=None if position is None else position.available_collateral,
+            margin_required=self.margin_required if self.margin_required is not None else Decimal("0")))
+        entry.extend(exposure)
         if self.position_gap_since is not None and now - self.position_gap_since > self.options.position_gap_grace_s:
             entry.append("POSITION_UNRECONCILED")
         if self._outside_bounds():
@@ -1267,17 +1320,20 @@ class NeutralGridEngine:
             state = EngineState(self.meta.stop_outcome) if self.meta.stop_outcome else EngineState.STOPPING
         elif self.fatal_reason is not None or self.persistence_error is not None:
             state = EngineState.DEGRADED
-        elif late or conflict or FREEZE_INVARIANT in self.meta.freezes:
+        elif late or conflict or FREEZE_INVARIANT in self.meta.freezes or (
+                self.b_engine is not None and self.b_engine.manual_reconcile_required
+                and "conflict" in (self.b_engine.manual_reconcile_reason or "")):
             state = EngineState.FROZEN
         elif self.meta.freezes or self.store_entry_blockers or (self.unknown_active and not self.meta.ever_normal) \
-                or any(e.startswith(("NET_CAP", "GROSS_CAP", "MARGIN_UNKNOWN")) for e in entry):
+                or any(e.startswith(("NET_CAP", "GROSS_CAP", "MARGIN_UNKNOWN", "ACCOUNT_IDENTITY")) for e in entry):
             state = EngineState.RISK_BLOCKED
         elif not self.bootstrapped:
             state = EngineState.BOOTSTRAPPING
         elif not self.startup_reconciled or not self.history_complete:
             state = EngineState.RECONCILING
-        elif any(e in ("POSITION_UNKNOWN_OR_STALE", "BOOK_UNKNOWN", "RULES_STALE", "HISTORY_STALE")
-                 or e.startswith(("RULES_", "LEVERAGE")) for e in entry):
+        elif any(e in ("BOOK_UNKNOWN", "RULES_STALE", "HISTORY_STALE")
+                 or e.startswith(("RULES_", "POSITION_KNOWN", "LEVERAGE_OK", "POSITION_MODE", "MARKET_ACTIVE",
+                                  "FRESHNESS")) for e in entry):
             state = EngineState.DEGRADED
         elif entry:
             state = EngineState.PAUSED
@@ -1295,9 +1351,7 @@ class NeutralGridEngine:
         for cell_id in sorted(self.cells):
             ledger = self.cells[cell_id]
             cur = ledger.current
-            retry_only = cur is not None and not cur.tps and cur.E == 0 and all(
-                e.state in (OrderState.REJECTED_UNSENT, OrderState.REJECTED_ZERO_FILL) for e in cur.entries)
-            open_cycle = (cur is not None and not retry_only) or any(
+            open_cycle = (cur is not None and not _retry_only(cur)) or any(
                 c.has_open_obligation_or_orders() for c in ledger.cycles if c is not cur)
             eligible, why = True, None
             if not open_cycle:
@@ -1389,7 +1443,8 @@ class NeutralGridEngine:
                                     limits=self.limits, slots=router.SlotBudget.from_plan(plan), mid=self.mid,
                                     entries_allowed=not self.entry_blockers,
                                     entries_blocker=self.entry_blockers[0] if self.entry_blockers
-                                    else "ENTRIES_BLOCKED")
+                                    else "ENTRIES_BLOCKED",
+                                    owed=risk.obligation_totals(list(self.cells.values())))
         self.router_plan = rplan
         for action in rplan.actions:
             if action.kind == router.ActionKind.CANCEL:

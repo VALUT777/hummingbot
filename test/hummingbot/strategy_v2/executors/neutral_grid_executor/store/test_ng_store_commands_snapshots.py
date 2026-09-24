@@ -172,3 +172,11 @@ def test_crash_before_snapshot_commit_keeps_previous_snapshot(env, store):
     reader = NeutralGridStore.open_readonly(env.db)
     latest = reader.latest_snapshot()
     assert latest.snapshot_version == 1 and latest.engine_state == EngineState.NORMAL  # no fake STOPPED
+
+
+def test_snapshot_json_text_is_accepted_and_versioned(store):
+    with store.transaction() as tx:
+        stored = store.write_snapshot(tx, '{"engine_state": "PAUSED", "reasons": ["operator"], '
+                                          '"summary": {"authoritative_net": "-12.5"}}')
+    assert stored.engine_state == EngineState.PAUSED and stored.payload["summary"]["authoritative_net"] == "-12.5"
+    assert store.latest_snapshot().snapshot_version == stored.snapshot_version == 1
