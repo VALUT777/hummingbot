@@ -7,6 +7,7 @@ outbox (intent before transport). A forced shutdown therefore does NOT run a bes
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import os
@@ -25,6 +26,9 @@ from hummingbot.strategy_v2.models.executors import CloseType
 
 EXECUTOR_TYPE = "neutral_grid_executor"
 _TRANSIENT_BASELINE_ERRORS = {"BOOTSTRAP_NOT_READY", None}
+# The baseline was refused because the applied START acknowledged another config: the launcher re-sends its START
+# (the operator confirmed THIS config at launch), the engine re-binds it and the baseline is retried (E-09, L1).
+_REBIND_BASELINE_ERRORS = {"START_CONFIG_CHANGED"}
 
 
 def launcher_start_payload(config: NeutralGridExecutorConfig) -> Dict[str, Any]:
@@ -82,8 +86,11 @@ def durable_stop_ms(db_path: Optional[str]) -> Optional[int]:
         meta = store.kv_get("engine_meta") or {}
     finally:
         store.close()
-    value = meta.get("stop_requested_ms")
-    return int(value) if value is not None else None
+    if meta.get("stop_requested_ms") is None:
+        return None
+    # a resume must name the LATEST applied STOP (a STOP while STOPPING keeps stop_requested_ms, H2)
+    value = meta.get("last_stop_applied_ms") or meta.get("stop_requested_ms")
+    return int(value)
 
 
 def has_cid_ownership(owner: Any) -> bool:
@@ -180,13 +187,15 @@ class NeutralGridExecutor(ExecutorBase):
         port = self._build_port()
         clock = self._clock or time.time
         grid_config = self.config.to_grid_config(port.account_index)
+        options = dataclasses.replace(self._options or EngineOptions(),
+                                      unknown_resolution_delay_s=float(self.config.unknown_resolution_delay_s))
         if self._store is not None:
-            self.engine = NeutralGridEngine(grid_config, self._store, port, clock, options=self._options,
+            self.engine = NeutralGridEngine(grid_config, self._store, port, clock, options=options,
                                             offline_demo=self._offline_demo)
         else:
             # A refused store (missing/corrupt DB with prior-run evidence, lock held, config mutation) yields
             # a fail-closed DEGRADED engine: never a fresh bootstrap (AC-54).
-            self.engine = open_engine(grid_config, self.config.db_path, port, clock=clock, options=self._options,
+            self.engine = open_engine(grid_config, self.config.db_path, port, clock=clock, options=options,
                                       offline_demo=self._offline_demo,
                                       allow_grid_migration=self.config.operator_confirmed_migration)
         if self.engine.fatal_reason is not None:
@@ -309,14 +318,14 @@ class NeutralGridExecutor(ExecutorBase):
         engine = self.engine
         if self._start_key is None or self._start_refused or engine.store is None or engine.store.closed:
             return
+        if self._stop_requested:
+            # Hummingbot asked to stop: the operator's newest intent. A START is never (re)sent after it (a re-sent
+            # resume would undo the applied STOP, H2); a START row already queued before the STOP applies first.
+            self._start_key = None
+            return
         record = engine.store.get_command(idempotency_key=self._start_key)
         if record is None or record.status == CommandStatus.CONFLICT:
-            self._start_attempts += 1
-            self._start_key = f"launcher-start-{self.config.id}-{self._start_attempts}"
-            try:
-                self._enqueue(CommandKind.START, launcher_start_payload(self.config), key=self._start_key)
-            except Exception as exc:  # noqa: BLE001 - retried next tick
-                self.logger().warning(f"Neutral grid START could not be enqueued ({type(exc).__name__}); retrying")
+            self._resend_start()
             return
         if record.status == CommandStatus.APPLIED:
             self._start_key = None
@@ -326,6 +335,15 @@ class NeutralGridExecutor(ExecutorBase):
             error = (record.result or {}).get("error")
             self.start_error = f"launcher START refused: {error}"
             self.logger().error(f"Neutral grid: {self.start_error} ({record.result})")
+
+    def _resend_start(self) -> None:
+        self._start_attempts += 1
+        self._start_refused = False
+        self._start_key = f"launcher-start-{self.config.id}-{self._start_attempts}"
+        try:
+            self._enqueue(CommandKind.START, launcher_start_payload(self.config), key=self._start_key)
+        except Exception as exc:  # noqa: BLE001 - retried next tick
+            self.logger().warning(f"Neutral grid START could not be enqueued ({type(exc).__name__}); retrying")
 
     def _maybe_migrate(self) -> None:
         """Launcher-confirmed audited grid migration (AC-52): sent once the engine has fresh market data; the
@@ -363,7 +381,14 @@ class NeutralGridExecutor(ExecutorBase):
             if record is None or record.status == CommandStatus.QUEUED:
                 return
             error = (record.result or {}).get("error")
-            if record.status == CommandStatus.REJECTED and error not in _TRANSIENT_BASELINE_ERRORS:
+            if record.status == CommandStatus.REJECTED and error in _REBIND_BASELINE_ERRORS \
+                    and self.config.operator_confirmed_start and not self._stop_requested:
+                if self._start_key is None and not engine.meta.started:
+                    self._resend_start()
+                if not engine.meta.started:
+                    return
+                self._baseline_key = None                   # re-bound: retried once the cut is stable again
+            elif record.status == CommandStatus.REJECTED and error not in _TRANSIENT_BASELINE_ERRORS:
                 if not self._baseline_refused:
                     self._baseline_refused = True
                     self.start_error = f"baseline confirmation refused: {error}"
@@ -389,6 +414,7 @@ class NeutralGridExecutor(ExecutorBase):
             return
         if not self._stop_requested:
             self._stop_requested = True
+            self._start_key = None                  # the launcher START intent is dropped (never re-sent, H2)
             self._send_stop()
 
     def _collect_held_position_orders(self) -> List[Dict]:
