@@ -1,7 +1,7 @@
 import asyncio
 import time
 from decimal import Decimal
-from typing import Any, Collection, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple
 
 from lighter import SignerClient
 
@@ -106,6 +106,11 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         # Single-flight task for WS-triggered balance refresh: Lighter's account_all_assets
         # event lacks `available_balance`, so we use the event as a trigger to refresh from REST.
         self._balance_refresh_task: Optional[asyncio.Task] = None
+        # Neutral grid: payload-free "poll authoritative history soon" signals (never proof).
+        self._history_wakeup_listeners: List[Callable[[], None]] = []
+        # Orders sent through `submit_with_client_id`: tracked (events/WS updates) but reconciled by
+        # the neutral-grid engine from paginated authoritative history instead of per-order polls.
+        self._history_reconciled_client_order_ids: Set[str] = set()
         self._real_time_balance_update = False
         self._signer_client = self._create_signer_client() if trading_required and self._account_index is not None else None
         super().__init__(balance_asset_limit, rate_limits_share_pct)
@@ -298,6 +303,19 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_order_status(self):
         await self._update_orders()
 
+    async def _update_orders(self):
+        # Orders submitted with a pre-persisted client id are reconciled by the neutral-grid engine
+        # from paginated authoritative history. Polling each of them here would cost 300-400 request
+        # weight per order per poll and starve the shared 18000/min pool; legacy orders are polled
+        # exactly as before.
+        orders = [
+            order for order in self.in_flight_orders.copy().values()
+            if order.client_order_id not in self._history_reconciled_client_order_ids
+        ]
+        await self._update_orders_with_error_handler(
+            orders=orders, error_handler=self._handle_update_error_for_active_order
+        )
+
     async def _update_lost_orders_status(self):
         await self._update_lost_orders()
 
@@ -401,14 +419,18 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         return
 
     async def _update_trade_history(self):
-        if not self._order_tracker.all_fillable_orders:
+        fillable_orders = [
+            order for order in self._order_tracker.all_fillable_orders.values()
+            if order.client_order_id not in self._history_reconciled_client_order_ids
+        ]
+        if not fillable_orders:
             return
         if self._markets_by_exchange_symbol == {}:
             await self._update_trading_rules()
 
         market_ids = {
             self.market_info_for_trading_pair(order.trading_pair).market_id
-            for order in self._order_tracker.all_fillable_orders.values()
+            for order in fillable_orders
         }
         for market_id in market_ids:
             response = await self._api_get(
@@ -641,14 +663,17 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             try:
                 channel = str(event_message.get("channel", ""))
                 if channel.startswith(f"{CONSTANTS.ACCOUNT_ALL_ORDERS_CHANNEL}:"):
+                    self._signal_history_wakeup()
                     self._process_order_events(event_message.get("orders", {}))
                 elif channel.startswith(f"{CONSTANTS.ACCOUNT_ALL_TRADES_CHANNEL}:"):
+                    self._signal_history_wakeup()
                     self._process_trade_events(event_message.get("trades", {}))
                 elif channel.startswith(f"{CONSTANTS.ACCOUNT_ALL_ASSETS_CHANNEL}:"):
                     # Lighter's assets event has no `available_balance` — use it as a
                     # signal to fetch the authoritative balance snapshot from REST.
                     self._schedule_balance_refresh()
                 elif channel.startswith(f"{CONSTANTS.ACCOUNT_ALL_POSITIONS_CHANNEL}:"):
+                    self._signal_history_wakeup()
                     self._process_position_events(event_message.get("positions", {}))
             except asyncio.CancelledError:
                 raise
@@ -1310,6 +1335,26 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     # Additive API. The legacy one-page readers (`_find_order`, `get_grid_account_snapshot`,
     # `_update_trade_history`) are intentionally left unchanged.
 
+    def add_history_wakeup_listener(self, listener: Callable[[], None]) -> None:
+        """Call ``listener()`` whenever the private stream reports own order/trade/position activity.
+
+        This is only a hint to poll the authoritative REST history sooner (NG-HIST-001); it carries
+        no payload and must never be treated as evidence of fills or terminal state.
+        """
+        if listener not in self._history_wakeup_listeners:
+            self._history_wakeup_listeners.append(listener)
+
+    def remove_history_wakeup_listener(self, listener: Callable[[], None]) -> None:
+        if listener in self._history_wakeup_listeners:
+            self._history_wakeup_listeners.remove(listener)
+
+    def _signal_history_wakeup(self) -> None:
+        for listener in list(self._history_wakeup_listeners):
+            try:
+                listener()
+            except Exception:
+                self.logger().error("History wakeup listener failed.", exc_info=True)
+
     def _require_history_account_index(self) -> int:
         if self._account_index is None:
             raise IOError("Lighter account index is not resolved; history cannot be scoped.")
@@ -1541,6 +1586,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             order_type=order_type,
             position_action=PositionAction.NIL,
         )
+        self._history_reconciled_client_order_ids.add(order_id)
         tif = (
             self._signer_client.ORDER_TIME_IN_FORCE_POST_ONLY
             if order_type is OrderType.LIMIT_MAKER
@@ -1584,6 +1630,16 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             "send_tx_accepted",
             tx_hash=tx_hash if isinstance(tx_hash, str) else None,
         )
+
+    def release_history_reconciled_order(self, client_order_id: int) -> None:
+        """Stop tracking a CID-submitted order once the engine has proven it terminal from history.
+
+        Emits no events and sends nothing; the order stays in the tracker cache, so the same client
+        id is still refused by ``submit_with_client_id``.
+        """
+        order_id = str(client_order_id)
+        self._order_tracker.stop_tracking_order(order_id)
+        self._history_reconciled_client_order_ids.discard(order_id)
 
     async def cancel_with_client_id(
         self,
