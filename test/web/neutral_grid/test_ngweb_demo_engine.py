@@ -265,7 +265,11 @@ async def test_demo_engine_history_conflict_ack_through_web_is_applied(tmp_path)
                                      "history conflict published", timeout=60)
         conflict = next(c for c in state["summary"]["history_conflicts"] if c["stream"] == "trades")
         assert {v["summary"]["size"] for v in conflict["versions"]} == {"3", "1"}
-        assert all(isinstance(v["fingerprint"], str) for v in conflict["versions"])
+        # engine canonical opaque forms (they pass the web's strict id/key validation unchanged)
+        import re
+        assert re.fullmatch(r"[0-9a-f]{32}", state["summary"]["conflict_set_id"])
+        assert all(re.fullmatch(r"[0-9a-f]{32}", v["fingerprint"]) for v in conflict["versions"])
+        assert conflict["key"].startswith("trade:") and re.fullmatch(r"[A-Za-z0-9_:.\-]{1,160}", conflict["key"])
         # an ack for a set the operator did not see is refused by the web and never enqueued
         stale = dict(_ack_payload(state), conflict_set_id="0" * 32, confirmation="ПРИНЯТЬ НАБОР " + "0" * 32)
         status, body = await api.command("baseline_audit", "cf-ack-stale-000001", stale)

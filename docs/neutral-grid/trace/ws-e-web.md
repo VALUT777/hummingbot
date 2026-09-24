@@ -234,3 +234,9 @@ Coded against WS-D's announced fields `summary.history_conflicts` and `summary.c
 |---|---|
 | `test_ngweb_conflicts.py::test_committed_key_may_only_repeat_its_committed_version`, `::test_ack_payload_validation[*]` (incl. ledger correction), `::test_ui_maps_engine_conflict_errors_and_stream_labels`, `::test_conflict_set_rendered_exactly_and_in_drilldown` (six streams, `cell_id`) | contract parity |
 | `test_ngweb_demo_engine.py::test_demo_engine_history_conflict_ack_through_web_is_applied` | Real engine + FakeExchange: a persistent conflicting duplicate trade publishes a `trades` conflict with sizes {3, 1}. A web ack for an unseen set gets 409 and is never enqueued. The web ack of the published set is APPLIED, and its result's `conflict_set_id` equals the acknowledged one. |
+
+Verified against `codex/ng-engine@19dc443d6` (merged as `620da6e8f`). The engine's canonical opaque keys
+(`trade:…`, `order:…`, `<kind>:sha:<32hex>`, `store_conflict:<id>`, `manual_reconcile:reason`,
+`freeze:LEDGER_INVARIANT`, `active_evidence:<cell>`), its 32-hex fingerprints and its 32-hex `conflict_set_id`
+pass the web's strict validation unchanged. Fixtures use exactly these forms and the lowercase stream values. The
+end-to-end demo test also asserts the canonical forms on the real engine's snapshot before the web ack is APPLIED.

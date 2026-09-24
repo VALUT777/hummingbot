@@ -9,11 +9,13 @@ from ngweb_fakes import sample_snapshot
 JS_SAFE = (1 << 53) - 1
 TRADE_ID = str((1 << 64) + 11)
 ORDER_ID = str((1 << 63) + 5)
-FP_COMMITTED, FP_OTHER = "a" * 16, "b" * 16
-FP_X, FP_Y = "c" * 16, "d" * 16
+# engine canonical forms: fingerprints / conflict_set_id are 32 lowercase hex
+FP_COMMITTED, FP_OTHER = "a" * 32, "b" * 32
+FP_X, FP_Y, FP_Z = "c" * 32, "d" * 32, "e" * 32
+SET_1, SET_2 = "1" * 32, "2" * 32
 
 
-def conflict_snapshot(set_id="set-000000000001", extra_version=False):
+def conflict_snapshot(set_id=SET_1, extra_version=False):
     snap = sample_snapshot("FROZEN")
     snap["summary"]["freezes"] = {"HISTORY_CONFLICT": "conflicting duplicate rows"}
     versions_b = [
@@ -23,7 +25,7 @@ def conflict_snapshot(set_id="set-000000000001", extra_version=False):
          "summary": {"size": "3.0", "price": "5.3818", "side": "BUY", "trade_id_str": TRADE_ID}},
     ]
     if extra_version:
-        versions_b.append({"fingerprint": "e" * 16, "committed": False,
+        versions_b.append({"fingerprint": FP_Z, "committed": False,
                            "summary": {"size": "9.9", "price": "5.3818", "side": "BUY", "trade_id_str": TRADE_ID}})
     snap["summary"]["history_conflicts"] = [
         {"stream": "trades", "key": f"trade:{TRADE_ID}:BUY:{ORDER_ID}", "cell_id": "21", "versions": [
@@ -34,17 +36,17 @@ def conflict_snapshot(set_id="set-000000000001", extra_version=False):
              "summary": {"size": "2.5", "price": "5.3818", "side": "BUY", "trade_id_str": TRADE_ID,
                          "exchange_order_id": ORDER_ID}}]},
         {"stream": "inactive_orders", "key": f"order:{ORDER_ID}", "cell_id": "22", "versions": versions_b},
-        # single-version streams: always committed, never a choice; keys can repeat across streams
-        {"stream": "store_conflict", "key": "3", "cell_id": "21", "versions": [
-            {"fingerprint": "f1" * 8, "committed": True,
+        # single-version streams: always committed, never a choice (engine canonical keys)
+        {"stream": "store_conflict", "key": "store_conflict:3", "cell_id": "21", "versions": [
+            {"fingerprint": "f1" * 16, "committed": True,
              "summary": {"kind": "CUMULATIVE", "cid": "281474976710600",
                          "detail": "trade cumulative > order cumulative"}}]},
-        {"stream": "manual_reconcile", "key": "reason", "cell_id": None, "versions": [
-            {"fingerprint": "f2" * 8, "committed": True, "summary": {"reason": "retention gap"}}]},
-        {"stream": "freeze", "key": "LEDGER_INVARIANT", "cell_id": None, "versions": [
-            {"fingerprint": "f3" * 8, "committed": True, "summary": {"detail": "E < X"}}]},
-        {"stream": "active_evidence", "key": "3", "cell_id": "3", "versions": [
-            {"fingerprint": "f4" * 8, "committed": True, "summary": {"detail": "unknown active row"}}]},
+        {"stream": "manual_reconcile", "key": "manual_reconcile:reason", "cell_id": None, "versions": [
+            {"fingerprint": "f2" * 16, "committed": True, "summary": {"reason": "retention gap"}}]},
+        {"stream": "freeze", "key": "freeze:LEDGER_INVARIANT", "cell_id": None, "versions": [
+            {"fingerprint": "f3" * 16, "committed": True, "summary": {"detail": "E < X"}}]},
+        {"stream": "active_evidence", "key": "active_evidence:3", "cell_id": "3", "versions": [
+            {"fingerprint": "f4" * 16, "committed": True, "summary": {"detail": "unknown active row"}}]},
     ]
     snap["summary"]["conflict_set_id"] = set_id
     return snap
@@ -57,7 +59,7 @@ def _strict(text):
     return json.loads(text, parse_int=parse_int)
 
 
-def ack_payload(set_id="set-000000000001", accepted=None, **extra):
+def ack_payload(set_id=SET_1, accepted=None, **extra):
     body = {"action": "ack_history_conflict", "note": "сверено по истории биржи", "acknowledge": True,
             "conflict_set_id": set_id, "accepted": {f"order:{ORDER_ID}": FP_Y} if accepted is None else accepted,
             "confirmation": f"ПРИНЯТЬ НАБОР {set_id}"}
@@ -71,7 +73,7 @@ async def test_conflict_set_rendered_exactly_and_in_drilldown(make_web):
     await web.login()
     state = _strict(await (await web.get("/api/state")).text())
     conflicts = state["summary"]["history_conflicts"]
-    assert state["summary"]["conflict_set_id"] == "set-000000000001"
+    assert state["summary"]["conflict_set_id"] == SET_1
     first = conflicts[0]["versions"][0]
     assert first["committed"] is True and first["summary"]["exchange_order_id"] == ORDER_ID  # int -> exact str
     assert first["summary"]["trade_id_str"] == TRADE_ID
@@ -96,7 +98,7 @@ async def test_ack_payload_carries_set_id_and_accepted_versions(make_web):
 @pytest.mark.parametrize("override,status", [
     ({"conflict_set_id": None}, 422),                                   # required
     ({"accepted": {}}, 422),                                            # key without committed version needs a pick
-    ({"accepted": {f"order:{ORDER_ID}": "f" * 16}}, 422),               # not one of the versions shown
+    ({"accepted": {f"order:{ORDER_ID}": "f" * 32}}, 422),               # not one of the versions shown
     ({"accepted": {"order:unknown": FP_X, f"order:{ORDER_ID}": FP_X}}, 422),  # key not in the set
     ({"accepted": {f"order:{ORDER_ID}": FP_X, f"trade:{TRADE_ID}:BUY:{ORDER_ID}": FP_OTHER}}, 422),  # ledger correction
     ({"confirmation": "да"}, 422),                                      # typed phrase kept
@@ -118,12 +120,12 @@ async def test_ack_payload_validation(make_web, override, status):
 async def test_changed_set_is_409_with_fresh_set_never_enqueued(make_web):
     web = await make_web(conflict_snapshot())
     await web.login()
-    web.gateway.snapshot = conflict_snapshot(set_id="set-000000000002", extra_version=True)  # new contradiction
+    web.gateway.snapshot = conflict_snapshot(set_id=SET_2, extra_version=True)  # new contradiction
     resp = await web.command("baseline_audit", "ack-conflict-stale01", ack_payload())
     assert resp.status == 409
     body = await resp.json()
     assert body["error"] == "conflict_set_changed"
-    assert body["conflict_set_id"] == "set-000000000002"
+    assert body["conflict_set_id"] == SET_2
     assert len(body["history_conflicts"][1]["versions"]) == 3
     assert web.gateway.commands == []
     unpublished = conflict_snapshot()

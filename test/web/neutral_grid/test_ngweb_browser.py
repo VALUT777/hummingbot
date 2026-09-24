@@ -383,7 +383,7 @@ async def test_browser_round3_redaction_and_extended_audits(make_web, tmp_path):
 async def test_browser_history_conflict_ack_bound_to_viewed_set(make_web, tmp_path):
     """M1: conflict versions rendered exactly; the ack sends the viewed set id + explicit pick; a changed set
     shows the fresh set and needs a new operator click (never re-sent)."""
-    from test_ngweb_conflicts import ORDER_ID, TRADE_ID, conflict_snapshot
+    from test_ngweb_conflicts import FP_X, FP_Y, FP_Z, ORDER_ID, SET_1, SET_2, TRADE_ID, conflict_snapshot
 
     web = await make_web(conflict_snapshot())
     web.gateway.live_clock = True
@@ -391,36 +391,37 @@ async def test_browser_history_conflict_ack_bound_to_viewed_set(make_web, tmp_pa
     try:
         await page.wait_for("!document.getElementById('conflicts-card').hidden")
         card = await page.eval("document.getElementById('conflicts-card').textContent")
-        assert TRADE_ID in card and ORDER_ID in card and "set-000000000001" in card and "зафиксирована" in card
+        assert TRADE_ID in card and ORDER_ID in card and SET_1 in card and "зафиксирована" in card
+        assert "конфликт журнала" in card and "ячейка 21" in card
         await page.eval("document.querySelector('[data-cmd=baseline_audit]').click()")
         await page.wait_for("document.getElementById('cmd-dialog').open")
         await page.eval("{ const s = document.getElementById('f-action'); s.value = 'ack_history_conflict';"
                         "s.dispatchEvent(new Event('change')); }")
         radios = await page.eval("[...document.querySelectorAll('#f-conflicts input[type=radio]')].map(r => r.value)")
-        assert radios == ["c" * 16, "d" * 16]  # only the key without a committed version needs a pick
-        assert "ПРИНЯТЬ НАБОР set-000000000001" in await page.eval(
+        assert radios == [FP_X, FP_Y]  # only the key without a committed version needs a pick
+        assert f"ПРИНЯТЬ НАБОР {SET_1}" in await page.eval(
             "document.getElementById('f-confirmation-hint').textContent")
-        await page.eval(f"document.getElementById('acc-1-{'d' * 16}').checked = true;"
+        await page.eval(f"document.getElementById('acc-1-{FP_Y}').checked = true;"
                         "document.getElementById('f-note').value = 'сверено';"
                         "document.getElementById('f-ack').checked = true;"
-                        "document.getElementById('f-confirmation').value = 'ПРИНЯТЬ НАБОР set-000000000001'")
+                        f"document.getElementById('f-confirmation').value = 'ПРИНЯТЬ НАБОР {SET_1}'")
         # a new contradiction appears before the click
-        web.gateway.snapshot = conflict_snapshot(set_id="set-000000000002", extra_version=True)
+        web.gateway.snapshot = conflict_snapshot(set_id=SET_2, extra_version=True)
         await page.eval("document.getElementById('cmd-submit').click()")
         await page.wait_for("document.getElementById('cmd-error').textContent.includes('409')")
         assert web.gateway.commands == []
-        assert "set-000000000002" in await page.eval("document.getElementById('f-conflicts').textContent")
+        assert SET_2 in await page.eval("document.getElementById('f-conflicts').textContent")
         assert await page.eval("document.querySelectorAll('#f-conflicts input[type=radio]:checked').length") == 0
         assert await page.eval("document.getElementById('f-confirmation').value") == ""
         await page.eval("new Promise(r => setTimeout(r, 2500))")
         assert web.gateway.commands == []  # never re-sent on its own
-        await page.eval(f"document.getElementById('acc-1-{'e' * 16}').checked = true;"
-                        "document.getElementById('f-confirmation').value = 'ПРИНЯТЬ НАБОР set-000000000002';"
+        await page.eval(f"document.getElementById('acc-1-{FP_Z}').checked = true;"
+                        f"document.getElementById('f-confirmation').value = 'ПРИНЯТЬ НАБОР {SET_2}';"
                         "document.getElementById('cmd-submit').click()")
         await page.wait_for("!document.getElementById('cmd-dialog').open")
         [row] = web.gateway.commands
-        assert row["payload"]["conflict_set_id"] == "set-000000000002"
-        assert row["payload"]["accepted"] == {f"order:{ORDER_ID}": "e" * 16}
+        assert row["payload"]["conflict_set_id"] == SET_2
+        assert row["payload"]["accepted"] == {f"order:{ORDER_ID}": FP_Z}
         # engine-side refusal is shown as such
         web.gateway.apply(row["id"], "REJECTED", {"error": "CONFLICT_SET_CHANGED"})
         await page.wait_for("document.getElementById('pending-command').textContent.includes('аудит НЕ выполнен')")
