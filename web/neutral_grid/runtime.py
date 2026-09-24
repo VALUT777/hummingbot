@@ -267,6 +267,9 @@ async def build_demo(args: Any) -> Bundle:
     if options_cls is not None:
         options = options_cls(stop_uncertain_after_s=30.0, cancel_retry_s=5.0)
     engine = engine_module.NeutralGridEngine(config, writer, fake, clock, options=options, offline_demo=True)
+    wake = getattr(engine, "wake", None)
+    if callable(wake) and hasattr(fake, "add_ws_listener"):
+        fake.add_ws_listener(wake)  # WS signal only wakes the history scan; it is never proof (NG-HIST-001)
     host = EngineHost(engine, identity.engine_id, tick_interval_s=1.0)
     await engine.tick()  # first committed snapshot (AWAITING_START) before the UI connects
     host.start()
