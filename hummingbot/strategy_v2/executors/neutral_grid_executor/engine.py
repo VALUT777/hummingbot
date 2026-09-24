@@ -369,6 +369,7 @@ class NeutralGridEngine:
         self.position_gap_since: Optional[float] = None
         self.unknown_active: List[ExchangeOrderRow] = []
         self.ws_pending: Dict[str, float] = {}
+        self._ws_label_cid: Dict[str, Optional[int]] = {}
         self.last_ws_event_at: Optional[float] = None
         self.tp_latencies: Deque[Tuple[int, float]] = deque(maxlen=200)
         self.cell_blockers: Dict[int, str] = {}
@@ -726,9 +727,21 @@ class NeutralGridEngine:
             trade_id = event.get("trade_id")
             if trade_id is not None and str(trade_id) in self._committed_trade_ids:
                 return                                  # already in committed history: no lag (AC-13)
+            cid = self._event_cid(event.get("client_order_id"))
+            if cid is not None and self._leg_settled(cid):
+                return                                  # replay for an order whose cumulative is already proven
             label = trade_id if trade_id is not None else event.get("client_order_id")
             if label is not None:
                 self.ws_pending.setdefault(str(label), now)
+                self._ws_label_cid[str(label)] = cid
+
+    def _event_cid(self, value: Any) -> Optional[int]:
+        text = str(value) if value is not None else ""
+        return int(text) if text.isdigit() and int(text) in self.order_meta else None
+
+    def _leg_settled(self, cid: int) -> bool:
+        leg = self.leg_by_cid(cid)
+        return leg is not None and leg.state in FINAL_STATES
 
     def history_lag_s(self, now: Optional[float] = None) -> float:
         """Age of the oldest WS trade signal not yet reflected in committed history (AC-13)."""
@@ -1568,11 +1581,15 @@ class NeutralGridEngine:
             self._last_walk_start_seq = self._walk_start_seq
             # A client-id-only WS signal cannot be matched to one trade row: a complete walk that started after it
             # covered it (a trade-id signal stays until its row is committed, so real lag stays visible, AC-13).
-            # A trade-id signal that a complete walk started >= settlement_delay_s after it did not find is not ours
-            # to wait for (another market, a replayed old fill): it expires too, so lag never grows forever.
+            # A trade-id signal that is not tied to one of our live orders (unknown CID, another market, a replay of
+            # a settled order) and that a complete walk started >= settlement_delay_s after it did not find expires,
+            # so lag never grows forever. A signal for our live order stays until committed: real lag stays
+            # visible (AC-13).
             settle = float(self.config.settlement_delay_s)
             self.ws_pending = {label: at for label, at in self.ws_pending.items()
-                               if at >= started or (self._is_trade_label(label) and at + settle > started)}
+                               if at >= started or (self._is_trade_label(label) and (
+                                   at + settle > started or self._own_live_label(label)))}
+            self._ws_label_cid = {k: v for k, v in self._ws_label_cid.items() if k in self.ws_pending}
         if self.bootstrapped:
             self._apply_history(result, now, in_progress)
         else:
@@ -1607,6 +1624,10 @@ class NeutralGridEngine:
             if self.committed[STREAM_ORDERS].get(c_order_key(domain, row)) != order_payload_fingerprint(row):
                 return False
         return True
+
+    def _own_live_label(self, label: str) -> bool:
+        cid = self._ws_label_cid.get(label)
+        return cid is not None and not self._leg_settled(cid)
 
     def _is_trade_label(self, label: str) -> bool:
         """A ws_pending label is a trade id unless it names one of our CIDs."""
