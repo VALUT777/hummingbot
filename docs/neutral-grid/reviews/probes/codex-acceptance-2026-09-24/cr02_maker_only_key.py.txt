@@ -1,0 +1,42 @@
+"""Offline acceptance probe: TP capability ignores maker-only API-key restriction."""
+import asyncio
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from hummingbot.connector.derivative.lighter_perpetual import lighter_perpetual_constants as CONSTANTS
+from hummingbot.strategy_v2.executors.neutral_grid_executor.lighter_port import LighterExchangePort
+
+
+async def main():
+    market = SimpleNamespace(
+        market_id=5,
+        min_price_increment=Decimal("0.0001"),
+        min_base_increment=Decimal("0.01"),
+        min_base_amount=Decimal("5"),
+        min_quote_amount=Decimal("10"),
+        max_leverage=Decimal("5"),
+        raw_info={
+            "status": "active",
+            "market_config": {"hidden": False, "force_reduce_only": False},
+        },
+    )
+    connector = SimpleNamespace(
+        domain=CONSTANTS.ROBINHOOD_DOMAIN,
+        account_index=7,
+        _api_key_index=4,
+        _update_trading_rules=AsyncMock(),
+        market_info_for_trading_pair=lambda pair: market,
+        # Mirrors SDK get_maker_only_api_keys => api_key_indexes=[4].
+        get_maker_only_api_keys=AsyncMock(return_value={"code": 200, "api_key_indexes": [4]}),
+    )
+    rules = await LighterExchangePort(connector, "LIT-USDG").trading_rules()
+    print("configured_api_key", connector._api_key_index)
+    print("venue_maker_only_indexes", [4])
+    print("maker_only_capability_checked", connector.get_maker_only_api_keys.await_count)
+    print("reported_supports_limit", rules.supports_limit)
+    print("reported_supports_post_only", rules.supports_post_only)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
