@@ -290,7 +290,7 @@ async def build_demo(args: Any) -> Bundle:
         gateway.close()
         writer.close()
     bundle = Bundle(context, [close_all])
-    bundle.fake = fake  # type: ignore[attr-defined]  (tests and --demo-seed-fills)
+    bundle.fake = fake  # type: ignore[attr-defined]  (tests drive the fake venue directly)
     bundle.engine = engine  # type: ignore[attr-defined]
     bundle.data_dir = data_dir  # type: ignore[attr-defined]
     return bundle

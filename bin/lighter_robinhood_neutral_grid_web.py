@@ -68,8 +68,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stale-after", type=float, default=15.0,
                         help="через сколько секунд снимок считается устаревшим (по умолчанию 15)")
     parser.add_argument("--data-dir", type=Path, help="каталог временного журнала демо (по умолчанию mkdtemp)")
-    parser.add_argument("--demo-seed-fills", action="store_true",
-                        help="демо: после старта автоматически показать частичный вход, TP и пыль")
     return parser
 
 
