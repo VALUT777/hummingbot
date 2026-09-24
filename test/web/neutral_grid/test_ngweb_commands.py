@@ -392,8 +392,8 @@ async def test_confirm_baseline_refused_before_start(make_web, started_flag):
         snap["summary"]["started"] = started_flag
     web = await make_web(snap)
     await web.login()
-    resp = await web.command("confirm_baseline", "confirm-before-start", {"expected_initial_position": "0",
-                                                                         "confirm": True})
+    confirm = {"expected_initial_position": "0", "confirm": True}
+    resp = await web.command("confirm_baseline", "confirm-before-start", confirm)
     assert resp.status == 409
     assert (await resp.json())["error"] == "start_required"
     assert web.gateway.commands == []
@@ -401,6 +401,5 @@ async def test_confirm_baseline_refused_before_start(make_web, started_flag):
     snap["summary"]["started"] = True
     snap["reasons"] = ["BASELINE_NOT_CONFIRMED"]
     web.gateway.snapshot = snap
-    ok = await web.command("confirm_baseline", "confirm-after-start1", {"expected_initial_position": "0",
-                                                                        "confirm": True})
+    ok = await web.command("confirm_baseline", "confirm-after-start1", confirm)
     assert ok.status == 202, await ok.text()

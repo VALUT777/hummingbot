@@ -47,8 +47,11 @@ def for_display(value: Any, key: str = "") -> Any:
         return out
     if isinstance(value, list):
         return [for_display(v, key) for v in value]
-    if key in DISPLAY_TIME_KEYS and isinstance(value, str) and _NUMERIC_RE.fullmatch(value):
-        return float(value)
+    if key in DISPLAY_TIME_KEYS:
+        if isinstance(value, str) and _NUMERIC_RE.fullmatch(value):
+            return float(value)
+        if isinstance(value, Decimal) and value.is_finite():  # store JSON floats are parsed as Decimal
+            return float(value)
     return value
 
 

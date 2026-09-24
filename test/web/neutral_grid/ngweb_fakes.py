@@ -93,9 +93,12 @@ class FakeGateway:
         self.trades: List[Dict[str, Any]] = []
         self.events: List[Dict[str, Any]] = []
         self.enqueue_calls = 0
+        self.live_clock = False  # True: behave like a running engine that commits a fresh snapshot every tick
 
     # read side
     def latest_snapshot(self):
+        if self.live_clock and self.snapshot is not None:
+            self.snapshot["committed_at"] = time.time()
         return copy.deepcopy(self.snapshot)
 
     def get_command(self, command_id):

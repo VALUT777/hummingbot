@@ -46,8 +46,10 @@ def _snapshot_with_engine_fields(state="NORMAL"):
 @pytest.mark.asyncio
 async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
     web = await make_web(_snapshot_with_engine_fields("NORMAL"), stale_after_s=5)
+    web.gateway.live_clock = True  # a running engine commits fresh snapshots; Chrome start-up time must not matter
     browser, page = await _open(tmp_path, web)
     try:
+        await page.eval("new Promise(r => setTimeout(r, 6000))")  # slower than stale_after_s, like a cold Chrome
         # token left the URL, nothing persisted client-side, the session cookie is not script-readable
         assert await page.eval("location.hash") == ""
         assert await page.eval("localStorage.length + sessionStorage.length") == 0
@@ -96,7 +98,8 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
         await page.wait_for("document.getElementById('state-badge').dataset.state === 'STOP_UNCERTAIN'")
         assert await page.eval("document.getElementById('state-text').textContent") == "Остановка не подтверждена"
 
-        # stale snapshot: no current state claimed, last known kept separately
+        # stale snapshot: the engine stops committing -> no current state claimed, last known kept separately
+        web.gateway.live_clock = False
         web.gateway.snapshot["committed_at"] = time.time() - 60
         await page.wait_for("document.getElementById('state-badge').dataset.state === 'STALE'")
         assert "STOP_UNCERTAIN" in await page.eval("document.getElementById('state-code').textContent")
@@ -110,6 +113,7 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
 @pytest.mark.parametrize("scheme", ["light", "dark"])
 async def test_browser_contrast_and_mobile_layout(make_web, tmp_path, scheme):
     web = await make_web(_snapshot_with_engine_fields("PAUSED"))
+    web.gateway.live_clock = True
     browser, page = await _open(tmp_path, web, scheme)
     try:
         assert await page.eval(f"matchMedia('(prefers-color-scheme: {scheme})').matches") is True
