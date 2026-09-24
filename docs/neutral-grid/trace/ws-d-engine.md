@@ -241,6 +241,34 @@ Adapted existing tests: `test_ng_engine_risk.py::test_ac43_*` (DEGRADED, from th
 the acknowledged START payload (a bare `{}` START is now refused), the AC-56 new-revision behaviour is kept by the
 one immediate retry after a first definitive venue reject.
 
+## Review package 2 (engine @ `bcd2eebef`: persistence / restart / ops / launcher)
+
+Red evidence: the tests were committed at `969003ef4` on the unchanged package-1 engine; the final test files fail
+there **15/44** (every fix test, for the reported reason; the other 29 are unchanged existing CTL tests and the J
+test-honesty items) — re-run in a scratch worktree of `969003ef4` with the final test files. Green at `0399975ae`
+(+ `f96d33c58`, merge of the one test-only `codex/ng-web` commit `85359342d`). Items already fixed in package 1:
+cancel committed-but-unsent during STOP (#7), LEDGER_INVARIANT durability (#16), STOPPED with baseline/unknown
+position (#9), resolve_unknown_submit on stale evidence (#8), drift same-tick timestamps (#3).
+
+| Item | Finding | Fix | Test(s) |
+|---|---|---|---|
+| A (HIGH) | Hummingbot-stop STOP lost when its queued row becomes CONFLICT; drain logged an unpersisted STOP_UNCERTAIN | Executor tracks its STOP row: CONFLICT/REJECTED → re-enqueued with fresh revisions and a NEW key (the operator's own CLI stop intent; web commands keep the strict 409); `_stop_command_sent` only once APPLIED. Drain timeout = `stop_uncertain_after_s + 30` s (150 s); the drain reports the durable outcome (`last_drain_outcome`: `STOP_NOT_APPLIED` / `STOPPING` / committed outcome) | `CTL::test_a_hummingbot_stop_is_resent_after_a_conflict_until_the_engine_applies_it` (red: CONFLICT, never re-sent, 10 orders live); `CTL::test_a_drain_reports_the_durable_outcome_and_waits_at_least_the_uncertain_bound` |
+| B | Launcher's automatic START (new random key every process) cleared a durable STOP / STOP_UNCERTAIN | A `source=launcher` START is refused (`DURABLE_STOP_ACTIVE`) while `stop_requested_ms` is set unless it carries `resume_stop_ms` equal to that stop; the launcher sets it only when `resume_after_stop_confirmation == "RESUME <grid_id> AFTER STOP <stop_ms>"` (read-only ledger read at launch); an explicit operator (web) START still resumes; the executor surfaces a refused START | `E test_ng_engine_review2.py::test_b_automatic_launcher_start_never_overrides_a_durable_stop` (red: NORMAL, 9 new submits); `E test_ng_engine_review2.py::test_b_launcher_resume_must_name_the_durable_stop_it_resumes`; `CTL::test_b_e_launcher_confirmations_bind_resume_and_migration_to_explicit_phrases` |
+| C | Pre-send checks only after the intent commit | Tick and quantity checks in planning (idle eligibility, TP planning) before any open_cycle/CID/intent; a `PRESEND` latch waits for a rules/config fingerprint change (no backoff retry); a blocked TP obligation keeps its SLO/queue-age clock; the cell blocker is persisted with the cell row | `E test_ng_engine_review2.py::test_c_off_tick_prices_are_durable_visible_blockers_without_any_intent_or_cid` (red: queue age None) |
+| D | Baseline audit absorbed an own fill history had not delivered (B=11 instead of 7) | Audit refused (`AUDIT_EVIDENCE_NOT_SETTLED`, retryable) unless the position was requested after the latest fill commit, no WS trade signal is pending (lag 0), a complete walk started after the position read and no own order is unresolved | `E test_ng_engine_review2.py::test_d_baseline_audit_is_refused_while_an_own_fill_may_be_missing_from_history` (red: APPLIED with B=11) |
+| E | No path to a new grid on the same account/market | Launcher-confirmed migration (`migrate_grid_confirmation == "MIGRATE lighter_perpetual_robinhood LIT-USDG TO <grid_id>"`): the store opens without the fingerprint (`open_engine(allow_grid_migration=True)`), the engine stays frozen (CONFIG_MISMATCH) and the audited `migrate_grid` action verifies `grid_mutation_blockers() == []`, a new grid id and fresh market data, then calls `store.migrate_grid` in the command transaction (old grid RETIRED, cycles kept, baseline/fills/cursors untouched). The controller's default ledger is the store's per-account/market path (`engine_db_path`), so migration is the only route | `E test_ng_engine_review2.py::test_e_quiescent_grid_is_migrated_by_an_audited_command_keeping_old_cycles`; `E test_ng_engine_review2.py::test_e_migration_is_refused_while_the_old_grid_has_obligations`; `CTL::test_e_controller_default_database_is_per_account_and_market` |
+| F | CID collision latched FREEZE_CID forever | Colliding CID remembered (`meta.colliding_cid`, sticky across reload); audited `retire_colliding_cid` calls `store.retire_cid` and clears the freeze in the command transaction | `E test_ng_engine_review2.py::test_f_cid_collision_is_recovered_by_an_audited_retire` |
+| G | CLI status lacked cursor progress / TP remaining | `format_status` renders trades/orders cursors, pages read, walk progress/backoff and `remaining` per TP child | `E test_ng_engine_review2.py::test_g_cli_status_shows_cursor_progress_and_tp_remaining` |
+| H | 1000 LIT caps enforced as a product ceiling | Caps validated finite positive; a difference from the profile default is a warning (`profile_warnings`) | `CTL::test_h_profile_caps_are_defaults_not_a_product_ceiling`; `CTL::test_profile_and_confirmation_policy` (adapted) |
+| I | `operator_confirmed_*` loadable from YAML | Removed as config fields (a YAML key is rejected by `extra="forbid"`); launcher-only private attributes via `mark_operator_confirmed` | `CTL::test_i_operator_confirmations_cannot_be_loaded_from_yaml` |
+| J | Test honesty | AC-12 idle eligible cell + page fault → no entry while incomplete, resumption after; AC-42 delay 20 s asserted at tick granularity; AC-55 faults at the intent / cancel-intent / dispatch-mark writes; AC-17/21 exact `P_min`/`P_max` incl. the unknown leg + slot accounting; STOPPING during a drain | `E test_ng_engine_review2.py::test_j_ac12_*`, `E test_ng_engine_review2.py::test_j_ac42_*`, `E test_ng_engine_review2.py::test_j_ac55_intent_write_failure_sends_nothing`, `E test_ng_engine_review2.py::test_j_ac55_dispatch_mark_failure_sends_nothing`, `E test_ng_engine_review2.py::test_j_ac55_cancel_intent_failure_sends_no_cancel`, `E test_ng_engine_review2.py::test_j_ac17_*`, `E test_ng_engine_review2.py::test_j_ac21_*`, `E test_ng_engine_review2.py::test_j_honest_stopping_state_during_a_drain`; mutation-proven: "entries ignore HISTORY_* blockers", "settlement delay 0", "submit without a committed intent", "transport despite a failed dispatch mark", "cancel before its intent", "UNKNOWN legs dropped from the risk endpoints", "STOPPING reported as STOP_UNCERTAIN" — each kills its test; the unmutated code passes |
+
+Adapted existing tests: `CTL::test_controller_creates_exactly_one_executor_and_never_recreates` (default ledger is
+None = per account/market), `CTL::test_profile_and_confirmation_policy` (caps are user limits),
+`test_ng_engine_review1.py::test_r13_*` (the audit is retried until its evidence is settled). The new
+`retire_colliding_cid` / `migrate_grid` actions are `commands.EXTENDED_AUDIT_ACTIONS` (accepted by the engine,
+launcher/CLI path); `commands.AUDIT_ACTIONS` stays the web contract (`test_ngweb_commands.py::test_audit_actions_match_engine`).
+
 ## Requests to other workstreams / integrator
 
 * **R1 (integrator, blocking for a clean V2 restart).** Register the executor natively:
@@ -256,6 +284,9 @@ one immediate retry after a first definitive venue reject.
   they stop invalidating walks and the high-water advances) would make that workaround unnecessary.
 * **R3 (WS-A, optional).** Accept an initial generation (or start at 1) so the genesis sentinel is unnecessary; a
   public constructor of a `CellLedger` from projected cycles would replace the engine's call of `_link()`.
+* **R5 (WS-E, optional).** Offer the launcher-path audited actions `retire_colliding_cid` and `migrate_grid`
+  (`commands.EXTENDED_AUDIT_ACTIONS`) in the web UI, and a resume flow for `DURABLE_STOP_ACTIVE` (an explicit web
+  START already resumes; the launcher needs the `RESUME <grid_id> AFTER STOP <stop_ms>` phrase).
 * **R4 (WS-C, optional).** `LighterExchangePort` does not forward `register/release_history_reconciled_order`; the
   executor calls the connector directly (the fake exchange implements the same names).
 
@@ -289,21 +320,30 @@ one immediate retry after a first definitive venue reject.
 * TP accumulation after a runtime minimum decrease applies to entries created by this version
   (`arming_min_tp`); older live entries keep the previous per-fill dispatch.
 * The launcher START has no web preview: its `preview_id` is a digest of the confirmed grid id + B + executor id.
+* A durable STOP is never resumed automatically: after any stop the launcher needs the per-stop resume phrase (or
+  a web START). The Hummingbot-stop re-send targets the operator's own CLI intent only; a STOP that keeps
+  conflicting (state churn) is re-sent every tick until applied.
+* Baseline audits are refused while evidence is unsettled (retryable): an operator may need a few seconds and a
+  second attempt after activity; the reason list says why.
+* Grid migration needs fresh market data at apply time and a new grid id; the old grid stays in the ledger
+  (RETIRED). The controller's default ledger moved from a per-grid-id file to the store's per-account/market
+  path: a pre-existing per-grid file is not picked up automatically (set `db_path` explicitly to keep using it).
 * If the launcher cannot read the ledger at construction (corrupt/unreadable DB), nothing is registered; the
   engine then fails closed, but Hummingbot's generic cancel paths could touch orders of a previous run until the
   connector restores its own tracking marker (logged as an error).
 
-## Commands run (code at `93c80b299`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
+## Commands run (code at `f96d33c58`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
 
 | Gate | Command | Result |
 |---|---|---|
-| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 214 passed |
+| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 237 passed |
 | Heavy property sweep | `NG_PROPERTY_SEEDS=60 NG_PROPERTY_STEPS=120 $PY -m pytest .../engine/test_ng_engine_properties.py -q` | 61 passed |
 | Lighter connector | `$PY -m pytest test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_derivative.py -q` | 85 passed, 8 subtests passed |
 | Committed neutral/risk | `$PY -m pytest test/scripts/test_lighter_robinhood_neutral_grid.py test/scripts/test_lighter_robinhood_grid_risk.py -q` | 73 passed |
-| Controller/executor regressions | `$PY -m pytest test/hummingbot/strategy_v2/executors/grid_executor test/controllers/generic test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py test/hummingbot/strategy_v2/executors/test_executor_base.py -q` | 135 passed |
+| Controller/executor regressions | `$PY -m pytest test/hummingbot/strategy_v2/executors/grid_executor test/controllers/generic test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py test/hummingbot/strategy_v2/executors/test_executor_base.py -q` | 141 passed |
 | Merged WS-A/B/C suites | `$PY -m pytest test/.../neutral_grid_executor/core test/.../neutral_grid_executor/store test/.../neutral_grid_executor/history test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_history_pagination.py -q` | 355 passed, 268 subtests passed |
 | Web suite (WS-E, merged) | `$PY -m pytest test/web/neutral_grid -q` (incl. browser tests) | 130 passed |
+| Review package 2 red/green | `$PY -m pytest .../engine/test_ng_engine_review2.py test/controllers/generic/test_neutral_grid.py -q` at the `969003ef4` code / at `f96d33c58` | 15 failed, 29 passed / 44 passed |
 | Review package 1 red/green | `$PY -m pytest .../engine/test_ng_engine_review1.py -q` at the `16b837428` engine / at `93c80b299` | 26 failed, 2 passed / 28 passed |
 | Compile/import | `$PY -m py_compile <9 WS-D modules>` + import of engine/executor/fake_exchange/commands/snapshot/data_types/controller/script | OK |
 | Lint | `$PY -m flake8 <WS-D modules> test/.../engine test/controllers/generic/test_neutral_grid.py` | clean |
