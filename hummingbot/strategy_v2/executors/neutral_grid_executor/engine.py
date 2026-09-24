@@ -1242,11 +1242,15 @@ class NeutralGridEngine:
         return self.bid > self.config.upper_price or self.ask < self.config.lower_price
 
     def _evaluate_state(self, now: float) -> None:
+        if self.fatal_reason is not None:
+            # Fail closed: the store refused to open/load (missing/corrupt DB with prior-run evidence, config
+            # mutation, foreign lock...). Nothing is derived or sent.
+            self.entry_blockers = self.tp_blockers = [self.fatal_reason]
+            self.engine_state = EngineState.DEGRADED
+            self.reasons = [self.fatal_reason]
+            return
         entry: List[str] = []
         tp: List[str] = []
-        if self.fatal_reason is not None:
-            entry.append(self.fatal_reason)
-            tp.append(self.fatal_reason)
         if self.persistence_error is not None:
             entry.append("PERSISTENCE_FAILURE")
             tp.append("PERSISTENCE_FAILURE")

@@ -16,12 +16,13 @@ from typing import Any, Callable, Dict, List, Optional
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.neutral_grid_executor.commands import new_idempotency_key
-from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, EngineState
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, CommandStatus, EngineState
 from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions, NeutralGridExecutorConfig
 from hummingbot.strategy_v2.executors.neutral_grid_executor.snapshot import format_status
 from hummingbot.strategy_v2.models.executors import CloseType
 
 EXECUTOR_TYPE = "neutral_grid_executor"
+_TRANSIENT_BASELINE_ERRORS = {"BOOTSTRAP_NOT_READY", None}
 
 
 def register_executor_type() -> None:
@@ -60,6 +61,8 @@ class NeutralGridExecutor(ExecutorBase):
         self.start_error: Optional[str] = None
         self._stop_command_sent = False
         self._bootstrap_attempts = 0
+        self._baseline_key: Optional[str] = None
+        self._baseline_refused = False
 
     # ------------------------------------------------------------------ construction
     def _build_port(self):
@@ -127,16 +130,28 @@ class NeutralGridExecutor(ExecutorBase):
         if (not self.config.operator_confirmed_baseline or engine.bootstrapped or engine.store is None
                 or self.config.expected_initial_position is None):
             return
+        if self._baseline_key is not None:
+            record = engine.store.get_command(idempotency_key=self._baseline_key)
+            if record is None or record.status == CommandStatus.QUEUED:
+                return
+            error = (record.result or {}).get("error")
+            if record.status == CommandStatus.REJECTED and error not in _TRANSIENT_BASELINE_ERRORS:
+                if not self._baseline_refused:
+                    self._baseline_refused = True
+                    self.start_error = f"baseline confirmation refused: {error}"
+                    self.logger().error(f"Neutral grid: {self.start_error} ({record.result})")
+                return
         ready, _ = engine.bootstrap_ready(engine.clock())
         if not ready:
             return
-        # A rejected confirmation (e.g. snapshot moved between enqueue and apply) may be retried with a new key
-        # only once the engine again reports a stable cut; the engine re-verifies everything at apply time.
+        # A transient refusal (cut moved between enqueue and apply, stale revision) may be retried with a new key
+        # once the engine again reports a stable cut; the engine re-verifies everything at apply time.
         self._bootstrap_attempts += 1
+        self._baseline_key = f"launcher-baseline-{self.config.id}-{self._bootstrap_attempts}"
         self._enqueue(CommandKind.CONFIRM_BASELINE,
                       {"expected_initial_position": str(self.config.expected_initial_position),
                        "actor": "launcher-confirmed-operator"},
-                      key=f"launcher-baseline-{self.config.id}-{self._bootstrap_attempts}")
+                      key=self._baseline_key)
 
     def early_stop(self, keep_position: bool = False):
         """NG-OPS-003: draining stop via the durable queue; never flattens, keep_position is implied."""

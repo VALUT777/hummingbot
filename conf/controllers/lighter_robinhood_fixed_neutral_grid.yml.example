@@ -1,0 +1,36 @@
+# Fixed-cell neutral grid for Robinhood Lighter LIT-USDG (spec 2026-09-24 NG-ARCH-003 sample profile).
+# Copy to conf/controllers/lighter_robinhood_fixed_neutral_grid.yml. The values below are a profile, not
+# universal constants. enabled: false refuses any live start; enabling it additionally requires the exact
+# live_start_confirmation phrase in the script config. No credentials or URLs belong in this file: the API
+# key stays in Hummingbot's encrypted connector config.
+id: lit-robinhood-fixed-neutral-grid-v1
+controller_name: neutral_grid
+controller_type: generic
+enabled: false
+connector_name: lighter_perpetual_robinhood
+trading_pair: LIT-USDG
+grid_id: lit-neutral-fixed-v1
+# Exact multiples of the runtime tick; N=55 gives 56 fixed price lines (22 BUY / 33 SELL cells at anchor 5.4).
+lower_price: '5'
+upper_price: '6'
+cell_count: 55
+# Exact multiple of the runtime size step; validated against min base/notional at every entry and TP price.
+order_amount_base: '10'
+leverage: '5'
+position_mode: ONEWAY
+# Signed LIT position you confirm on the first bootstrap only (long, flat or short). Never adopted automatically.
+expected_initial_position: '0'
+max_abs_net_position: '1000'
+max_gross_position: '1000'
+# 3 slots per cell with Q=10 and a 5 LIT floor: 120 slots arm 40 of 55 cells (the preview shows it).
+max_active_orders: 120
+history_freshness_s: '10'
+settlement_delay_s: '5'
+settlement_scans: 2
+history_overlap_s: '60'
+poll_interval_s: '5'
+entry_order_type: LIMIT_MAKER
+tp_order_type: LIMIT
+tp_gtt_seconds: 2419200
+# Optional; default is <hummingbot data path>/neutral_grid_<grid_id>.sqlite
+db_path: null
