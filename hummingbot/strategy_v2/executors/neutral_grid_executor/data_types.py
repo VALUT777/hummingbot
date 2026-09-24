@@ -46,6 +46,7 @@ class EngineOptions:
     reject_backoff_initial_s: float = 30.0       # a latched reject is retried with unchanged rules after this ...
     reject_backoff_max_s: float = 3600.0         # ... doubling up to this
     normal_hysteresis_ticks: int = 3             # back to NORMAL after DEGRADED only after this many clean ticks
+    health_heartbeat_s: float = 10.0             # health sidecar rewritten at least this often (older = unknown)
 
     @property
     def rules_max_age_published_s(self) -> float:
@@ -139,6 +140,8 @@ class EngineMeta:
     risk_blocked: Dict[str, str] = field(default_factory=dict)   # router TP key -> RISK_BLOCKED reason
     start_preview_id: Optional[str] = None                        # preview the applied START acknowledged
     colliding_cid: Optional[int] = None                           # CID a foreign order owns (retire_colliding_cid)
+    start_config_fingerprint: Optional[str] = None                # full config the applied START acknowledged
+    audited_payloads: Dict[str, Dict[str, str]] = field(default_factory=dict)   # stream -> key -> accepted fp
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)

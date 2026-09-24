@@ -232,6 +232,10 @@ def trade_rows_from_raw(raw: Any, *, account_index: int) -> List[ExchangeTradeRo
     return rows
 
 
+class PortReadError(RuntimeError):
+    """A connector read failed; the message names only the operation and the exception type (no URL/token)."""
+
+
 def market_is_tradable(raw_info: Any) -> bool:
     """Fail-closed market state from an ``orderBookDetails`` row (status, hidden, force_reduce_only)."""
     if not isinstance(raw_info, dict):
@@ -300,6 +304,12 @@ class LighterExchangePort:
         self._connector.remove_history_wakeup_listener(callback)
 
     # reads -----------------------------------------------------------------------------------
+    @staticmethod
+    def _read_failed(operation: str, exc: BaseException) -> "PortReadError":
+        """Connector read failures carry request URLs (with ``auth=<token>`` for authenticated GETs, e.g. an
+        aiohttp ContentTypeError): only the exception type crosses the port, never its text or cause."""
+        return PortReadError(f"{operation} failed: {type(exc).__name__}")
+
     async def trading_rules(self) -> TradingRules:
         """Fresh rules; limit/post-only availability comes from the refreshed market state.
 
@@ -308,8 +318,13 @@ class LighterExchangePort:
         snapshot). Anything else - including missing fields - reports both flags False so the engine
         blocks new exposure (NG-GRID-003, NG-RISK-004). A market absent after refresh raises.
         """
-        await self._connector._update_trading_rules()
-        market = self._connector.market_info_for_trading_pair(self._trading_pair)
+        try:
+            await self._connector._update_trading_rules()
+            market = self._connector.market_info_for_trading_pair(self._trading_pair)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise self._read_failed("trading rules", exc) from None
         tradable = market_is_tradable(getattr(market, "raw_info", None))
         max_leverage = market.max_leverage
         return TradingRules(
@@ -340,7 +355,12 @@ class LighterExchangePort:
         return (bid + ask) / 2
 
     async def position(self) -> PositionSnapshot:
-        snapshot = await self._connector.fetch_account_position(self._trading_pair)
+        try:
+            snapshot = await self._connector.fetch_account_position(self._trading_pair)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise self._read_failed("account position", exc) from None
         if snapshot.get("account_index") != self.account_index or snapshot.get("market_id") != self.market_id:
             raise HistorySchemaError("position snapshot is not scoped to the port account/market")
         return PositionSnapshot(
@@ -356,6 +376,10 @@ class LighterExchangePort:
             page = await self._connector.fetch_active_orders(self._trading_pair)
         except LighterHistoryResponseError as exc:
             raise HistorySchemaError(str(exc)) from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise self._read_failed("active orders", exc) from None
         if page.next_cursor not in (None, ""):
             raise HistorySchemaError("active orders response is truncated (next_cursor present)")
         rows = [order_row_from_raw(raw, timestamp_field=self._order_timestamp_field) for raw in page.rows]
@@ -367,6 +391,10 @@ class LighterExchangePort:
             page = await self._connector.fetch_inactive_orders_page(self._trading_pair, cursor=cursor, limit=limit)
         except LighterHistoryResponseError as exc:
             raise HistorySchemaError(str(exc)) from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise self._read_failed("inactive orders page", exc) from None
         rows = [order_row_from_raw(raw, timestamp_field=self._order_timestamp_field) for raw in page.rows]
         self._check_scope(rows)
         return HistoryPage(rows=rows, next_cursor=page.next_cursor, raw_cursor_sent=page.cursor_sent)
@@ -376,6 +404,10 @@ class LighterExchangePort:
             page = await self._connector.fetch_trades_page(self._trading_pair, cursor=cursor, limit=limit)
         except LighterHistoryResponseError as exc:
             raise HistorySchemaError(str(exc)) from exc
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise self._read_failed("trades page", exc) from None
         account_index = self.account_index
         rows: List[ExchangeTradeRow] = []
         for raw in page.rows:
