@@ -122,6 +122,13 @@ def _ms(ts: float) -> int:
     return int(round(ts * 1000))
 
 
+def _retry_only(cycle: Cycle) -> bool:
+    """Every entry revision was proven unsent / definitively rejected with zero fill: the same cycle may retry
+    with a new revision (NG-DB-005); it is neither an open exposure nor a completed cycle."""
+    return (bool(cycle.entries) and not cycle.tps and cycle.E == 0
+            and all(e.state in (OrderState.REJECTED_UNSENT, OrderState.REJECTED_ZERO_FILL) for e in cycle.entries))
+
+
 # ------------------------------------------------------------------------------------------ row json helpers
 def order_row_to_json(row: ExchangeOrderRow) -> Dict[str, Any]:
     return {
@@ -1165,7 +1172,8 @@ class NeutralGridEngine:
             if rules_ok:
                 for gen, dust in ledger.refresh_dust(self.rules).items():
                     dust_changes.append((ledger.cell_id, gen, dust))
-            if ledger.current is not None and ledger.can_release(self.position_reconciled).ok:
+            if ledger.current is not None and not _retry_only(ledger.current) \
+                    and ledger.can_release(self.position_reconciled).ok:
                 releases.append(ledger.cell_id)
         if not dust_changes and not releases:
             return
@@ -1343,9 +1351,7 @@ class NeutralGridEngine:
         for cell_id in sorted(self.cells):
             ledger = self.cells[cell_id]
             cur = ledger.current
-            retry_only = cur is not None and not cur.tps and cur.E == 0 and all(
-                e.state in (OrderState.REJECTED_UNSENT, OrderState.REJECTED_ZERO_FILL) for e in cur.entries)
-            open_cycle = (cur is not None and not retry_only) or any(
+            open_cycle = (cur is not None and not _retry_only(cur)) or any(
                 c.has_open_obligation_or_orders() for c in ledger.cycles if c is not cur)
             eligible, why = True, None
             if not open_cycle:

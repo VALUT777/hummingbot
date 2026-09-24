@@ -133,14 +133,19 @@ class Harness:
                 expected=None):
         return self.engine.enqueue(kind, payload or {}, key=key or f"test-{next(self._keys)}", expected=expected)
 
-    def bootstrap(self, baseline: Decimal = D("0"), start: bool = True) -> None:
-        """First bootstrap: wait for a stable snapshot + history cut, then the explicit operator confirmation."""
+    def bootstrap(self, baseline: Decimal = D("0"), start: bool = True, confirm_tick: bool = True) -> None:
+        """First bootstrap: wait for a stable snapshot + history cut, then the explicit operator confirmation.
+
+        The confirmation is applied at the start of the next tick; the first entry intents follow in that same
+        tick. ``confirm_tick=False`` leaves that tick to the caller (e.g. to arm a crash point first).
+        """
         if start:
             self.command(CommandKind.START)
         self.run_until(lambda: self.engine.bootstrap_ready(self.clock())[0], max_ticks=60)
         self.command(CommandKind.CONFIRM_BASELINE, {"expected_initial_position": str(baseline)})
-        self.tick()
-        assert self.engine.bootstrapped, self.engine.recent_commands
+        if confirm_tick:
+            self.tick()
+            assert self.engine.bootstrapped, self.engine.recent_commands
 
     def settle(self, max_ticks: int = 80) -> None:
         """Run until every owned order that is terminal *at the venue* (test oracle) is proven TERMINAL."""
