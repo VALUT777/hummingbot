@@ -3,7 +3,7 @@ AC-15/16/17/18/19/20/21/54/55/56 plus a crash at every persistence window (store
 from decimal import Decimal
 
 import pytest
-from ng_engine_harness import Harness
+from ng_engine_harness import Harness, start_payload
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     CommandKind,
@@ -332,7 +332,7 @@ def _crash_tolerant_scenario(h: Harness) -> None:
                 h.crash_restart()
         raise AssertionError("command could not be enqueued")
 
-    cmd(CommandKind.START, {}, "k-start")
+    cmd(CommandKind.START, start_payload(), "k-start")
     for _ in range(60):
         h.tick_crashing()
         if h.engine.bootstrap_ready(h.clock())[0]:

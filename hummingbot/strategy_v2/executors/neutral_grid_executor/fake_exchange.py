@@ -237,8 +237,13 @@ class FakeExchange:
         weight_pool_per_min: int = DEFAULT_WEIGHT_POOL_PER_MIN,
         enforce_weight_pool: bool = False,
         seed: int = 7,
+        transport_delay_s: float = 0.0,
     ):
         self.clock = clock or FakeClock()
+        # Every submit/cancel round trip advances the clock (real transport is not instantaneous).
+        self.transport_delay_s = float(transport_delay_s)
+        # Submits at these prices are definitively rejected with zero fill (persistent venue refusal).
+        self.reject_prices: set = set()
         self.domain = domain
         self.account_index = account_index
         self.market_id = market_id
@@ -690,6 +695,10 @@ class FakeExchange:
 
     async def submit(self, req: SubmitRequest) -> TransportResult:
         behavior = self._next_behavior(self._submit_script, req.client_order_id, SubmitBehavior.ACCEPT)
+        if req.price in self.reject_prices:
+            behavior = SubmitBehavior.REJECT_ZERO_FILL
+        if self.transport_delay_s:
+            self.clock.advance(self.transport_delay_s)
         self.history_reconciled.add(req.client_order_id)   # like submit_with_client_id: CID orders are engine-owned
         if req.reduce_only:
             self.violations.append(f"reduce_only submit cid={req.client_order_id}")
@@ -721,6 +730,8 @@ class FakeExchange:
 
     async def cancel(self, client_order_id: int, exchange_order_id: Optional[str]) -> TransportResult:
         behavior = self._next_behavior(self._cancel_script, client_order_id, CancelBehavior.ACCEPT)
+        if self.transport_delay_s:
+            self.clock.advance(self.transport_delay_s)
         record = CallRecord(at=self.clock.now(), kind="cancel", client_order_id=client_order_id, request=None,
                             exchange_order_id=exchange_order_id, behavior=behavior.value, result=None)
         self.calls.append(record)
