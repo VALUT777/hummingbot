@@ -98,10 +98,14 @@ def test_ac16_crash_after_dispatch_commit_is_unknown_not_proven_absent(tmp_path)
         cell = leg.identity.cell_id
         assert h.live_order(cell, LegRole.ENTRY).cid == cid         # no new CID / revision for that cell
         _assert_no_phantoms_and_no_new_cid(h)
-        # Audited manual resolution is the only way out (evidence absent, history complete).
-        h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(cid),
-                                               "note": "venue export shows no order"})
-        h.tick(3)
+        # Audited manual resolution is the only way out (evidence absent, history complete), and only with evidence
+        # taken unknown_resolution_delay_s after the dispatch (round 4, H1).
+        for attempt in range(200):
+            h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(cid),
+                                                   "note": "venue export shows no order"}, key=f"resolve-{attempt}")
+            h.tick()
+            if h.engine.leg_by_cid(cid).state == OrderState.REJECTED_ZERO_FILL:
+                break
         assert h.engine.leg_by_cid(cid).state == OrderState.REJECTED_ZERO_FILL
     finally:
         h.close()
