@@ -10,6 +10,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     ExchangeTradeRow,
     LegIdentity,
     LegRole,
+    OrderState,
     OrderTypePolicy,
     Side,
     SubmitRequest,
@@ -155,3 +156,34 @@ def order_row(cid: Optional[int], side: Side, price: Decimal, amount: Decimal, f
                             market_id=market, side=side, price=price, initial_base_amount=amount,
                             filled_base_amount=filled, remaining_base_amount=amount - filled, status=status,
                             reduce_only=False, timestamp_ms=ts, raw_json=json.dumps(raw, sort_keys=True))
+
+
+def fill_and_terminate(store: NeutralGridStore, cid: int, trade_id: str, size: Decimal = Q,
+                       ts: int = BOOT_CUT_MS + 10_000) -> None:
+    """History proves ``cid`` fully filled and terminal (trade row + final inactive-order row), then TERMINAL."""
+    leg = store.leg(cid)
+    order = store.order(cid)
+    with store.transaction() as tx:
+        store.apply_history_batch(tx, [
+            trade_row(trade_id, cid, leg.side, str(size), price=str(leg.price), ts=ts,
+                      exchange_order_id=order.exchange_order_id),
+            order_row(cid, leg.side, leg.price, leg.amount, size, order_id=order.exchange_order_id, ts=ts + 1),
+        ])
+        store.set_leg_state(tx, cid, OrderState.TERMINAL, reason="terminal row + full scan + equal cumulative")
+
+
+def complete_cycle(store: NeutralGridStore, transport: FakeTransport, cell_id: int, tag: str = "a") -> Tuple[int, int]:
+    """Entry fully filled, TP fully filled, both proven terminal, cycle released. Returns (entry_cid, tp_cid)."""
+    entry = record_entry_intent(store, cell_id)
+    submit_via_protocol(store, transport, entry)
+    fill_and_terminate(store, entry.cid, f"{tag}-entry-{cell_id}")
+    generation = store.leg(entry.cid).generation
+    cycle = store.cycle(GRID_ID, cell_id, generation)
+    with store.transaction() as tx:
+        tp = store.prepare_submit(tx, tp_leg(cell_id, generation), side=cycle.tp_side, price=cycle.tp_price,
+                                  amount=cycle.entry_filled, order_type=OrderTypePolicy.LIMIT)
+    submit_via_protocol(store, transport, tp)
+    fill_and_terminate(store, tp.cid, f"{tag}-tp-{cell_id}", ts=BOOT_CUT_MS + 20_000)
+    with store.transaction() as tx:
+        store.close_cycle(tx, GRID_ID, cell_id, generation, "entry and TP proven terminal")
+    return entry.cid, tp.cid
