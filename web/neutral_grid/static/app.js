@@ -516,6 +516,36 @@
     if (!rows.length) { ul.appendChild(el("li", { text: "Команд ещё не было." })); return; }
     rows.forEach(function (c) { ul.appendChild(commandLine(c)); });
   }
+  var CONFLICT_STREAMS = {
+    trades: "сделки (история)", inactive_orders: "неактивные ордера (история)",
+    store_conflict: "конфликт журнала", manual_reconcile: "требуется ручная сверка",
+    freeze: "заморозка по инварианту", active_evidence: "активные ордера (свидетельство)"
+  };
+  var AUDIT_ERRORS = {
+    CONFLICT_SET_ID_REQUIRED: "Не указан просмотренный набор конфликтов.",
+    CONFLICT_SET_CHANGED: "Набор конфликтов изменился до применения: аудит НЕ выполнен. Проверьте свежий набор выше " +
+      "и подтвердите заново (новой командой).",
+    NOTHING_TO_AUDIT: "Аудировать нечего: набор конфликтов пуст.",
+    ACCEPTED_CHOICE_REQUIRED: "Для ключей без зафиксированной версии нужно явно выбрать принимаемую версию.",
+    ACCEPTED_INVALID: "Выбор версий некорректен.",
+    NOT_IN_CONFLICT_SET: "ключ не входит в набор конфликтов",
+    NOT_A_SEEN_VERSION: "такой версии движок не видел",
+    LEDGER_CORRECTION_NOT_SUPPORTED: "исправление зафиксированной версии не поддерживается"
+  };
+  function conflictTitle(c) {
+    return (CONFLICT_STREAMS[c.stream] || txt(c.stream)) + " · " + txt(c.key) +
+      (c.cell_id !== null && c.cell_id !== undefined ? " · ячейка " + c.cell_id : "");
+  }
+  function auditErrorText(result) {
+    if (!result || !AUDIT_ERRORS[result.error]) return null;
+    var text = AUDIT_ERRORS[result.error];
+    (result.keys || []).forEach(function (k) {
+      if (typeof k === "string") text += " " + k + ";";
+      else if (k && k.key) text += " " + k.key + ": " + (AUDIT_ERRORS[k.error] || k.error) + ";";
+    });
+    return text;
+  }
+
   // History conflicts: every version of a key side by side, exact strings, committed one marked (AC-40).
   function conflictTable(conflict, pick) {
     var versions = conflict.versions || [];
@@ -544,7 +574,7 @@
     $("conflicts-set").textContent = list.length ? "Набор: " + txt(summary.conflict_set_id) +
       ". Аудит («Аудит / ручная сверка…» → конфликт истории) подтверждает ровно этот набор." : "";
     list.forEach(function (c) {
-      box.appendChild(el("h3", { text: txt(c.stream) + " · " + txt(c.key) }));
+      box.appendChild(el("h3", { text: conflictTitle(c) }));
       box.appendChild(conflictTable(c, null));
     });
   }
@@ -608,7 +638,7 @@
       conflictBox.appendChild(el("p", { cls: "hint", text: "Набор конфликтов: " + txt(S.dialogConflict.id) }));
       S.dialogConflict.conflicts.forEach(function (c, i) {
         var committed = (c.versions || []).filter(function (v) { return v.committed; })[0];
-        conflictBox.appendChild(el("h3", { text: txt(c.stream) + " · " + txt(c.key) }));
+        conflictBox.appendChild(el("h3", { text: conflictTitle(c) }));
         conflictBox.appendChild(el("p", { cls: "hint", text: committed ? "Зафиксирована версия " + committed.fingerprint +
           "; остальные будут записаны в аудит как шум." : "Зафиксированной версии нет — выберите принимаемую версию:" }));
         conflictBox.appendChild(conflictTable(c, committed ? null : { index: i }));
@@ -726,9 +756,8 @@
     box.appendChild(el("span", { cls: "status", text: COMMAND_STATUS[c.status] || txt(c.status) }));
     if (replay) box.appendChild(el("span", { text: " (повтор: возвращена та же команда)" }));
     if (c.result) box.appendChild(el("div", { cls: "hint", text: "Результат движка: " + (typeof c.result === "string" ? c.result : JSON.stringify(c.result)) }));
-    if (c.result && c.result.error === "CONFLICT_SET_CHANGED")
-      box.appendChild(el("div", { cls: "form-error", text: "Набор конфликтов изменился до применения: аудит НЕ выполнен. " +
-        "Проверьте свежий набор выше и подтвердите заново (новой командой)." }));
+    var auditError = auditErrorText(c.result);
+    if (auditError) box.appendChild(el("div", { cls: "form-error", text: auditError }));
   }
   async function pollCommand(id, attempt) {
     if (!S.pendingCommand || String(S.pendingCommand.id) !== String(id) || attempt > 120) return;
@@ -1054,7 +1083,7 @@
         "журнала (ограниченное окно). «Не найдено» здесь не доказывает отсутствие." }));
       d.snapshot_matches.forEach(function (m) {
         if (m.source === "history_conflict") {
-          out.appendChild(el("article", { cls: "card" }, [el("h3", { text: "Конфликт истории " + txt(m.stream) + " · " + txt(m.key) }),
+          out.appendChild(el("article", { cls: "card" }, [el("h3", { text: "Конфликт истории: " + conflictTitle(m) }),
             conflictTable(m, null)]));
           return;
         }

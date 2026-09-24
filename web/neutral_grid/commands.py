@@ -227,17 +227,27 @@ class CommandService:
                                "свежий набор и подтвердите заново.",
                                conflict_set_id=current, history_conflicts=conflicts)
         accepted = normalized["accepted"]
-        keys = {str(c.get("key")): c for c in conflicts}
-        unknown = sorted(set(accepted) - set(keys))
+        # Keys may repeat across streams (store_conflict ids vs active_evidence cells): iterate, never dict-by-key.
+        unknown = sorted(set(accepted) - {str(c.get("key")) for c in conflicts if isinstance(c, dict)})
         if unknown:
             raise ValueError(f"accepted: ключи не из набора конфликтов: {unknown}.")
-        for key, conflict in keys.items():
+        for conflict in conflicts:
+            if not isinstance(conflict, dict):
+                continue
+            key = str(conflict.get("key"))
             versions = conflict.get("versions") or []
+            committed = [str(v.get("fingerprint")) for v in versions if v.get("committed")]
             fingerprints = {str(v.get("fingerprint")) for v in versions}
-            if key in accepted and accepted[key] not in fingerprints:
+            if key not in accepted:
+                if not committed:
+                    raise ValueError(f"Для {key} нет зафиксированной версии: выберите принимаемую версию явно.")
+                continue
+            if committed and accepted[key] not in committed:
+                # engine: LEDGER_CORRECTION_NOT_SUPPORTED (the ledger keeps what it committed, R6)
+                raise ValueError(f"{key}: исправление зафиксированной версии не поддерживается — для этого ключа "
+                                 "принимается только зафиксированная версия.")
+            if accepted[key] not in fingerprints:
                 raise ValueError(f"accepted[{key}]: такой версии нет среди показанных.")
-            if not any(v.get("committed") for v in versions) and key not in accepted:
-                raise ValueError(f"Для {key} нет зафиксированной версии: выберите принимаемую версию явно.")
         return None
 
     async def _start_material_blocker(self, snapshot: Dict[str, Any], cur_cfg: int,

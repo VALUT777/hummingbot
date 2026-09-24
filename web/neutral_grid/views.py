@@ -226,7 +226,8 @@ def lookup_in_snapshot(snapshot: Optional[Dict[str, Any]], wanted: str) -> List[
             texts.update(str(v) for v in (version.get("summary") or {}).values() if v is not None)
         if wanted in texts or any(wanted in part.split(":") for part in texts):
             matches.append({"source": "history_conflict", "stream": conflict.get("stream"),
-                            "key": conflict.get("key"), "versions": conflict.get("versions")})
+                            "key": conflict.get("key"), "cell_id": conflict.get("cell_id"),
+                            "versions": conflict.get("versions")})
     for item in (snapshot or {}).get("unmatched_evidence") or []:
         if isinstance(item, dict) and any(_str_eq(v, wanted) for v in item.values()):
             matches.append({"source": "unmatched_evidence", "evidence": item})
