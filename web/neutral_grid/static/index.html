@@ -6,8 +6,10 @@
   <meta name="color-scheme" content="light dark">
   <title>Нейтральная сетка</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/static/app.css">
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=terminal-20260924d">
+  <script src="/static/vendor/lightweight-charts-5.2.1/lightweight-charts.standalone.production.js?v=5.2.1" defer></script>
+  <script src="/static/terminal.js?v=terminal-20260924d" defer></script>
+  <script src="/static/app.js?v=terminal-20260924d" defer></script>
 </head>
 <body>
 <a class="skip" href="#main">Перейти к содержимому</a>
@@ -60,8 +62,33 @@
 
   <!-- Overview -->
   <section class="panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" hidden>
-    <div class="grid-2">
-      <article class="card" aria-labelledby="h-engine">
+    <section class="terminal-summary" data-terminal-region="summary" aria-label="Ключевые показатели">
+      <article class="summary-metric">
+        <span class="summary-label">Рынок · bid / ask</span>
+        <strong class="summary-value" id="terminal-price-value">—</strong>
+        <span class="summary-detail" id="terminal-spread">Данные загружаются</span>
+      </article>
+      <article class="summary-metric">
+        <span class="summary-label">Позиция · биржа</span>
+        <strong class="summary-value" id="terminal-position-value">—</strong>
+        <span class="summary-detail" id="terminal-position-detail">Журнал: —</span>
+      </article>
+      <article class="summary-metric">
+        <span class="summary-label">Заявки сетки</span>
+        <strong class="summary-value" id="terminal-orders-value">—</strong>
+        <span class="summary-detail" id="terminal-orders-detail">Снимок: —</span>
+      </article>
+      <article class="summary-metric">
+        <span class="summary-label">Сетка</span>
+        <strong class="summary-value summary-value-small" id="terminal-grid-value">—</strong>
+        <span class="summary-detail" id="terminal-grid-detail">Конфигурация загружается</span>
+      </article>
+    </section>
+
+    <div class="banner banner-error" id="persistence-banner" role="alert" hidden></div>
+
+    <section class="terminal-workspace" data-terminal-region="workspace" aria-label="График и управление">
+      <aside class="card terminal-controls" aria-label="Позиция и управление">
         <h2 id="h-engine">Состояние движка</h2>
         <p class="lede" id="engine-note"></p>
         <ul class="reasons" id="engine-reasons"></ul>
@@ -69,67 +96,133 @@
           <button type="button" class="btn" data-cmd="pause">Пауза</button>
           <button type="button" class="btn" data-cmd="resume">Снять паузу</button>
           <button type="button" class="btn btn-danger" data-cmd="stop">Стоп</button>
+          <button type="button" class="btn btn-primary terminal-start" id="terminal-start">Старт / продолжить…</button>
           <button type="button" class="btn" data-cmd="confirm_baseline">Подтвердить baseline</button>
-          <button type="button" class="btn" id="external-close-open" hidden>Я закрыл позицию вручную…</button>
-          <button type="button" class="btn" data-cmd="baseline_audit">Другой аудит / ручная сверка…</button>
         </div>
+        <p class="stop-note">«Стоп» отменяет ордера, но не закрывает позицию.</p>
+        <details class="operator-details">
+          <summary>Сверка и восстановление</summary>
+          <div class="actions">
+            <button type="button" class="btn" id="external-close-open" hidden>Я закрыл позицию вручную…</button>
+            <button type="button" class="btn" data-cmd="baseline_audit">Другой аудит / ручная сверка…</button>
+          </div>
+        </details>
         <p class="hint">Команды записываются в очередь единственного движка. Статус «в очереди» не означает,
           что биржа что-то исполнила: результат появится после применения движком.</p>
         <div id="pending-command" class="pending" aria-live="polite"></div>
-      </article>
-
-      <article class="card" aria-labelledby="h-risk">
+        <hr class="card-rule">
         <h2 id="h-risk">Позиция и лимиты</h2>
         <div class="gauge" id="net-gauge" hidden>
           <div class="gauge-track"><div class="gauge-range" id="net-range"></div><div class="gauge-mark" id="net-mark"></div><div class="gauge-zero"></div></div>
           <div class="gauge-scale"><span id="net-cap-neg">−cap</span><span>0</span><span id="net-cap-pos">+cap</span></div>
         </div>
-        <dl class="kv" id="risk-kv"></dl>
-      </article>
-    </div>
+        <details class="operator-details risk-details">
+          <summary>Все показатели позиции и лимитов</summary>
+          <dl class="kv" id="risk-kv"></dl>
+        </details>
+      </aside>
 
-    <div class="banner banner-error" id="persistence-banner" role="alert" hidden></div>
-    <article class="card" aria-labelledby="h-blockers" id="blockers-card">
+      <article class="card chart-card" aria-labelledby="h-chart">
+        <div class="chart-head">
+          <div>
+            <h2 id="h-chart">Цена и уровни сетки</h2>
+            <p class="chart-meta" id="terminal-status" data-state="loading" aria-live="polite">Загрузка рыночных данных…</p>
+          </div>
+          <label class="chart-period" for="chart-interval">Интервал
+            <select id="chart-interval" aria-label="Интервал свечей">
+              <option value="1m">1 мин</option><option value="5m" selected>5 мин</option>
+              <option value="15m">15 мин</option><option value="30m">30 мин</option>
+              <option value="1h">1 час</option><option value="4h">4 часа</option>
+            </select>
+          </label>
+        </div>
+        <div class="terminal-chart" id="terminal-chart" role="img" aria-label="График цены LIT-USDG и уровней нейтральной сетки">
+          <p class="chart-empty" id="chart-empty">График загружается…</p>
+        </div>
+        <div class="chart-footer">
+          <span id="chart-source">Источник: —</span>
+          <span id="chart-attribution">График: TradingView Lightweight Charts™ ·
+            <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer nofollow"
+               referrerpolicy="no-referrer">Copyright (с) 2025 TradingView, Inc.</a>
+          </span>
+        </div>
+      </article>
+    </section>
+
+    <section class="card activity" data-terminal-region="activity" aria-labelledby="h-activity">
+      <div class="card-head">
+        <h2 id="h-activity">Ордера и исполнения</h2>
+        <span class="hint" id="activity-revision">Снимок: —</span>
+      </div>
+      <div class="subtabs" role="tablist" aria-label="Торговая активность">
+        <button type="button" role="tab" id="activity-orders-tab" aria-controls="activity-orders-panel" aria-selected="true">Заявки сетки <span id="activity-orders-count">0</span></button>
+        <button type="button" role="tab" id="activity-fills-tab" aria-controls="activity-fills-panel" aria-selected="false" tabindex="-1">Подтверждённые исполнения <span id="activity-fills-count">0</span></button>
+      </div>
+      <div role="tabpanel" id="activity-orders-panel" aria-labelledby="activity-orders-tab">
+        <p class="activity-empty" id="activity-orders-empty">Заявок, ожидающих завершения, нет.</p>
+        <div class="table-wrap" id="activity-orders-wrap" hidden><table class="plain terminal-table">
+          <thead><tr><th>Сторона</th><th>Роль / ячейка</th><th>Цена</th><th>Запрошено</th><th>Исполнено</th><th>Остаток</th><th>Состояние</th><th>Client / exchange ID</th></tr></thead>
+          <tbody id="activity-orders-body"></tbody>
+        </table></div>
+      </div>
+      <div role="tabpanel" id="activity-fills-panel" aria-labelledby="activity-fills-tab" hidden>
+        <p class="activity-empty" id="activity-fills-empty">Подтверждённых исполнений в истории биржи нет.</p>
+        <div class="table-wrap" id="activity-fills-wrap" hidden><table class="plain terminal-table">
+          <thead><tr><th>Время</th><th>Сторона</th><th>Роль / ячейка</th><th>Цена</th><th>Объём</th><th>Trade ID</th><th>Client / exchange ID</th></tr></thead>
+          <tbody id="activity-fills-body"></tbody>
+        </table></div>
+      </div>
+      <p class="hint activity-note" id="activity-note">Показываются только данные, связанные с тем же зафиксированным снимком.</p>
+    </section>
+
+    <section class="terminal-diagnostics" data-terminal-region="diagnostics" aria-label="Диагностика и карта сетки">
+      <article class="card" aria-labelledby="h-blockers" id="blockers-card">
       <h2 id="h-blockers">Блокеры, заморозки и bootstrap</h2>
       <dl class="kv" id="blockers-kv"></dl>
       <ul class="log" id="unknown-orders" hidden></ul>
-    </article>
+      </article>
 
-    <div class="grid-3">
-      <article class="card" aria-labelledby="h-orders"><h2 id="h-orders">Ордера и слоты</h2><dl class="kv" id="orders-kv"></dl></article>
-      <article class="card" aria-labelledby="h-history"><h2 id="h-history">История биржи</h2><dl class="kv" id="history-kv"></dl></article>
-      <article class="card" aria-labelledby="h-margin"><h2 id="h-margin">Маржа и правила</h2><dl class="kv" id="margin-kv"></dl></article>
-    </div>
+      <details class="diagnostics-details">
+        <summary>Подробная диагностика</summary>
+        <div class="diagnostics-body">
+          <div class="grid-3">
+            <article class="card" aria-labelledby="h-orders"><h2 id="h-orders">Ордера и слоты</h2><dl class="kv" id="orders-kv"></dl></article>
+            <article class="card" aria-labelledby="h-history"><h2 id="h-history">История биржи</h2><dl class="kv" id="history-kv"></dl></article>
+            <article class="card" aria-labelledby="h-margin"><h2 id="h-margin">Маржа и правила</h2><dl class="kv" id="margin-kv"></dl></article>
+          </div>
 
-    <article class="card" aria-labelledby="h-map">
+          <article class="card" aria-labelledby="h-map">
       <div class="card-head">
         <h2 id="h-map">Карта ячеек</h2>
         <p class="hint">Состояние каждой ячейки берётся из зафиксированного снимка, а не из текущей цены.</p>
       </div>
       <div class="cellmap" id="cell-map" role="list" aria-label="Ячейки по состоянию"></div>
       <div class="legend" id="cell-legend"></div>
-    </article>
+          </article>
 
-    <div class="grid-2">
-      <article class="card" aria-labelledby="h-errors"><h2 id="h-errors">Последние ошибки</h2><ul class="log" id="errors-list"></ul></article>
-      <article class="card" aria-labelledby="h-commands"><h2 id="h-commands">Последние команды</h2><ul class="log" id="commands-list"></ul></article>
-    </div>
-    <article class="card" aria-labelledby="h-conflicts" id="conflicts-card" hidden>
+          <div class="grid-2">
+            <article class="card" aria-labelledby="h-errors"><h2 id="h-errors">Последние ошибки</h2><ul class="log" id="errors-list"></ul></article>
+            <article class="card" aria-labelledby="h-commands"><h2 id="h-commands">Последние команды</h2><ul class="log" id="commands-list"></ul></article>
+          </div>
+          <article class="card" aria-labelledby="h-conflicts" id="conflicts-card" hidden>
       <h2 id="h-conflicts">Конфликты истории (нужен аудит)</h2>
       <p class="hint" id="conflicts-set"></p>
       <div id="conflicts-list" class="stack"></div>
-    </article>
-    <article class="card" aria-labelledby="h-unmatched" id="unmatched-card" hidden>
+          </article>
+          <article class="card" aria-labelledby="h-unmatched" id="unmatched-card" hidden>
       <h2 id="h-unmatched">Несопоставленные данные истории</h2>
       <ul class="log" id="unmatched-list"></ul>
-    </article>
-    <article class="card demo-card" aria-labelledby="h-demo" id="demo-card" hidden>
+          </article>
+          <article class="card demo-card" aria-labelledby="h-demo" id="demo-card" hidden>
       <h2 id="h-demo">Демо: сценарии fake exchange</h2>
       <p class="hint">Эти кнопки управляют только офлайн-симулятором биржи. Состояние движка меняется
         лишь после того, как движок сам прочитает «историю» симулятора.</p>
       <div class="actions" id="demo-actions"></div>
       <p class="hint" id="demo-result" aria-live="polite"></p>
-    </article>
+          </article>
+        </div>
+      </details>
+    </section>
   </section>
 
   <!-- Preview & start -->

@@ -242,10 +242,16 @@ def test_static_assets_are_local_and_js_never_stores_or_numbers_ids():
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
-    for text in (html, js, css):
+    for text in (js, css):
         assert not re.search(r"https?://", text), "no external/CDN URLs"
         assert "@import" not in text
-    assert re.findall(r"<script[^>]*src=\"([^\"]+)\"", html) == ["/static/app.js"]
+    assert re.findall(r"https?://[^\"<]+", html) == ["https://www.tradingview.com/"]
+    assert "Copyright (с) 2025 TradingView, Inc." in html
+    assert re.findall(r"<script[^>]*src=\"([^\"]+)\"", html) == [
+        "/static/vendor/lightweight-charts-5.2.1/lightweight-charts.standalone.production.js?v=5.2.1",
+        "/static/terminal.js?v=terminal-20260924d",
+        "/static/app.js?v=terminal-20260924d",
+    ]
     assert "<script>" not in html and "style=" not in html  # CSP: no inline script/style
     assert not re.search(r"(localStorage|sessionStorage|indexedDB|document\.cookie)\s*[.\[(]", js)
     assert not re.search(r"\b(Number|parseInt|parseFloat)\s*\(", js)

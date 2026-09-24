@@ -18,7 +18,7 @@ from aiohttp import web
 
 from web.neutral_grid import jsonsafe, views
 from web.neutral_grid.commands import CommandService
-from web.neutral_grid.gateway import EngineGateway
+from web.neutral_grid.gateway import EngineGateway, SnapshotUnavailable
 from web.neutral_grid.keystore import KeystoreError, KeystoreService
 from web.neutral_grid.preview import PreviewService
 from web.neutral_grid.security import (
@@ -63,11 +63,15 @@ class WebContext:
     identity_provider: Optional[Callable[[], Dict[str, Any]]] = None
     demo: Optional[DemoControls] = None
     commands: Optional[CommandService] = None
+    terminal: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if self.commands is None:
             self.commands = CommandService(self.gateway, self.build_preview, self.identity,
                                            config_baseline=self._config_baseline)
+        if self.terminal is None and self.mode == "demo":
+            from web.neutral_grid.terminal import DemoCandleProvider, TerminalService
+            self.terminal = TerminalService(self.gateway, DemoCandleProvider(self.clock), self.identity, self.clock)
 
     def identity(self) -> Dict[str, Any]:
         return dict(self.identity_provider()) if self.identity_provider is not None else dict(self.engine_identity)
@@ -116,6 +120,13 @@ def _int_param(request: web.Request, name: str, default: int, lo: int, hi: int) 
     if not raw.isdigit():
         raise web.HTTPBadRequest(reason=f"bad {name}")
     return max(lo, min(hi, int(raw)))
+
+
+def _bounded_ascii_int(raw: str, low: int, high: int, *, max_digits: int = 3) -> Optional[int]:
+    if not raw or len(raw) > max_digits or any(char < "0" or char > "9" for char in raw):
+        return None
+    parsed = int(raw)
+    return parsed if low <= parsed <= high else None
 
 
 # ---------------------------------------------------------------------------- pages
@@ -186,6 +197,36 @@ async def state(request: web.Request) -> web.Response:
         "host": ctx.host_status(),
         "health": views.health_view(ctx.health_provider(), fresh, ctx.clock()),
     })
+
+
+async def terminal(request: web.Request) -> web.Response:
+    ctx = _ctx(request)
+    if ctx.terminal is None:
+        return json_error(503, "terminal_unavailable", "Данные терминала недоступны.")
+    interval = request.query.get("interval", "5m")
+    raw_candles = request.query.get("candle_limit", "200")
+    raw_fills = request.query.get("fill_limit", "100")
+    raw_snapshot = request.query.get("snapshot_version")
+    if interval not in {"1m", "5m", "15m", "30m", "1h", "4h"}:
+        return json_error(400, "bad_terminal_query", "Недопустимый интервал свечей.")
+    candle_limit = _bounded_ascii_int(raw_candles, 20, 500)
+    fill_limit = _bounded_ascii_int(raw_fills, 1, 200)
+    snapshot_version = None if raw_snapshot is None else _bounded_ascii_int(
+        raw_snapshot, 1, (1 << 63) - 1, max_digits=19)
+    if candle_limit is None:
+        return json_error(400, "bad_terminal_query", "candle_limit должен быть от 20 до 500.")
+    if fill_limit is None:
+        return json_error(400, "bad_terminal_query", "fill_limit должен быть от 1 до 200.")
+    if raw_snapshot is not None and (snapshot_version is None or raw_snapshot.startswith("0")):
+        return json_error(400, "bad_terminal_query", "snapshot_version должен быть положительным целым ID.")
+    try:
+        data = await ctx.terminal.build(
+            interval=interval, candle_limit=candle_limit, fill_limit=fill_limit,
+            stale_after_s=ctx.stale_after_s, snapshot_version=snapshot_version,
+        )
+    except SnapshotUnavailable:
+        return json_error(409, "snapshot_unavailable", "Запрошенный снимок больше не доступен; обновите состояние.")
+    return _json(data)
 
 
 async def preview(request: web.Request) -> web.Response:
@@ -344,6 +385,7 @@ def create_app(ctx: WebContext) -> web.Application:
     app.router.add_post("/api/logout", logout)
     app.router.add_get("/api/session", session_info)
     app.router.add_get("/api/state", state)
+    app.router.add_get("/api/terminal", terminal)
     app.router.add_get("/api/preview", preview)
     app.router.add_get("/api/cells", cells)
     app.router.add_get("/api/commands", commands_list)

@@ -32,6 +32,7 @@ from web.neutral_grid.keystore import KeystoreService
 from web.neutral_grid.preview import MarketContext, PreviewService
 from web.neutral_grid.security import SecurityPolicy
 from web.neutral_grid.server import DemoControls, WebContext
+from web.neutral_grid.terminal import PublicCandleProvider, TerminalService
 
 LOGGER = logging.getLogger("web.neutral_grid.runtime")
 _DECIMAL_FIELDS = {f.name for f in dataclasses.fields(GridConfig)
@@ -274,10 +275,12 @@ def attach_context(gateway: Any, args: Any, *, health_provider: Callable[[], Dic
         return engine_identity_view(cfg) if cfg is not None else {"grid_id": None, "config_error": error}
 
     preview = PreviewService(config_source, snapshot_market(gateway, config_source, args.stale_after), mode="attach")
-    return WebContext(
+    context = WebContext(
         gateway=gateway, preview=preview, keystore=None, engine_identity={},
         identity_provider=identity, mode="attach", bind_host=args.host, stale_after_s=args.stale_after,
         policy=_security_policy(args), health_provider=health_provider)
+    context.terminal = TerminalService(gateway, PublicCandleProvider(), context.identity)
+    return context
 
 
 async def build_attach(args: Any) -> Bundle:

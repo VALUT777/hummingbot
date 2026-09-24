@@ -13,6 +13,7 @@ from decimal import Decimal
 import pytest
 from ngweb_cdp import CONTRAST_JS, Browser, find_chrome
 from ngweb_fakes import ACCESS_TOKEN, sample_rules, sample_snapshot
+from web.neutral_grid.terminal import DemoCandleProvider, TerminalService
 
 CHROME = find_chrome()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chrome/Chromium binary for headless browser tests")
@@ -56,6 +57,8 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
         assert await page.eval("document.cookie") == ""
         await page.wait_for("document.getElementById('state-text').textContent === 'Работает'")
         assert await page.eval("document.getElementById('state-badge').dataset.state") == "NORMAL"
+        assert await page.eval("document.getElementById('terminal-start').hidden") is True
+        assert await page.eval("document.querySelector('[data-cmd=confirm_baseline]').hidden") is True
 
         # exact ids beyond 2**53 in the DOM (cells table and lookup)
         await page.eval("document.getElementById('tab-cells').click()")
@@ -111,6 +114,159 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
         await page.wait_for("document.getElementById('persistence-banner').textContent.includes('disk is full')")
         assert "не зафиксировано" in await page.eval("document.getElementById('persistence-banner').textContent")
         assert await page.eval("localStorage.length + sessionStorage.length") == 0
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_terminal_hierarchy_and_activity_tabs(make_web, tmp_path):
+    """The primary view is a terminal: summary, chart/risk workspace, then exact order and fill activity."""
+    web = await make_web(_snapshot_with_engine_fields("NORMAL"))
+    web.gateway.live_clock = True
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('terminal-status').dataset.state !== 'loading'")
+        order = await page.eval("[...document.querySelectorAll('#panel-overview [data-terminal-region]')]"
+                                ".map(node => node.dataset.terminalRegion)")
+        assert order[:4] == ["summary", "workspace", "activity", "diagnostics"]
+        assert await page.eval("document.getElementById('terminal-chart').getAttribute('aria-label')")
+        assert "TradingView" in await page.eval("document.getElementById('chart-attribution').textContent")
+
+        # A second, keyboard-operable tablist changes only the under-chart activity surface.
+        await page.eval("document.getElementById('activity-orders-tab').focus()")
+        await page.key("ArrowRight")
+        assert await page.eval("document.activeElement.id") == "activity-fills-tab"
+        assert await page.eval("document.getElementById('activity-fills-tab').getAttribute('aria-selected')") == "true"
+        assert await page.eval("document.getElementById('activity-orders-panel').hidden") is True
+        assert await page.eval("document.getElementById('activity-fills-panel').hidden") is False
+        assert await page.eval("NeutralGridTerminal.sameRevision("
+                               "{snapshot:{config_revision:1,engine_revision:2,snapshot_version:10}},"
+                               "{snapshot:{config_revision:1,engine_revision:2,snapshot_version:'9'}})") is False
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_terminal_primary_start_uses_existing_confirmation(make_web, tmp_path):
+    web = await make_web(_snapshot_with_engine_fields("STOPPED"))
+    web.gateway.live_clock = True
+    web.ctx.terminal = TerminalService(web.gateway, DemoCandleProvider(), web.ctx.identity)
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("!document.getElementById('terminal-start').hidden")
+        assert "Продолжить сетку" in await page.eval("document.getElementById('terminal-start').textContent")
+        await page.eval("document.getElementById('terminal-start').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        assert await page.eval("document.getElementById('tab-preview').getAttribute('aria-selected')") == "true"
+        assert "Продолжить сохранённую сетку" in await page.eval("document.getElementById('start-title').textContent")
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_terminal_renders_candles_and_exact_order_strings(make_web, tmp_path):
+    snap = _snapshot_with_engine_fields("NORMAL")
+    snap["snapshot_version"] = 1842
+    snap["summary"].update({"anchor": "5.400000000000000001", "bid": "5.399999999999999999",
+                            "ask": "5.400000000000000002"})
+    snap["cells"][0]["entry"].update(price="5.381800000000000001", requested="10.000000000000000001")
+    web = await make_web(snap)
+    web.gateway.live_clock = True
+    fill = {"dedupe_key": "trade:precise", "trade_id": "9007199254741999", "cid": "281474976710600",
+            "exchange_order_id": HUGE, "grid_id": "ng-test", "cell_id": "21", "generation": 2,
+            "role": "ENTRY", "side": "BUY", "size": "3.000000000000000001",
+            "price": "5.351200000000000001", "trade_at": 1790250102.234, "late": False}
+    web.gateway.terminal_read = lambda limit, snapshot_version=None: (web.gateway.latest_snapshot(), [fill], False)
+    web.ctx.terminal = TerminalService(web.gateway, DemoCandleProvider(), web.ctx.identity)
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('terminal-status').dataset.state === 'ready'")
+        await page.wait_for("document.getElementById('chart-empty').hidden")
+        assert await page.eval("document.querySelectorAll('#terminal-chart canvas').length") > 0
+        assert await page.eval("document.getElementById('terminal-price-value').textContent") == \
+            "5.399999999999999999 / 5.400000000000000002"
+        assert "якорь 5.400000000000000001" in await page.eval("document.getElementById('terminal-spread').textContent")
+        orders = await page.eval("document.getElementById('activity-orders-body').textContent")
+        assert "10.000000000000000001" in orders
+        assert "281474976710600" in orders and HUGE in orders
+        await page.eval("document.getElementById('activity-fills-tab').click()")
+        fills = await page.eval("document.getElementById('activity-fills-body').textContent")
+        assert "9007199254741999" in fills and "3.000000000000000001" in fills
+        assert "5.351200000000000001" in fills and HUGE in fills
+
+        fit_count = await page.eval("document.getElementById('terminal-chart').dataset.fitCount")
+        await page.eval("new Promise(r => setTimeout(r, 2500))")
+        assert await page.eval("document.getElementById('terminal-chart').dataset.fitCount") == fit_count
+
+        await page.eval("{ const s = document.getElementById('chart-interval'); s.value = '15m';"
+                        "s.dispatchEvent(new Event('change')); }")
+        await page.wait_for(f"document.getElementById('terminal-chart').dataset.fitCount !== '{fit_count}'")
+        assert await page.eval("document.getElementById('chart-interval').value") == "15m"
+
+        # A new configuration revision refreshes the exact preview-backed size/leverage metric once.
+        original_preview = web.ctx.build_preview
+        revision_two_attempts = 0
+
+        async def flaky_preview(**kwargs):
+            nonlocal revision_two_attempts
+            if kwargs.get("config_revision") == 2:
+                revision_two_attempts += 1
+                if revision_two_attempts == 1:
+                    raise RuntimeError("transient preview read")
+            return await original_preview(**kwargs)
+
+        web.ctx.build_preview = flaky_preview
+        web.gateway.snapshot.update(snapshot_version=1843, config_revision=2, engine_revision=2)
+        await page.wait_for("document.getElementById('revisions').textContent.includes('config r2')")
+        await page.wait_for("document.getElementById('terminal-grid-detail').textContent.includes('по 10 LIT')"
+                            " && document.getElementById('terminal-grid-detail').textContent.includes('5x')")
+        assert revision_two_attempts >= 2
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_chart_overlays_only_actual_order_rows(make_web, tmp_path):
+    snap = _snapshot_with_engine_fields("NORMAL")
+    snap.update(snapshot_version=21, config_revision=1, engine_revision=1)
+    cell = snap["cells"][0]
+    cell.update(entry_price="5.3818", tp_price="5.4000")  # planned levels are not live orders
+    cell["entry"].update(price="5.3818", state="LIVE")
+    cell["tp_children"] = []
+    web = await make_web(snap)
+    web.gateway.live_clock = True
+    web.ctx.terminal = TerminalService(web.gateway, DemoCandleProvider(), web.ctx.identity)
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('terminal-chart').dataset.entryLines === '1'")
+        assert await page.eval("document.getElementById('terminal-chart').dataset.tpLines") == "0"
+        assert int(await page.eval("document.getElementById('terminal-chart').dataset.boundaryLines")) > 0
+
+        # Once a real TP child exists in the committed snapshot, exactly one TP overlay appears.
+        web.gateway.snapshot["cells"][0]["tp_children"] = [{
+            "cid": "281474976710699", "exchange_id": HUGE, "price": "5.4000",
+            "requested": "3", "filled": "1", "remaining": "2", "state": "LIVE", "expiry_at": None,
+            "side": "SELL",
+        }]
+        web.gateway.snapshot.update(snapshot_version=22, engine_revision=2)
+        await page.wait_for("document.getElementById('terminal-chart').dataset.tpLines === '1'")
+        assert await page.eval("document.getElementById('terminal-chart').dataset.entryLines") == "1"
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_fresh_market_never_masks_stale_engine_snapshot(make_web, tmp_path):
+    snap = _snapshot_with_engine_fields("NORMAL")
+    snap["committed_at"] = time.time() - 120
+    web = await make_web(snap, stale_after_s=5)
+    web.ctx.terminal = TerminalService(web.gateway, DemoCandleProvider(), web.ctx.identity)
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('terminal-status').dataset.state === 'stale'")
+        assert await page.eval("document.getElementById('chart-empty').hidden") is True
+        assert "снимок движка устарел" in await page.eval("document.getElementById('terminal-status').textContent")
+        assert await page.eval("document.getElementById('state-badge').dataset.state") == "STALE"
     finally:
         await browser.close()
 
@@ -185,10 +341,13 @@ async def test_browser_external_close_flow_and_stopped_start_wording(make_web, t
                            "filled": "10"},
     }
     web = await make_web(snap)
+    web.gateway.live_clock = True
     browser, page = await _open(tmp_path, web)
     try:
         await page.wait_for("document.getElementById('state-badge').dataset.state === 'STOPPED_WITH_INVENTORY'")
         assert await page.eval("document.querySelector('[data-cmd=resume]').disabled") is True
+        assert await page.eval("document.getElementById('terminal-start').hidden") is False
+        assert "Продолжить сетку" in await page.eval("document.getElementById('terminal-start').textContent")
         await page.eval("document.getElementById('external-close-open').click()")
         await page.wait_for("document.getElementById('cmd-dialog').open")
         assert await page.eval("document.getElementById('f-action').value") == "settle_external_close"

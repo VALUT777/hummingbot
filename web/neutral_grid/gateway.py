@@ -15,6 +15,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 
+class SnapshotUnavailable(LookupError):
+    """The requested retained snapshot version is no longer available."""
+
+
 class EngineGateway(Protocol):
     def latest_snapshot(self) -> Optional[Dict[str, Any]]:
         """Latest *committed* snapshot (parsed JSON dict, ids/decimals as strings) or None."""
@@ -41,6 +45,10 @@ class EngineGateway(Protocol):
 
     def audit_events(self, *, limit: int, before: Optional[str] = None) -> List[Dict[str, Any]]:
         """Newest first operator/engine audit events (no secrets are ever stored there)."""
+
+    def terminal_read(self, fill_limit: int, snapshot_version: Optional[int] = None
+                      ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], bool]:
+        """One committed snapshot plus confirmed fills applied no later than that snapshot."""
 
 
 ACTIVE_ENGINE_STATES = frozenset({
@@ -118,6 +126,49 @@ class StoreGateway:
     def latest_snapshot(self) -> Optional[Dict[str, Any]]:
         stored = self._store.latest_snapshot()
         return None if stored is None else stored.payload
+
+    def terminal_read(self, fill_limit: int, snapshot_version: Optional[int] = None
+                      ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], bool]:
+        """Read the snapshot and its bounded fill cut-off in one SQLite read transaction."""
+        with self._store._rlock:
+            self._store._require_open()
+            self._store._x("BEGIN")
+            try:
+                if snapshot_version is None:
+                    snapshot_row = self._store._x(
+                        "SELECT * FROM snapshots ORDER BY snapshot_version DESC LIMIT 1"
+                    ).fetchone()
+                else:
+                    snapshot_row = self._store._x(
+                        "SELECT * FROM snapshots WHERE snapshot_version = ?", (snapshot_version,)
+                    ).fetchone()
+                    if snapshot_row is None:
+                        raise SnapshotUnavailable(str(snapshot_version))
+                if snapshot_row is None:
+                    fill_rows = []
+                    snapshot = None
+                else:
+                    snapshot = self._store._snapshot(snapshot_row).payload
+                    fill_rows = self._store._x(
+                        "SELECT dedupe_key, trade_id_str, own_side, own_exchange_order_id, cid, grid_id, "
+                        "cell_id, generation, role, size, price, timestamp_ms, late "
+                        "FROM fills WHERE applied_at_ms < ? "
+                        "ORDER BY rowid DESC LIMIT ?",
+                        (snapshot_row["committed_at_ms"], fill_limit + 1),
+                    ).fetchall()
+                self._store._x("COMMIT")
+            except Exception:
+                self._store._rollback_quietly()
+                raise
+        fills = [{
+            "dedupe_key": row["dedupe_key"], "trade_id": str(row["trade_id_str"]),
+            "side": row["own_side"],
+            "exchange_order_id": None if row["own_exchange_order_id"] is None else str(row["own_exchange_order_id"]),
+            "cid": str(row["cid"]), "grid_id": row["grid_id"], "cell_id": str(row["cell_id"]),
+            "generation": row["generation"], "role": row["role"], "size": row["size"],
+            "price": row["price"], "trade_at": _ms_to_s(row["timestamp_ms"]), "late": bool(row["late"]),
+        } for row in fill_rows[:fill_limit]]
+        return snapshot, fills, len(fill_rows) > fill_limit
 
     def enqueue_command(self, idempotency_key: str, kind: str, expected_config_revision: int,
                         expected_engine_revision: int, payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -88,7 +88,7 @@
   var S = {
     csrf: null, mode: null, identity: null, staleAfter: 15,
     state: null, stateReceivedAt: 0, backendDown: false,
-    preview: null, tab: "overview",
+    preview: null, previewRequestedRevision: null, previewRequestPromise: null, terminal: null, tab: "overview",
     cellsCursor: null, cellsFilterKey: "",
     commandsCursor: null, auditCursor: null,
     pendingCommand: null, dialogKey: null, dialogKind: null, dialogRevs: null,
@@ -224,8 +224,11 @@
     $("logout").hidden = false;
     renderIdentity();
     renderDemoActions();
+    if (!S.terminal && window.NeutralGridTerminal) S.terminal = window.NeutralGridTerminal.create({ request: api });
+    $("activity-orders-tab").click();
     selectTab(S.tab, false);
     await refreshState();
+    await ensurePreviewForState();
     if (!S.timers) {
       S.timers = [setInterval(refreshState, 2000), setInterval(tickAge, 1000)];
     }
@@ -288,6 +291,8 @@
       S.stateReceivedAt = Date.now();
       S.backendDown = false;
       renderState();
+      if (S.terminal) S.terminal.refresh(S.state);
+      ensurePreviewForState();
     } else if (r.status !== 401) {
       S.backendDown = true;
       tickAge();
@@ -350,12 +355,20 @@
     var display = engine.display_state;
     var pauseBtn = document.querySelector("[data-cmd=pause]");
     var resumeBtn = document.querySelector("[data-cmd=resume]");
+    var stopBtn = document.querySelector("[data-cmd=stop]");
+    var startBtn = $("terminal-start");
     pauseBtn.disabled = display === "PAUSED" || display === "STOPPED" || display === "STOPPED_WITH_INVENTORY";
     resumeBtn.disabled = display !== "PAUSED";
     resumeBtn.title = resumeBtn.disabled ? "Доступно только для состояния PAUSED" : "Снять паузу";
+    stopBtn.disabled = display === "STOPPED" || display === "STOPPED_WITH_INVENTORY" || display === "STOPPING";
+    var canStart = st.engine_started === false || display === "STOPPED" || display === "STOPPED_WITH_INVENTORY";
+    startBtn.hidden = !canStart;
+    startBtn.textContent = (display === "STOPPED" || display === "STOPPED_WITH_INVENTORY")
+      ? "Продолжить сетку…" : "Старт…";
     // confirm_baseline only after an applied Start (the backend refuses it otherwise, 409 start_required)
     var confirmBtn = document.querySelector("[data-cmd=confirm_baseline]");
     confirmBtn.disabled = !(st.engine_started === true && (summary.baseline === null || summary.baseline === undefined));
+    confirmBtn.hidden = confirmBtn.disabled;
     confirmBtn.title = confirmBtn.disabled ? "Доступно после применённого «Старта» и до подтверждения baseline" : "";
     var boot = summary.bootstrap || {};
     var next = null;
@@ -865,9 +878,31 @@
     var seq = nextSeq("preview");
     var r = await api(path);
     if (!isLatest("preview", seq)) return null;
-    if (r.status === 200) { S.preview = r.data; renderPreview(); return r.data; }
+    if (r.status === 200) {
+      S.preview = r.data;
+      if (S.terminal) S.terminal.setPreview(S.preview);
+      renderPreview();
+      return r.data;
+    }
     if (r.data && r.data.message) toast(r.data.message);
     return null;
+  }
+
+  function ensurePreviewForState() {
+    var snapshot = S.state && S.state.snapshot;
+    if (!snapshot || snapshot.config_revision === null || snapshot.config_revision === undefined)
+      return Promise.resolve(null);
+    var revision = String(snapshot.config_revision);
+    if (S.preview && String(S.preview.config_revision) === revision) return Promise.resolve(S.preview);
+    if (S.previewRequestedRevision === revision && S.previewRequestPromise) return S.previewRequestPromise;
+    S.previewRequestedRevision = revision;
+    var tracked = loadPreview().finally(function () {
+      if (S.previewRequestPromise !== tracked) return;
+      S.previewRequestPromise = null;
+      if (!S.preview || String(S.preview.config_revision) !== revision) S.previewRequestedRevision = null;
+    });
+    S.previewRequestPromise = tracked;
+    return tracked;
   }
 
   function statCard(label, value, sub, bad) {
@@ -1321,6 +1356,12 @@
     wireLookup();
     wireJournal();
     wireKeystore();
+    $("terminal-start").addEventListener("click", async function () {
+      selectTab("preview", false);
+      var preview = await loadPreview();
+      if (preview && preview.can_start) openStart();
+      else if (preview) toast("Старт недоступен: проверьте ошибки превью.");
+    });
     $("login-form").addEventListener("submit", async function (ev) {
       ev.preventDefault();
       var token = $("login-token").value;

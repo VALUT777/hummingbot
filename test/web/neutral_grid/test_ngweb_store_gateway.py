@@ -9,6 +9,13 @@ import pytest
 from ngweb_fakes import sample_snapshot
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.store import EngineIdentity, NeutralGridStore
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store.ng_store_support import (
+    Env,
+    FakeTransport,
+    record_entry_intent,
+    submit_via_protocol,
+    trade_row,
+)
 from web.neutral_grid.gateway import StoreGateway
 
 JS_SAFE = (1 << 53) - 1
@@ -135,6 +142,53 @@ def test_command_client_cannot_write_ledger(store_pair):
     with pytest.raises(sqlite3.DatabaseError):
         store._conn.execute("UPDATE engine SET engine_revision = 99 WHERE id = 1")
     assert writer.engine().engine_revision == 0
+
+
+def test_terminal_read_returns_one_committed_snapshot_transaction(store_pair):
+    writer, gateway = store_pair
+    first = _commit_snapshot(writer, "RECONCILING")
+    latest = _commit_snapshot(writer, "NORMAL")
+
+    snapshot, fills, truncated = gateway.terminal_read(100)
+
+    assert latest.snapshot_version == first.snapshot_version + 1
+    assert snapshot["snapshot_version"] == latest.snapshot_version
+    assert snapshot["engine_state"] == "NORMAL"
+    assert fills == [] and truncated is False
+    selected, fills, truncated = gateway.terminal_read(100, snapshot_version=first.snapshot_version)
+    assert selected["snapshot_version"] == first.snapshot_version
+    assert selected["engine_state"] == "RECONCILING"
+    assert fills == [] and truncated is False
+
+
+def test_terminal_read_excludes_fill_applied_after_selected_snapshot(tmp_path):
+    env = Env(tmp_path)
+    writer = env.open()
+    env.bootstrap(writer)
+    before = writer.write_snapshot(None, {"engine_state": "NORMAL", "reasons": []})
+    env.clock.advance()
+    intent = record_entry_intent(writer, cell_id=4)
+    submit_via_protocol(writer, FakeTransport(), intent)
+    leg = writer.leg(intent.cid)
+    exchange_order_id = writer.order(intent.cid).exchange_order_id
+    with writer.transaction() as tx:
+        writer.apply_history_batch(tx, [trade_row("terminal-cutoff", leg.cid, leg.side, "2.5",
+                                                  price=str(leg.price), exchange_order_id=exchange_order_id)])
+    gateway = StoreGateway.open(env.db)
+    try:
+        selected, fills, _ = gateway.terminal_read(100)
+        assert selected["snapshot_version"] == before.snapshot_version and fills == []
+        same_millisecond = writer.write_snapshot(None, {"engine_state": "NORMAL", "reasons": []})
+        selected, fills, _ = gateway.terminal_read(100)
+        assert selected["snapshot_version"] == same_millisecond.snapshot_version and fills == []
+        env.clock.advance()
+        after = writer.write_snapshot(None, {"engine_state": "NORMAL", "reasons": []})
+        selected, fills, _ = gateway.terminal_read(100)
+        assert selected["snapshot_version"] == after.snapshot_version
+        assert [row["trade_id"] for row in fills] == ["terminal-cutoff"]
+    finally:
+        gateway.close()
+        writer.close()
 
 
 @pytest.mark.asyncio
