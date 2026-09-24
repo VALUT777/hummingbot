@@ -215,6 +215,27 @@ def _history_row_summary(stream: str, row: Any) -> Dict[str, str]:
             "nonce": text(row.nonce), "timestamp_ms": text(row.timestamp_ms)}
 
 
+_PUBLIC_PART = re.compile(r"[A-Za-z0-9_.\-]*\Z")
+
+
+def public_conflict_key(stream: str, key: Tuple) -> str:
+    """Canonical, web-safe key of a contradicted history row (M1 parity with WS-E, ``[A-Za-z0-9_:.-]{1,160}``):
+    ``trade:<trade_id>:<own_side>:<own_exchange_order_id>`` / ``order:<exchange_order_id>``. Domain, account and
+    market are constant for one engine (the scanner rejects rows outside them), so they are omitted. A part outside
+    ``[A-Za-z0-9_.-]`` or an over-long key falls back to ``<kind>:sha:<32 hex of the exact typed key>``."""
+    kind, parts = ("trade", key[3:]) if stream == STREAM_TRADES else ("order", key[3:])
+    text = ":".join([kind] + [str(p) for p in parts])
+    if len(text) <= 160 and all(_PUBLIC_PART.match(str(p)) for p in parts):
+        return text
+    return f"{kind}:sha:{_digest(_key_label(key))}"
+
+
+def public_fingerprint(raw: str) -> str:
+    """Web-safe version fingerprint: the first 32 hex of sha256 over the scanner's canonical payload fingerprint
+    (``history.trade/order_payload_fingerprint``, UTF-8); the engine maps it back to the raw one."""
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
 def _digest(value: Any, n: int = 32) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
                           ).hexdigest()[:n]
@@ -1496,14 +1517,15 @@ class NeutralGridEngine:
         items: List[Dict[str, Any]] = []
         for _, entry in sorted(self.meta.history_conflicts.items()):
             cell = self._cell_of_ids(entry.get("client"), entry.get("exchange"))
-            items.append({"stream": entry["stream"], "key": entry["key"],
+            items.append({"stream": entry["stream"], "key": self._public_key_of(entry),
                           "cell_id": None if cell is None else str(cell),
-                          "versions": [{"fingerprint": fp, "summary": dict(summary),
-                                        "committed": fp == entry.get("committed")}
-                                       for fp, summary in sorted(entry["versions"].items())]})
+                          "versions": sorted(({"fingerprint": public_fingerprint(fp), "summary": dict(summary),
+                                               "committed": fp == entry.get("committed")}
+                                              for fp, summary in entry["versions"].items()),
+                                             key=lambda v: v["fingerprint"])})
 
         def single(stream: str, key: str, summary: Dict[str, str], cell: Optional[int] = None) -> None:
-            items.append({"stream": stream, "key": key, "cell_id": None if cell is None else str(cell),
+            items.append({"stream": stream, "key": f"{stream}:{key}", "cell_id": None if cell is None else str(cell),
                           "versions": [{"fingerprint": _digest([stream, key, summary]), "summary": summary,
                                         "committed": True}]})
         for c in self.open_conflicts:
@@ -1519,6 +1541,10 @@ class NeutralGridEngine:
             single("active_evidence", str(cell_id), {"detail": redact(why)}, cell_id)
         set_id = _digest([[i["stream"], i["key"], [v["fingerprint"] for v in i["versions"]]] for i in items])
         return items, set_id
+
+    @staticmethod
+    def _public_key_of(entry: Dict[str, Any]) -> str:
+        return public_conflict_key(entry["stream"], _key_from_label(entry["key"]))
 
     def _cmd_ack_history_conflict(self, actor: str, note: str, evidence: Dict[str, Any], payload: Dict[str, Any],
                                   now: float, tx) -> CommandOutcome:
@@ -1544,40 +1570,44 @@ class NeutralGridEngine:
                                                     for k, v in choices.items()):
             return CommandOutcome(CommandStatus.REJECTED, {"error": "ACCEPTED_INVALID",
                                                            "detail": "accepted must map key -> fingerprint"})
+        # The published (web-safe) key/fingerprints map back to the exact typed key and raw payload fingerprints.
         entries = sorted(self.meta.history_conflicts.values(), key=lambda e: (e["stream"], e["key"]))
-        need, invalid, audited = [], [], []
-        known_keys = {e["key"] for e in entries}
+        need, invalid, audited, internal = [], [], [], []
+        known_keys = {self._public_key_of(e) for e in entries}
         invalid.extend({"key": k, "error": "NOT_IN_CONFLICT_SET"} for k in choices if k not in known_keys)
         for entry in entries:
-            versions, committed, choice = set(entry["versions"]), entry.get("committed"), choices.get(entry["key"])
+            public = self._public_key_of(entry)
+            raw = {public_fingerprint(fp): fp for fp in entry["versions"]}
+            committed, choice = entry.get("committed"), choices.get(public)
             if committed is not None:
-                if choice is not None and choice != committed:
-                    invalid.append({"key": entry["key"], "error": "LEDGER_CORRECTION_NOT_SUPPORTED",
-                                    "committed": committed})
+                if choice is not None and raw.get(choice) != committed:
+                    invalid.append({"key": public, "error": "LEDGER_CORRECTION_NOT_SUPPORTED",
+                                    "committed": public_fingerprint(committed)})
                 accept = committed
             elif choice is None:
-                need.append(entry["key"])
+                need.append(public)
                 continue
-            elif choice not in versions:
-                invalid.append({"key": entry["key"], "error": "NOT_A_SEEN_VERSION"})
+            elif choice not in raw:
+                invalid.append({"key": public, "error": "NOT_A_SEEN_VERSION"})
                 continue
             else:
-                accept = choice
-            audited.append({"stream": entry["stream"], "key": entry["key"], "accepted": accept,
-                            "noise": sorted(versions - {accept})})
+                accept = raw[choice]
+            noise = sorted(set(entry["versions"]) - {accept})
+            internal.append((entry["stream"], entry["key"], accept, noise))
+            audited.append({"stream": entry["stream"], "key": public, "accepted": public_fingerprint(accept),
+                            "noise": sorted(public_fingerprint(fp) for fp in noise)})
         if invalid:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "ACCEPTED_INVALID", "keys": invalid[:20]})
         if need:
             return CommandOutcome(CommandStatus.REJECTED, {
                 "error": "ACCEPTED_CHOICE_REQUIRED", "keys": need[:20],
                 "detail": "no committed payload exists for these keys: choose the version the venue export proves"})
-        for item in audited:
-            previous = self.meta.audited_payloads.get(item["stream"], {}).get(item["key"]) or {}
-            noise = set(item["noise"]) | (set(previous.get("noise", [])) if previous.get("accepted") == item["accepted"]
-                                          else set())
-            self.meta.audited_payloads.setdefault(item["stream"], {})[item["key"]] = {
-                "accepted": item["accepted"], "noise": sorted(noise - {item["accepted"]})}
-        ids = [int(i["key"]) for i in items if i["stream"] == "store_conflict"]
+        for stream, label, accept, noise_now in internal:
+            previous = self.meta.audited_payloads.get(stream, {}).get(label) or {}
+            noise = set(noise_now) | (set(previous.get("noise", [])) if previous.get("accepted") == accept else set())
+            self.meta.audited_payloads.setdefault(stream, {})[label] = {"accepted": accept,
+                                                                        "noise": sorted(noise - {accept})}
+        ids = [int(i["key"].split(":", 1)[1]) for i in items if i["stream"] == "store_conflict"]
         s = self.store
         s.record_manual_reconciliation(tx, actor, note, dict(evidence, conflict_set_id=set_id, audited_payloads=audited,
                                                              audited_set=items[:50]),
