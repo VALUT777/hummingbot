@@ -8,12 +8,13 @@ Accounting per cycle (all exact ``Decimal``, never rounded up, fees never touch 
 
 * ``E`` - confirmed entry quantity (sum of history fills applied to the entry legs);
 * ``X`` - confirmed exit quantity (sum of history fills applied to TP children);
-* ``E - X`` is partitioned into disjoint buckets:
+* ``E - X - S`` is partitioned into disjoint buckets, where ``S`` is externally settled quantity:
   ``live_tp_remainder`` (proven live TP remainder) + ``reserved_tp_unassigned`` (TP remainder in
   intent/submit-unknown/cancel-unknown/terminal-unknown legs; reservation is kept, no duplicate TP)
   + ``unassigned`` (obligation without a TP child yet, e.g. below-minimum while the entry may still fill)
   + ``dust`` (entry is final and the exact remainder cannot form a valid order).
-* invariant: ``X + reserved_TP_unfilled <= E`` where ``reserved_TP_unfilled`` = remainder of non-final TP legs.
+* invariant: ``X + S + reserved_TP_unfilled <= E`` where ``reserved_TP_unfilled`` is the remainder of non-final
+  TP legs.
 
 Pure and deterministic: no IO, no clocks. The engine is the only caller that asserts history proofs.
 """
@@ -206,17 +207,18 @@ class Leg:
 
 @dataclass(frozen=True)
 class Buckets:
-    """Disjoint partition of the open obligation ``E - X`` of one cycle (or a sum over cycles)."""
+    """Disjoint partition of the open obligation ``E - X - S`` of one cycle (or a sum over cycles)."""
     E: Decimal
     X: Decimal
     live_tp_remainder: Decimal
     reserved_tp_unassigned: Decimal
     unassigned: Decimal
     dust: Decimal
+    external_settled: Decimal = ZERO
 
     @property
     def open_obligation(self) -> Decimal:
-        return self.E - self.X
+        return self.E - self.X - self.external_settled
 
     @property
     def reserved_tp_unfilled(self) -> Decimal:
@@ -226,10 +228,11 @@ class Buckets:
         return Buckets(*(a + b for a, b in zip(self._tuple(), other._tuple())))
 
     def _tuple(self) -> Tuple[Decimal, ...]:
-        return (self.E, self.X, self.live_tp_remainder, self.reserved_tp_unassigned, self.unassigned, self.dust)
+        return (self.E, self.X, self.live_tp_remainder, self.reserved_tp_unassigned, self.unassigned, self.dust,
+                self.external_settled)
 
 
-EMPTY_BUCKETS = Buckets(ZERO, ZERO, ZERO, ZERO, ZERO, ZERO)
+EMPTY_BUCKETS = Buckets(ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO)
 
 
 @dataclass(frozen=True)
@@ -269,6 +272,7 @@ class Cycle:
     dust: Decimal = ZERO            # durable, operator-visible DUST classification (<= unassigned)
     closed: bool = False
     late_evidence: bool = False
+    external_settled: Decimal = ZERO
     # All cycles of the owning cell (set by CellLedger): needed to see aggregate TP legs hosted in a newer cycle.
     peers: Optional[List["Cycle"]] = field(default=None, repr=False, compare=False)
 
@@ -297,6 +301,14 @@ class Cycle:
         return sum((filled for _, _, filled in self.tp_parts()), ZERO)
 
     @property
+    def effective_exit(self) -> Decimal:
+        return self.X + self.external_settled
+
+    @property
+    def open_obligation(self) -> Decimal:
+        return self.E - self.effective_exit
+
+    @property
     def entry_final(self) -> bool:
         return bool(self.entries) and all(e.is_final for e in self.entries)
 
@@ -310,19 +322,20 @@ class Cycle:
     def unassigned_total(self) -> Decimal:
         """``E - X - (remainder of non-final TP legs)``; includes dust. Negative means invariant violation."""
         reserved = sum((req - filled for t, req, filled in self.tp_parts() if not t.is_final), ZERO)
-        return self.E - self.X - reserved
+        return self.open_obligation - reserved
 
     def buckets(self) -> Buckets:
         parts = self.tp_parts()
         live = sum((req - filled for t, req, filled in parts if t.state in LIVE_STATES), ZERO)
         unknown = sum((req - filled for t, req, filled in parts if t.state in UNKNOWN_STATES), ZERO)
-        total_unassigned = self.E - self.X - live - unknown
+        total_unassigned = self.open_obligation - live - unknown
         dust = min(self.dust, max(total_unassigned, ZERO))
         return Buckets(E=self.E, X=self.X, live_tp_remainder=live, reserved_tp_unassigned=unknown,
-                       unassigned=total_unassigned - dust, dust=dust)
+                       unassigned=total_unassigned - dust, dust=dust,
+                       external_settled=self.external_settled)
 
     def has_open_obligation_or_orders(self) -> bool:
-        return (self.E != self.X or any(not leg.is_final for leg in self.legs) or self.dust > 0
+        return (self.open_obligation != 0 or any(not leg.is_final for leg in self.legs) or self.dust > 0
                 or any(not t.is_final for t, _, _ in self.tp_parts()))
 
     def to_record(self) -> Dict[str, Any]:
@@ -335,6 +348,7 @@ class Cycle:
             "dust": str(self.dust),
             "closed": self.closed,
             "late_evidence": self.late_evidence,
+            "external_settled": str(self.external_settled),
         }
 
     @classmethod
@@ -348,6 +362,7 @@ class Cycle:
             dust=Decimal(rec.get("dust", "0")),
             closed=bool(rec.get("closed", False)),
             late_evidence=bool(rec.get("late_evidence", False)),
+            external_settled=Decimal(rec.get("external_settled", "0")),
         )
 
 
@@ -755,8 +770,8 @@ class CellLedger:
         for e in cur.entries:
             if e.state == OrderState.TERMINAL and e.terminal_cumulative != e.filled:
                 reasons.append("ENTRY_CUMULATIVE_MISMATCH")
-        if cur.E != cur.X:
-            reasons.append(f"OBLIGATION_OPEN:E={cur.E},X={cur.X}")
+        if cur.open_obligation != 0:
+            reasons.append(f"OBLIGATION_OPEN:E={cur.E},X={cur.X},S={cur.external_settled}")
         if any(not leg.is_final for leg in cur.legs):
             reasons.append("ORDERS_NOT_TERMINAL")
         if any(c.dust > 0 or c.buckets().dust > 0 for c in self.open_cycles()):
@@ -800,8 +815,9 @@ class CellLedger:
                 if leg.state in REJECTED_STATES and leg.filled != 0:
                     errors.append(f"gen{c.generation}: rejected leg has fills {leg.filled}")
             reserved = sum((req - filled for t, req, filled in c.tp_parts() if not t.is_final), ZERO)
-            if c.X + reserved > c.E:
-                errors.append(f"gen{c.generation}: X {c.X} + reserved TP {reserved} > E {c.E}")
+            if c.external_settled < 0 or c.effective_exit + reserved > c.E:
+                errors.append(f"gen{c.generation}: X {c.X} + external {c.external_settled} + reserved TP "
+                              f"{reserved} > E {c.E}")
             for t in c.tps:
                 if t.allocation is None:
                     continue
@@ -846,7 +862,7 @@ class CellLedger:
                 flags.add(CellState.TP_REQUIRED)
             if b.dust > 0 or cycle.dust > 0:
                 flags.add(CellState.DUST)
-            if not cycle.closed and all(leg.is_final for leg in cycle.legs) and cycle.E == cycle.X \
+            if not cycle.closed and all(leg.is_final for leg in cycle.legs) and cycle.open_obligation == 0 \
                     and cycle.dust == 0:
                 flags.add(CellState.SETTLING)
         if not flags:

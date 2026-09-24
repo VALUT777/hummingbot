@@ -4,7 +4,7 @@
 * ``P_max = P + sum(possibly executable BUY remainder)``, ``P_min = P - sum(possibly executable SELL remainder)``;
   every non-final order counts with its *full* submitted remainder until terminal + cumulative are proven,
   regardless of role (entry, TP or unknown);
-* ``gross = sum(E - X)`` over cycles (unpaired virtual quantity, baseline excluded);
+* ``gross = sum(E - X - S)`` over cycles (unpaired virtual quantity, baseline excluded);
   ``gross_worst = gross + remainder of possibly executable entries and of unknown-role orders``.
   TP legs change net risk but never add virtual gross.
 
@@ -91,7 +91,7 @@ def endpoints(baseline: Decimal, confirmed_buys: Decimal, confirmed_sells: Decim
               *, unpaired: Decimal = ZERO) -> RiskEndpoints:
     """Conservative reachable net interval and worst-case gross (NG-RISK-002).
 
-    ``unpaired`` is the confirmed virtual gross ``sum(E - X)`` over all durable cycles (baseline excluded).
+    ``unpaired`` is the confirmed virtual gross ``sum(E - X - S)`` over all durable cycles (baseline excluded).
     """
     b = _dec(baseline, "baseline")
     buys = _dec(confirmed_buys, "confirmed_buys")
@@ -123,7 +123,12 @@ def endpoints_from_ledgers(baseline: Decimal, ledgers: Sequence[Any],
     legs: List[OpenLeg] = list(extra_open_legs)
     for ledger in ledgers:
         for cycle in ledger.cycles:
-            unpaired += abs(cycle.E - cycle.X)
+            unpaired += abs(cycle.open_obligation)
+            # External settlement is a real account execution in the obligation-closing direction.
+            if cycle.entry_side == Side.BUY:
+                sells += cycle.external_settled
+            else:
+                buys += cycle.external_settled
             for leg in cycle.legs:
                 if leg.side == Side.BUY:
                     buys += leg.filled

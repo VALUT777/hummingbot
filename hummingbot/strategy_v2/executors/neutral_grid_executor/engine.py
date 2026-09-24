@@ -103,6 +103,9 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     CursorUpdate,
     EngineIdentity as StoreIdentity,
     EntryBlockedError,
+    ExternalSettlementCycle,
+    ExternalSettlementEvidence,
+    ExternalSettlementRequest,
     InvalidTransitionError,
     NeutralGridStore,
     PersistenceError,
@@ -558,7 +561,8 @@ class NeutralGridEngine:
             for g in gens:
                 cy = s.cycle(grid_id, cr.cell_id, g)
                 cycle = Cycle(generation=g, entry_side=cy.entry_side, planned_qty=cy.planned_amount, dust=cy.dust,
-                              closed=cy.state == "COMPLETE", late_evidence=cy.late_evidence == 1)
+                              closed=cy.state == "COMPLETE", late_evidence=cy.late_evidence == 1,
+                              external_settled=cy.external_settled)
                 for lr in sorted((x for x in cell_legs if x.generation == g),
                                  key=lambda x: (x.role.value, x.revision)):
                     leg = self._leg_from_store(lr, fills_by_cid.get(lr.cid, []))
@@ -1208,13 +1212,149 @@ class NeutralGridEngine:
              "sell_cells": len(specs) - buy, "cut_ts_ms": cut_ts}, reload=True)
 
     def _confirmed_fills(self) -> Tuple[Decimal, Decimal]:
-        buys = sells = ZERO
-        for leg in self.all_legs():
-            if leg.side == Side.BUY:
-                buys += leg.filled
-            else:
-                sells += leg.filled
-        return buys, sells
+        # The in-memory projection contains only the current grid after migration. Baseline audits reconcile the
+        # whole account history, so use the durable all-grid ledger (owned fills plus real external executions).
+        ledger = self.store.position_ledger()
+        return ledger.confirmed_buys, ledger.confirmed_sells
+
+    def external_close_candidate(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Build the bounded one-cycle/one-order manual-close proof from committed facts only.
+
+        The proof intentionally excludes polling and scan timestamps. Those are execution gates and audit
+        evidence, so an unchanged semantic candidate keeps the same proof while the operator reviews it.
+        """
+        now = self.clock() if now is None else now
+        blockers: List[str] = []
+        if not self.bootstrapped:
+            blockers.append("NOT_BOOTSTRAPPED")
+        if not self.is_stopped or self.meta.stop_outcome not in ("STOPPED", "STOPPED_WITH_INVENTORY"):
+            blockers.append("ENGINE_NOT_CLEANLY_STOPPED")
+        if self.position is None or self._position_stale(now):
+            blockers.append("POSITION_NOT_FRESH")
+        elif self.position.net_base != ZERO:
+            blockers.append(f"POSITION_NOT_FLAT:{self.position.net_base}")
+        if self.active_rows is None or self.active_at is None \
+                or now - self.active_at > float(self.config.history_freshness_s):
+            blockers.append("ACTIVE_ORDERS_NOT_FRESH")
+        elif self.active_seq < self.position_seq:
+            blockers.append("ACTIVE_ORDERS_PREDATE_POSITION")
+        elif self.active_rows:
+            blockers.append(f"ACTIVE_ORDERS_PRESENT:{len(self.active_rows)}")
+        if not self.history_complete or self._history_stale(now):
+            blockers.append("HISTORY_NOT_FRESH_COMPLETE")
+        if not self._position_settled_for_audit():
+            blockers.append("STABLE_CUT_NOT_PROVEN")
+        blockers.extend("COHERENT_CUT:" + reason for reason in self._audit_evidence_unsettled(now))
+        if self.ws_pending:
+            blockers.append(f"WS_EXECUTIONS_PENDING:{len(self.ws_pending)}")
+        if self.open_conflicts:
+            blockers.append(f"HISTORY_CONFLICTS:{len(self.open_conflicts)}")
+        blockers.extend(f"FROZEN:{code}" for code in sorted(self.meta.freezes))
+        if self.store is not None and not self.store.closed:
+            if self.store.unresolved_outbox():
+                blockers.append("OUTBOX_NOT_DONE")
+            if self.store.reservations():
+                blockers.append("ACTIVE_RESERVATIONS")
+            gaps = [name for name, cursor in self.store.cursors().items() if cursor.retention_gap_open]
+            if gaps:
+                blockers.append("RETENTION_GAPS:" + ",".join(sorted(gaps)))
+        if self.b_engine is not None and self.b_engine.manual_reconcile_required \
+                and "drift" not in (self.b_engine.manual_reconcile_reason or ""):
+            blockers.append("MANUAL_RECONCILIATION_BLOCKED")
+        if any(not leg.is_final for leg in self.all_legs()):
+            blockers.append("OWNED_LEGS_NOT_FINAL")
+        if any(c.late_evidence for ledger in self.cells.values() for c in ledger.cycles):
+            blockers.append("LATE_EVIDENCE")
+
+        cycles = [(ledger, cycle) for ledger in self.cells.values() for cycle in ledger.cycles
+                  if cycle.generation > 0 and cycle.open_obligation > ZERO]
+        if len(cycles) != 1:
+            blockers.append(f"EXACTLY_ONE_CYCLE_REQUIRED:{len(cycles)}")
+        ledger, cycle = cycles[0] if len(cycles) == 1 else (None, None)
+        if cycle is not None and self.store is not None and not self.store.closed:
+            blockers.extend("CYCLE:" + b for b in self.store.cycle_release_blockers(
+                self.grid_id, ledger.cell_id, cycle.generation) if not b.startswith("obligation open:"))
+
+        trades = [r for r in self.unmatched if r.stream == B_TRADES]
+        orders = [r for r in self.unmatched if r.stream == B_ORDERS]
+        order_keys = {(str(r.payload.get("own_exchange_order_id") or ""),
+                       str(r.payload.get("own_client_order_id") or "")) for r in trades}
+        if not trades or len(order_keys) != 1:
+            blockers.append(f"EXACTLY_ONE_MANUAL_ORDER_REQUIRED:{len(order_keys)}")
+        side_values = {str(r.payload.get("own_side")) for r in trades}
+        if len(side_values) != 1:
+            blockers.append("MIXED_TRADE_SIDES")
+        settlement_side = next(iter(side_values), "")
+        expected_side = (Side.SELL if cycle.entry_side == Side.BUY else Side.BUY).value \
+            if cycle is not None else None
+        if expected_side is not None and settlement_side != expected_side:
+            blockers.append(f"WRONG_SETTLEMENT_SIDE:{settlement_side}")
+
+        matching_orders = []
+        if len(order_keys) == 1:
+            exchange_id, client_id = next(iter(order_keys))
+            matching_orders = [r for r in orders
+                               if str(r.payload.get("order_index") or r.payload.get("order_id") or "") == exchange_id
+                               and str(r.payload.get("client_order_id") or "") == client_id]
+        if len(matching_orders) != 1 or len(orders) != 1:
+            blockers.append(f"EXACTLY_ONE_TERMINAL_ORDER_REQUIRED:{len(matching_orders)}")
+        terminal = matching_orders[0] if len(matching_orders) == 1 else None
+        quantity = sum((Decimal(str(r.payload.get("size", "0"))) for r in trades), ZERO)
+        if terminal is not None:
+            p = terminal.payload
+            final = Decimal(str(p.get("remaining_base_amount", "-1"))) == ZERO
+            if not p.get("reduce_only") or not final:
+                blockers.append("ORDER_NOT_FINAL_REDUCE_ONLY")
+            if str(p.get("side")) != settlement_side:
+                blockers.append("ORDER_SIDE_MISMATCH")
+            if Decimal(str(p.get("filled_base_amount", "-1"))) != quantity:
+                blockers.append("ORDER_TRADE_QUANTITY_MISMATCH")
+        if cycle is not None and quantity != cycle.open_obligation:
+            blockers.append(f"SETTLEMENT_QUANTITY_MISMATCH:{quantity}:{cycle.open_obligation}")
+
+        trade_view = [{"inbox_id": str(r.id), "payload_hash": r.payload_hash,
+                       "trade_id": str(r.payload.get("trade_id_str")), "side": str(r.payload.get("own_side")),
+                       "quantity": str(r.payload.get("size")), "price": str(r.payload.get("price")),
+                       "exchange_order_id": None if r.payload.get("own_exchange_order_id") is None
+                       else str(r.payload.get("own_exchange_order_id"))}
+                      for r in sorted(trades, key=lambda x: x.id)]
+        cycle_view = None if cycle is None else {
+            "grid_id": self.grid_id, "cell_id": str(ledger.cell_id), "generation": str(cycle.generation),
+            "entry_side": cycle.entry_side.value, "E": str(cycle.E), "X": str(cycle.X),
+            "external_settled": canonical_decimal(cycle.external_settled),
+            "proposed_settlement": canonical_decimal(quantity),
+            "open_after": canonical_decimal(cycle.open_obligation - quantity),
+        }
+        order_view = None if terminal is None else {
+            "inbox_id": str(terminal.id), "payload_hash": terminal.payload_hash,
+            "exchange_order_id": str(terminal.payload.get("order_index") or terminal.payload.get("order_id")),
+            "client_order_id": str(terminal.payload.get("client_order_id")),
+            "side": str(terminal.payload.get("side")), "reduce_only": bool(terminal.payload.get("reduce_only")),
+            "final": Decimal(str(terminal.payload.get("remaining_base_amount", "-1"))) == ZERO,
+            "filled": str(terminal.payload.get("filled_base_amount")),
+        }
+        semantic = {
+            "account_index": str(self.b_engine.account_index) if self.b_engine else None,
+            "domain": self.port.domain, "market_id": str(self.port.market_id),
+            "config_revision": self.b_engine.config_revision if self.b_engine else 0,
+            "engine_revision": self.b_engine.engine_revision if self.b_engine else 0,
+            "cycle": cycle_view, "trades": trade_view, "terminal_order": order_view,
+            "observed_position": None if self.position is None else str(self.position.net_base),
+            "active_order_fingerprint": [],
+        }
+        proof_id = hashlib.sha256(json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        scan = self.complete_scans[-1] if self.complete_scans else None
+        return {
+            "proof_id": proof_id, "blockers": sorted(set(blockers)), "cycle": cycle_view,
+            "settlement_side": settlement_side or None, "trades": trade_view, "terminal_order": order_view,
+            "observed_position": None if self.position is None else str(self.position.net_base),
+            "position_observed_at_ms": None if self.position_at is None else _ms(self.position_at),
+            "active_observed_at_ms": None if self.active_at is None else _ms(self.active_at),
+            "history_scan_started_at_ms": None if scan is None else _ms(scan.started_at),
+            "history_scan_completed_at_ms": None if scan is None else _ms(scan.completed_at),
+            "trades_high_water": self.high_water.get(STREAM_TRADES),
+            "orders_high_water": self.high_water.get(STREAM_ORDERS),
+        }
 
     def _cmd_baseline_audit(self, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
         """AC-30: explicit operator audit/rebase; never changes cell obligations or hides unknown fills."""
@@ -1483,6 +1623,50 @@ class NeutralGridEngine:
                                                           "detail": detail}, reload=True)
         if action == "migrate_grid":
             return self._cmd_migrate_grid(actor, note, now, tx)
+        if action == "settle_external_close":
+            expected_confirmation = f"SETTLE EXTERNAL CLOSE {self.grid_id} AT FLAT 0"
+            if payload.get("acknowledge") is not True or payload.get("confirmation") != expected_confirmation:
+                return CommandOutcome(CommandStatus.REJECTED, {
+                    "error": "EXTERNAL_CLOSE_NOT_ACKNOWLEDGED", "confirmation": expected_confirmation})
+            candidate = self.external_close_candidate(now)
+            if candidate["blockers"]:
+                return CommandOutcome(CommandStatus.REJECTED, {
+                    "error": "EXTERNAL_CLOSE_NOT_ELIGIBLE", "blockers": candidate["blockers"]})
+            if payload.get("proof_id") != candidate["proof_id"]:
+                return CommandOutcome(CommandStatus.REJECTED, {
+                    "error": "EXTERNAL_CLOSE_PROOF_CHANGED", "proof_id": candidate["proof_id"]})
+            cycle = candidate["cycle"]
+            terminal = candidate["terminal_order"]
+            request = ExternalSettlementRequest(
+                proof_id=candidate["proof_id"], grid_id=cycle["grid_id"],
+                settlement_side=Side(candidate["settlement_side"]), observed_position=ZERO,
+                actor=actor, reason=note,
+                expected_config_revision=self.b_engine.config_revision,
+                expected_engine_revision=self.b_engine.engine_revision,
+                position_observed_at_ms=int(candidate["position_observed_at_ms"]),
+                active_observed_at_ms=int(candidate["active_observed_at_ms"]),
+                history_scan_started_at_ms=int(candidate["history_scan_started_at_ms"]),
+                history_scan_completed_at_ms=int(candidate["history_scan_completed_at_ms"]),
+                trades_high_water=candidate["trades_high_water"],
+                orders_high_water=candidate["orders_high_water"],
+                cycles=(ExternalSettlementCycle(
+                    grid_id=cycle["grid_id"], cell_id=int(cycle["cell_id"]),
+                    generation=int(cycle["generation"]), quantity=Decimal(cycle["proposed_settlement"])),),
+                evidence=tuple(ExternalSettlementEvidence(
+                    inbox_id=int(t["inbox_id"]), evidence_role="TRADE",
+                    allocated_quantity=Decimal(t["quantity"])) for t in candidate["trades"])
+                + (ExternalSettlementEvidence(inbox_id=int(terminal["inbox_id"]),
+                                              evidence_role="TERMINAL_ORDER"),),
+            )
+            settlement_id = s.record_external_settlement(tx, request)
+            self.position_gap_since = None
+            return CommandOutcome(CommandStatus.APPLIED, {
+                "settlement_id": str(settlement_id), "proof_id": candidate["proof_id"],
+                "grid_id": cycle["grid_id"], "cell_id": cycle["cell_id"],
+                "generation": cycle["generation"], "E": cycle["E"], "X": cycle["X"],
+                "external_settled": cycle["proposed_settlement"], "open": cycle["open_after"],
+                "stopped": True,
+            }, reload=True)
         if action == "ack_risk_blocked":
             detail = self.meta.freezes.pop(FREEZE_RISK_BLOCKED, None)
             self.meta.risk_blocked = {}
@@ -3065,7 +3249,8 @@ class NeutralGridEngine:
         previous = self.meta.stop_outcome
         if not open_legs and self.history_complete and self._position_fresh_for_ledger(now):
             # STOPPED / STOPPED_WITH_INVENTORY only on a fresh known position; the baseline B counts as inventory.
-            inventory = any(c.E != c.X or c.dust > 0 for ledger in self.cells.values() for c in ledger.cycles)
+            inventory = any(c.open_obligation != 0 or c.dust > 0
+                            for ledger in self.cells.values() for c in ledger.cycles)
             if self.position.net_base != 0 or (self.effective_baseline or ZERO) != 0:
                 inventory = True
             outcome: Optional[EngineState] = (EngineState.STOPPED_WITH_INVENTORY if inventory

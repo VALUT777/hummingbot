@@ -67,10 +67,11 @@
         <ul class="reasons" id="engine-reasons"></ul>
         <div class="actions" id="command-buttons">
           <button type="button" class="btn" data-cmd="pause">Пауза</button>
-          <button type="button" class="btn" data-cmd="resume">Продолжить</button>
+          <button type="button" class="btn" data-cmd="resume">Снять паузу</button>
           <button type="button" class="btn btn-danger" data-cmd="stop">Стоп</button>
           <button type="button" class="btn" data-cmd="confirm_baseline">Подтвердить baseline</button>
-          <button type="button" class="btn" data-cmd="baseline_audit">Аудит / ручная сверка…</button>
+          <button type="button" class="btn" id="external-close-open" hidden>Я закрыл позицию вручную…</button>
+          <button type="button" class="btn" data-cmd="baseline_audit">Другой аудит / ручная сверка…</button>
         </div>
         <p class="hint">Команды записываются в очередь единственного движка. Статус «в очереди» не означает,
           что биржа что-то исполнила: результат появится после применения движком.</p>
@@ -256,7 +257,7 @@
     <label for="start-baseline">Введите expected_initial_position (B) ещё раз, LIT, со знаком</label>
     <input id="start-baseline" inputmode="decimal" spellcheck="false" required aria-describedby="start-baseline-help">
     <p class="hint" id="start-baseline-help"></p>
-    <label class="check"><input type="checkbox" id="start-ack-baseline"> Подтверждаю, что позиция на бирже равна B.</label>
+    <label class="check"><input type="checkbox" id="start-ack-baseline"> <span id="start-ack-baseline-text">Подтверждаю исходный baseline B.</span></label>
     <label class="check"><input type="checkbox" id="start-ack-risk"> Понимаю риск: движок будет выставлять ордера
       в пределах показанных лимитов, без стоп-лосса и без автоматического закрытия позиции.</label>
     <p class="form-error" id="start-error" role="alert"></p>

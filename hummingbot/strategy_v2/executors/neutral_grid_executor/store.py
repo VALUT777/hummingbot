@@ -751,6 +751,41 @@ class GridMigration:
 
 
 @dataclass(frozen=True)
+class ExternalSettlementCycle:
+    grid_id: str
+    cell_id: int
+    generation: int
+    quantity: Decimal
+
+
+@dataclass(frozen=True)
+class ExternalSettlementEvidence:
+    inbox_id: int
+    evidence_role: str
+    allocated_quantity: Optional[Decimal] = None
+
+
+@dataclass(frozen=True)
+class ExternalSettlementRequest:
+    proof_id: str
+    grid_id: str
+    settlement_side: Side
+    observed_position: Decimal
+    actor: str
+    reason: str
+    expected_config_revision: int
+    expected_engine_revision: int
+    position_observed_at_ms: int
+    active_observed_at_ms: int
+    history_scan_started_at_ms: int
+    history_scan_completed_at_ms: int
+    trades_high_water: Optional[str]
+    orders_high_water: Optional[str]
+    cycles: Sequence[ExternalSettlementCycle]
+    evidence: Sequence[ExternalSettlementEvidence]
+
+
+@dataclass(frozen=True)
 class Reservation:
     """Risk/slot reservation committed with an intent; the full submitted amount stays reserved until a
     final leg state is proven."""
@@ -904,6 +939,7 @@ class CycleRecord:
     config_revision: int
     entry_filled: Decimal
     exit_filled: Decimal
+    external_settled: Decimal
     dust: Decimal
     state: str
     late_evidence: int
@@ -914,6 +950,14 @@ class CycleRecord:
     @property
     def tp_side(self) -> Side:
         return Side.SELL if self.entry_side == Side.BUY else Side.BUY
+
+    @property
+    def effective_exit(self) -> Decimal:
+        return self.exit_filled + self.external_settled
+
+    @property
+    def open_obligation(self) -> Decimal:
+        return self.entry_filled - self.effective_exit
 
 
 @dataclass(frozen=True)
@@ -2010,9 +2054,9 @@ class NeutralGridStore:
                                "WHERE l.grid_id = ? AND o.status != 'DONE'", (grid.grid_id,)).fetchall():
                 blockers.append(f"outbox {row['id']} (cid {row['cid']}) unresolved")
             for cycle in self._cycles("grid_id = ?", (grid.grid_id,)):  # OPEN and released (late evidence)
-                if cycle.entry_filled != cycle.exit_filled:
+                if cycle.open_obligation != 0:
                     blockers.append(f"cell {cycle.cell_id} gen {cycle.generation} obligation "
-                                    f"E={cycle.entry_filled} X={cycle.exit_filled}")
+                                    f"E={cycle.entry_filled} X={cycle.exit_filled} S={cycle.external_settled}")
                 if cycle.dust != 0:
                     blockers.append(f"cell {cycle.cell_id} gen {cycle.generation} dust {cycle.dust}")
                 if cycle.late_evidence == 1:
@@ -2167,14 +2211,15 @@ class NeutralGridStore:
                 self._transition("CELL", f"{grid_id}/{cell_id}", current.state, state.value, reason)
             return self.cell(grid_id, cell_id)
 
-    @staticmethod
-    def _cycle(row: sqlite3.Row) -> CycleRecord:
+    def _cycle(self, row: sqlite3.Row) -> CycleRecord:
+        external_settled = self.external_settled_quantity(row["grid_id"], row["cell_id"], row["generation"])
         return CycleRecord(
             grid_id=row["grid_id"], cell_id=row["cell_id"], generation=row["generation"],
             entry_side=Side(row["entry_side"]), entry_price=parse_decimal(row["entry_price"]),
             tp_price=parse_decimal(row["tp_price"]), planned_amount=parse_decimal(row["planned_amount"]),
             config_revision=row["config_revision"], entry_filled=parse_decimal(row["entry_filled"]),
-            exit_filled=parse_decimal(row["exit_filled"]), dust=parse_decimal(row["dust"]), state=row["state"],
+            exit_filled=parse_decimal(row["exit_filled"]), external_settled=external_settled,
+            dust=parse_decimal(row["dust"]), state=row["state"],
             late_evidence=row["late_evidence"], opened_at_ms=row["opened_at_ms"], closed_at_ms=row["closed_at_ms"],
             close_reason=row["close_reason"])
 
@@ -2202,20 +2247,19 @@ class NeutralGridStore:
             return self._cycles("grid_id = ? AND state = 'OPEN'", (grid_id,))
 
     def late_obligation_cycles(self, grid_id: Optional[str] = None) -> List[CycleRecord]:
-        """Released (COMPLETE) cycles that late history reopened: E != X or late evidence not yet acknowledged.
+        """Released cycles that late history reopened: E-X-S != 0 or late evidence not yet acknowledged.
         Their obligation still needs a TP (allowed once the late evidence is audited, see ``record_intent``)."""
-        where = "state = 'COMPLETE' AND (entry_filled != exit_filled OR late_evidence = 1)"
         with self._rlock:
             self._require_open()
-            if grid_id is None:
-                return self._cycles(where, ())
-            return self._cycles(f"grid_id = ? AND {where}", (grid_id,))
+            complete = self._cycles("state = 'COMPLETE'" if grid_id is None else
+                                    "grid_id = ? AND state = 'COMPLETE'", () if grid_id is None else (grid_id,))
+        return [cycle for cycle in complete if cycle.open_obligation != 0 or cycle.late_evidence == 1]
 
     def open_cycle(self, tx: Optional[Transaction], grid_id: str, cell_id: int,
                    planned_amount: Optional[Decimal] = None) -> CycleRecord:
         """Start the next cycle (generation + 1) of a cell with its fixed entry side and prices. Refused while
         the previous cycle is not COMPLETE (whole-cell lock, NG-CELL-001), while any released cycle of the cell
-        still has a late obligation (E != X) or unacknowledged late evidence, and while any history conflict is
+        still has a late obligation (E-X-S != 0) or unacknowledged late evidence, and while any history conflict is
         unresolved (market freeze, NG-HIST-002)."""
         with self._scope(tx):
             self._require_writer()
@@ -2266,8 +2310,292 @@ class NeutralGridStore:
                         (text, grid_id, cell_id, generation))
             return self.cycle(grid_id, cell_id, generation)
 
+    def _external_settlement_schema_available(self) -> bool:
+        """Permit explicit legacy registries, but fail closed if an applied v6 schema loses any required table."""
+        version_row = self._conn.raw.execute("SELECT max(version) FROM schema_migrations").fetchone()
+        version = 0 if version_row is None or version_row[0] is None else int(version_row[0])
+        names = {row[0] for row in self._conn.raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+            "('external_settlements','external_settlement_cycles','external_settlement_evidence')")}
+        required = {"external_settlements", "external_settlement_cycles", "external_settlement_evidence"}
+        if version < 6:
+            return False
+        if names != required:
+            reason = f"schema v{version} is missing external settlement tables {sorted(required - names)}"
+            self.degraded_reason = reason
+            raise StoreIntegrityError(reason)
+        return True
+
+    def external_settled_quantity(self, grid_id: str, cell_id: int, generation: int) -> Decimal:
+        """Exact append-only external quantity allocated to one retained cycle."""
+        with self._rlock:
+            self._require_open()
+            if not self._external_settlement_schema_available():
+                return Decimal(0)  # explicitly supplied, verified pre-v6 registry for migration diagnostics
+            rows = self._x("SELECT quantity FROM external_settlement_cycles WHERE grid_id = ? AND cell_id = ? "
+                           "AND generation = ?", (grid_id, cell_id, generation)).fetchall()
+        return sum((parse_decimal(row[0]) for row in rows), Decimal(0))
+
+    def external_position_totals(self, grid_id: Optional[str] = None) -> Tuple[Decimal, Decimal]:
+        """Real external ``(BUY, SELL)`` execution totals included in account-position reconciliation."""
+        sql = ("SELECT s.settlement_side, e.allocated_quantity FROM external_settlements s "
+               "JOIN external_settlement_evidence e ON e.settlement_id = s.id "
+               "WHERE e.evidence_role = 'TRADE'")
+        params: Tuple[Any, ...] = ()
+        if grid_id is not None:
+            sql += " AND s.grid_id = ?"
+            params = (grid_id,)
+        buys = sells = Decimal(0)
+        with self._rlock:
+            self._require_open()
+            if not self._external_settlement_schema_available():
+                return buys, sells
+            rows = self._x(sql, params).fetchall()
+        for row in rows:
+            quantity = parse_decimal(row["allocated_quantity"])
+            if Side(row["settlement_side"]) == Side.BUY:
+                buys += quantity
+            else:
+                sells += quantity
+        return buys, sells
+
+    def record_external_settlement(self, tx: Transaction, request: ExternalSettlementRequest) -> int:
+        """Atomically bind one full manual reduce-only terminal order to one exact cycle obligation.
+
+        The evidence is resolved, but owned fills, leg cumulative quantities, CIDs, baseline and STOP metadata are
+        never changed. All request-shape validation precedes the first SQL write; state is re-read in the caller's
+        transaction so a stale proof cannot partially apply.
+        """
+        if not isinstance(request, ExternalSettlementRequest):
+            raise TypeError("request must be ExternalSettlementRequest")
+        proof_id = _require_text(request.proof_id, "proof_id", 256)
+        grid_id = _require_text(request.grid_id, "grid_id", 200)
+        actor = _require_text(request.actor, "actor")
+        reason = _require_text(request.reason, "reason", 2000)
+        side = _enum(Side, request.settlement_side, "settlement_side")
+        observed_position = Decimal(canonical_decimal(request.observed_position, "observed_position"))
+        if observed_position != 0:
+            raise ValueError("external settlement requires observed_position == 0")
+        expected_config_revision = _require_int(request.expected_config_revision, "expected_config_revision", 0)
+        expected_engine_revision = _require_int(request.expected_engine_revision, "expected_engine_revision", 0)
+        timestamps = (
+            _require_int(request.position_observed_at_ms, "position_observed_at_ms", 0),
+            _require_int(request.active_observed_at_ms, "active_observed_at_ms", 0),
+            _require_int(request.history_scan_started_at_ms, "history_scan_started_at_ms", 0),
+            _require_int(request.history_scan_completed_at_ms, "history_scan_completed_at_ms", 0),
+        )
+        if timestamps[3] < timestamps[2]:
+            raise ValueError("history scan completion precedes its start")
+        trades_high_water = None if request.trades_high_water is None else \
+            _require_text(request.trades_high_water, "trades_high_water", 4096)
+        orders_high_water = None if request.orders_high_water is None else \
+            _require_text(request.orders_high_water, "orders_high_water", 4096)
+        if len(request.cycles) != 1:
+            raise ValueError("external settlement v1 requires exactly one cycle")
+        cycle_request = request.cycles[0]
+        if not isinstance(cycle_request, ExternalSettlementCycle):
+            raise TypeError("cycles must contain ExternalSettlementCycle records")
+        if cycle_request.grid_id != grid_id:
+            raise ValueError("settlement cycle grid differs from request grid")
+        _require_int(cycle_request.cell_id, "cycle.cell_id", 0)
+        _require_int(cycle_request.generation, "cycle.generation", 1)
+        quantity = _require_positive(cycle_request.quantity, "cycle.quantity")
+        evidence = tuple(request.evidence)
+        if len(evidence) < 2 or len({item.inbox_id for item in evidence}) != len(evidence):
+            raise ValueError("settlement evidence must contain distinct trade fragments and one terminal order")
+        normalized_evidence = []
+        for item in evidence:
+            if not isinstance(item, ExternalSettlementEvidence):
+                raise TypeError("evidence must contain ExternalSettlementEvidence records")
+            inbox_id = _require_int(item.inbox_id, "evidence.inbox_id", 1)
+            if item.evidence_role not in ("TRADE", "TERMINAL_ORDER"):
+                raise ValueError(f"invalid settlement evidence role {item.evidence_role!r}")
+            if item.evidence_role == "TRADE":
+                allocated = _require_positive(item.allocated_quantity, "evidence.allocated_quantity")
+            elif item.allocated_quantity is not None:
+                raise ValueError("terminal order evidence cannot have allocated quantity")
+            else:
+                allocated = None
+            normalized_evidence.append((inbox_id, item.evidence_role, allocated))
+        trades = [item for item in normalized_evidence if item[1] == "TRADE"]
+        orders = [item for item in normalized_evidence if item[1] == "TERMINAL_ORDER"]
+        if not trades or len(orders) != 1:
+            raise ValueError("external settlement v1 requires trades and exactly one terminal order")
+        if sum((item[2] for item in trades), Decimal(0)) != quantity:
+            raise ValueError("allocated trade quantity must equal the cycle settlement quantity")
+
+        with self._scope(tx):
+            self._require_writer()
+            engine = self.engine()
+            if grid_id != engine.current_grid_id:
+                raise InvalidTransitionError("external settlement grid is not the current grid")
+            if (expected_config_revision, expected_engine_revision) != \
+                    (engine.config_revision, engine.engine_revision):
+                raise InvalidTransitionError("external settlement revisions are stale")
+            if engine.engine_state not in (EngineState.STOPPED, EngineState.STOPPED_WITH_INVENTORY):
+                raise InvalidTransitionError("external settlement requires a cleanly stopped engine")
+            cycle = self.cycle(grid_id, cycle_request.cell_id, cycle_request.generation)
+            if cycle.open_obligation != quantity:
+                raise InvalidTransitionError(
+                    f"settlement quantity {quantity} != open obligation {cycle.open_obligation}")
+            if side != cycle.tp_side:
+                raise InvalidTransitionError(
+                    f"settlement side {side.value} does not close {cycle.entry_side.value} entry")
+            blockers = [blocker for blocker in self.cycle_release_blockers(
+                grid_id, cycle.cell_id, cycle.generation) if not blocker.startswith("obligation open:")]
+            if blockers:
+                raise InvalidTransitionError("cycle is not externally settleable: " + "; ".join(blockers))
+            if self.open_conflicts():
+                raise InvalidTransitionError("external settlement refused with unresolved history conflicts")
+            if any(cursor.retention_gap_open for cursor in self.cursors().values()):
+                raise InvalidTransitionError("external settlement refused with an open history retention gap")
+
+            rows: Dict[int, InboxRecord] = {}
+            for inbox_id, _, _ in normalized_evidence:
+                try:
+                    row = self._inbox_by_id(inbox_id)
+                except (TypeError, AttributeError):
+                    raise InvalidTransitionError(f"unknown settlement inbox row {inbox_id}") from None
+                if row.status != "UNMATCHED" or row.resolved_at_ms is not None:
+                    raise InvalidTransitionError(f"inbox row {inbox_id} is not unresolved UNMATCHED evidence")
+                rows[inbox_id] = row
+            engine_market = engine.market_id
+            trade_order_ids = set()
+            trade_client_ids = set()
+            selected_trade_ids = set()
+            for inbox_id, role, allocated in normalized_evidence:
+                row = rows[inbox_id]
+                payload = row.payload
+                if payload.get("account_index") != engine.account_index or payload.get("market_id") != engine_market:
+                    raise InvalidTransitionError(f"inbox row {inbox_id} belongs to another account/market")
+                if role == "TRADE":
+                    if row.stream != STREAM_TRADES or payload.get("own_side") != side.value:
+                        raise InvalidTransitionError(f"trade inbox row {inbox_id} has the wrong stream/side")
+                    size = parse_decimal(payload.get("size"))
+                    if size <= 0 or size != allocated:
+                        raise InvalidTransitionError(f"trade inbox row {inbox_id} is not fully allocated")
+                    order_id = payload.get("own_exchange_order_id")
+                    if not order_id:
+                        raise InvalidTransitionError(f"trade inbox row {inbox_id} has no exchange order id")
+                    client_id = payload.get("own_client_order_id")
+                    if client_id in (None, ""):
+                        raise InvalidTransitionError(f"trade inbox row {inbox_id} has no client order id")
+                    trade_order_ids.add(str(order_id))
+                    trade_client_ids.add(str(client_id))
+                    selected_trade_ids.add(inbox_id)
+                elif row.stream != STREAM_INACTIVE_ORDERS:
+                    raise InvalidTransitionError(f"terminal-order inbox row {inbox_id} has the wrong stream")
+            if len(trade_order_ids) != 1:
+                raise InvalidTransitionError("selected trades do not belong to exactly one manual order")
+            manual_order_id = next(iter(trade_order_ids))
+            order_row = rows[orders[0][0]]
+            payload = order_row.payload
+            row_order_id = payload.get("order_index") or payload.get("order_id")
+            if str(row_order_id) != manual_order_id or payload.get("side") != side.value:
+                raise InvalidTransitionError("terminal order does not match the selected trades")
+            order_client_ids = {str(value) for value in
+                                (payload.get("client_order_id"), payload.get("client_order_id_str"))
+                                if value not in (None, "")}
+            if len(trade_client_ids) != 1 or len(order_client_ids) != 1 or \
+                    trade_client_ids != order_client_ids:
+                raise InvalidTransitionError("selected trades and terminal order have different client order ids")
+            filled = parse_decimal(payload.get("filled_base_amount"))
+            initial = parse_decimal(payload.get("initial_base_amount"))
+            remaining = parse_decimal(payload.get("remaining_base_amount"))
+            terminal_status = str(payload.get("status", "")).strip().lower() in {
+                "filled", "closed", "complete", "completed",
+            }
+            if not terminal_status or not payload.get("reduce_only") or filled != quantity or \
+                    initial != quantity or remaining != 0:
+                raise InvalidTransitionError("manual order must be reduce-only, fully final, and equal selected trades")
+
+            all_unmatched = self.unmatched_evidence()
+            fragments = {row.id for row in all_unmatched if row.stream == STREAM_TRADES
+                         and str(row.payload.get("own_exchange_order_id")) == manual_order_id}
+            terminal_rows = {row.id for row in all_unmatched if row.stream == STREAM_INACTIVE_ORDERS
+                             and str(row.payload.get("order_index") or row.payload.get("order_id")) == manual_order_id}
+            if fragments != selected_trade_ids or terminal_rows != {orders[0][0]}:
+                raise InvalidTransitionError("selected evidence is partial or ambiguous for the manual order")
+            trade_groups: Dict[str, List[InboxRecord]] = {}
+            order_groups: Dict[str, List[InboxRecord]] = {}
+            for unmatched in all_unmatched:
+                candidate_payload = unmatched.payload
+                if candidate_payload.get("account_index") != engine.account_index or \
+                        candidate_payload.get("market_id") != engine_market:
+                    continue
+                candidate_order_id = (candidate_payload.get("own_exchange_order_id")
+                                      if unmatched.stream == STREAM_TRADES else
+                                      candidate_payload.get("order_index") or candidate_payload.get("order_id"))
+                if not candidate_order_id:
+                    continue
+                target = trade_groups if unmatched.stream == STREAM_TRADES else order_groups
+                target.setdefault(str(candidate_order_id), []).append(unmatched)
+            viable_order_ids = []
+            for candidate_order_id, candidate_trades in trade_groups.items():
+                candidate_orders = order_groups.get(candidate_order_id, [])
+                if len(candidate_orders) != 1 or any(row.payload.get("own_side") != side.value
+                                                     for row in candidate_trades):
+                    continue
+                candidate_trade_clients = {
+                    str(row.payload.get("own_client_order_id")) for row in candidate_trades
+                    if row.payload.get("own_client_order_id") not in (None, "")
+                }
+                candidate_quantity = sum((parse_decimal(row.payload.get("size")) for row in candidate_trades),
+                                         Decimal(0))
+                candidate_order = candidate_orders[0].payload
+                candidate_order_clients = {str(value) for value in
+                                           (candidate_order.get("client_order_id"),
+                                            candidate_order.get("client_order_id_str"))
+                                           if value not in (None, "")}
+                candidate_status = str(candidate_order.get("status", "")).strip().lower()
+                final_status = candidate_status in {"filled", "closed", "complete", "completed"}
+                if candidate_quantity == quantity and candidate_order.get("side") == side.value and \
+                        len(candidate_trade_clients) == 1 and candidate_trade_clients == candidate_order_clients and \
+                        candidate_order.get("reduce_only") and final_status and \
+                        parse_decimal(candidate_order.get("filled_base_amount")) == quantity and \
+                        parse_decimal(candidate_order.get("initial_base_amount")) == quantity and \
+                        parse_decimal(candidate_order.get("remaining_base_amount")) == 0:
+                    viable_order_ids.append(candidate_order_id)
+            if viable_order_ids != [manual_order_id]:
+                raise InvalidTransitionError(
+                    f"external settlement evidence is ambiguous across manual orders {sorted(viable_order_ids)}")
+
+            audit_id = self._audit("external_settlement", actor, {
+                "proof_id": proof_id, "grid_id": grid_id, "cell_id": cycle.cell_id,
+                "generation": cycle.generation, "settlement_side": side.value, "quantity": str(quantity),
+                "observed_position": str(observed_position), "reason": reason,
+                "evidence_inbox_ids": [item[0] for item in normalized_evidence],
+            })
+            settlement_id = self._x(
+                "INSERT INTO external_settlements(proof_id, grid_id, settlement_side, observed_position, actor, "
+                "reason, expected_config_revision, expected_engine_revision, position_observed_at_ms, "
+                "active_observed_at_ms, history_scan_started_at_ms, history_scan_completed_at_ms, "
+                "trades_high_water, orders_high_water, audit_event_id, created_at_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (proof_id, grid_id, side.value, canonical_decimal(observed_position), actor, reason,
+                 expected_config_revision, expected_engine_revision, *timestamps, trades_high_water,
+                 orders_high_water, audit_id, self._clock_ms())).lastrowid
+            cycle_values = (settlement_id, grid_id, cycle.cell_id, cycle.generation, canonical_decimal(quantity))
+            self._x("INSERT INTO external_settlement_cycles(settlement_id, grid_id, cell_id, generation, quantity) "
+                    "VALUES (?, ?, ?, ?, ?)", cycle_values)
+            for inbox_id, role, allocated in normalized_evidence:
+                self._x("INSERT INTO external_settlement_evidence(settlement_id, inbox_id, evidence_role, "
+                        "allocated_quantity) VALUES (?, ?, ?, ?)",
+                        (settlement_id, inbox_id, role,
+                         None if allocated is None else canonical_decimal(allocated)))
+                self._x("UPDATE history_inbox SET resolved_at_ms = ?, resolution = ? WHERE id = ?",
+                        (self._clock_ms(), f"external_settlement:{settlement_id}", inbox_id))
+            self.close_cycle(tx, grid_id, cycle.cell_id, cycle.generation, "externally settled manual close")
+            self.set_cell_state(tx, grid_id, cycle.cell_id, CellState.IDLE, blocker=None, reserved_slots=0,
+                                queued_at_ms=None, reason="externally settled manual close")
+            self._x("UPDATE engine SET manual_reconcile_required = 0, manual_reconcile_reason = NULL, "
+                    "reconciliation_revision = reconciliation_revision + 1, updated_at_ms = ? WHERE id = 1",
+                    (self._clock_ms(),))
+            self.fault_hooks.hit("before_command_commit")
+            return settlement_id
+
     def cycle_release_blockers(self, grid_id: str, cell_id: int, generation: int) -> List[str]:
-        """Persistence-derivable part of NG-CELL-001: all legs final, nothing reserved/unresolved, E == X,
+        """Persistence-derivable part of NG-CELL-001: all legs final, nothing reserved/unresolved, E-X-S == 0,
         no dust, no unallocated fills, no unacknowledged late evidence."""
         cycle = self.cycle(grid_id, cell_id, generation)
         blockers: List[str] = []
@@ -2287,8 +2615,9 @@ class NeutralGridStore:
                 (grid_id, cell_id, generation)).fetchone()[0]
         if unallocated:
             blockers.append(f"{unallocated} aggregated fill(s) not yet allocated")
-        if cycle.entry_filled != cycle.exit_filled:
-            blockers.append(f"obligation open: E={cycle.entry_filled} X={cycle.exit_filled}")
+        if cycle.open_obligation != 0:
+            blockers.append(f"obligation open: E={cycle.entry_filled} X={cycle.exit_filled} "
+                            f"S={cycle.external_settled}")
         if cycle.dust != 0:
             blockers.append(f"dust {cycle.dust}")
         if cycle.late_evidence == 1:
@@ -2710,10 +3039,10 @@ class NeutralGridStore:
         for grid_id, cell_id, generation, part in parts:
             target = self.cycle(grid_id, cell_id, generation)
             reserved = self._tp_reserved(target)
-            if target.exit_filled + reserved + Decimal(canonical_decimal(part)) > target.entry_filled:
+            if target.effective_exit + reserved + Decimal(canonical_decimal(part)) > target.entry_filled:
                 raise InvalidTransitionError(
                     f"TP {cid} for {grid_id}/{cell_id}/{generation} exceeds confirmed entry: X={target.exit_filled} "
-                    f"+ reserved={reserved} + new={part} > E={target.entry_filled}")
+                    f"+ S={target.external_settled} + reserved={reserved} + new={part} > E={target.entry_filled}")
 
     def prepare_submit(self, tx: Optional[Transaction], leg_identity: LegIdentity, *, side: Side, price: Decimal,
                        amount: Decimal, order_type: OrderTypePolicy, reduce_only: bool = False,
@@ -2765,7 +3094,7 @@ class NeutralGridStore:
         """OPEN cycles accept legs; a released cycle accepts only a TP for its audited late obligation (E > X)."""
         if cycle.state == "OPEN":
             return True
-        return role == LegRole.TP and cycle.late_evidence == 2 and cycle.entry_filled > cycle.exit_filled
+        return role == LegRole.TP and cycle.late_evidence == 2 and cycle.open_obligation > 0
 
     @staticmethod
     def _allocation_pairs(leg_identity: LegIdentity, allocations: Any) -> List[Tuple[str, int, int, Any]]:
@@ -3444,6 +3773,13 @@ class NeutralGridStore:
             result.late_fills.append(fill)
             self._conflict(result, "LATE_FILL", inbox_id, cid,
                            f"fill {row.trade_id_str} after leg {leg.state.value}/cycle {cycle.state}: market freeze")
+        credited_cycle = self.cycle(leg.grid_id, leg.cell_id, leg.generation)
+        if leg.role == LegRole.TP and credited_cycle.effective_exit > credited_cycle.entry_filled:
+            self._conflict(
+                result, "EXTERNAL_SETTLEMENT_OVERALLOCATION", inbox_id, cid,
+                f"late owned TP makes X+S {credited_cycle.effective_exit} exceed E {credited_cycle.entry_filled}",
+                discriminator=canonical_decimal(credited_cycle.effective_exit),
+            )
 
     def _credit_cycle(self, grid_id: str, cell_id: int, generation: int, role: LegRole, size: Decimal) -> None:
         column = "entry_filled" if role == LegRole.ENTRY else "exit_filled"
@@ -3676,7 +4012,7 @@ class NeutralGridStore:
         return [self._inbox(row) for row in rows]
 
     def position_ledger(self) -> PositionLedger:
-        """``P = B + confirmed buys - confirmed sells`` over all owned history fills (NG-RISK-002)."""
+        """``P = B + owned fills + real external settlement executions`` (NG-RISK-002)."""
         engine = self.engine()
         if engine.effective_baseline is None:
             raise BootstrapError("engine is not bootstrapped")
@@ -3686,6 +4022,9 @@ class NeutralGridStore:
                 buys += fill.size
             else:
                 sells += fill.size
+        external_buys, external_sells = self.external_position_totals()
+        buys += external_buys
+        sells += external_sells
         return PositionLedger(baseline=engine.effective_baseline, confirmed_buys=buys, confirmed_sells=sells)
 
     def verify_ledger(self) -> List[str]:
@@ -3722,6 +4061,59 @@ class NeutralGridStore:
             if entry != cycle.entry_filled or exit_ != cycle.exit_filled:
                 problems.append(f"cycle {cycle.grid_id}/{cycle.cell_id}/{cycle.generation}: stored E/X "
                                 f"{cycle.entry_filled}/{cycle.exit_filled} != fills {entry}/{exit_}")
+            if cycle.external_settled < 0 or cycle.effective_exit > cycle.entry_filled:
+                problems.append(f"cycle {cycle.grid_id}/{cycle.cell_id}/{cycle.generation}: "
+                                f"X+S {cycle.effective_exit} exceeds E {cycle.entry_filled}")
+        with self._rlock:
+            settlements = (self._x("SELECT id, settlement_side FROM external_settlements ORDER BY id").fetchall()
+                           if self._external_settlement_schema_available() else [])
+        for settlement in settlements:
+            with self._rlock:
+                cycle_rows = self._x("SELECT quantity FROM external_settlement_cycles WHERE settlement_id = ?",
+                                     (settlement["id"],)).fetchall()
+                evidence_rows = self._x("SELECT e.evidence_role, e.allocated_quantity, h.stream, h.payload_json, "
+                                        "h.resolution FROM external_settlement_evidence e JOIN history_inbox h "
+                                        "ON h.id = e.inbox_id WHERE e.settlement_id = ?", (settlement["id"],)).fetchall()
+            cycle_total = sum((parse_decimal(row[0]) for row in cycle_rows), Decimal(0))
+            trade_total = sum((parse_decimal(row["allocated_quantity"]) for row in evidence_rows
+                               if row["evidence_role"] == "TRADE"), Decimal(0))
+            if len(cycle_rows) != 1 or cycle_total <= 0 or cycle_total != trade_total:
+                problems.append(f"external settlement {settlement['id']}: cycle/trade totals differ "
+                                f"{cycle_total}/{trade_total}")
+            if sum(row["evidence_role"] == "TERMINAL_ORDER" for row in evidence_rows) != 1:
+                problems.append(f"external settlement {settlement['id']}: terminal order evidence count is not one")
+            trade_order_ids = set()
+            trade_client_ids = set()
+            terminal_order_id = None
+            terminal_client_ids = set()
+            for row in evidence_rows:
+                expected_stream = STREAM_TRADES if row["evidence_role"] == "TRADE" else STREAM_INACTIVE_ORDERS
+                if row["stream"] != expected_stream or row["resolution"] != \
+                        f"external_settlement:{settlement['id']}":
+                    problems.append(f"external settlement {settlement['id']}: malformed evidence binding")
+                    continue
+                payload = _loads(row["payload_json"])
+                if row["evidence_role"] == "TRADE":
+                    allocated = parse_decimal(row["allocated_quantity"])
+                    if payload.get("own_side") != settlement["settlement_side"] or \
+                            parse_decimal(payload.get("size")) != allocated or allocated <= 0:
+                        problems.append(f"external settlement {settlement['id']}: trade allocation/payload mismatch")
+                    trade_order_ids.add(str(payload.get("own_exchange_order_id")))
+                    if payload.get("own_client_order_id") not in (None, ""):
+                        trade_client_ids.add(str(payload.get("own_client_order_id")))
+                else:
+                    terminal_order_id = str(payload.get("order_index") or payload.get("order_id"))
+                    terminal_client_ids = {str(value) for value in
+                                           (payload.get("client_order_id"), payload.get("client_order_id_str"))
+                                           if value not in (None, "")}
+                    if not payload.get("reduce_only") or payload.get("side") != settlement["settlement_side"] or \
+                            parse_decimal(payload.get("remaining_base_amount")) != 0 or \
+                            parse_decimal(payload.get("filled_base_amount")) != cycle_total:
+                        problems.append(f"external settlement {settlement['id']}: terminal order payload mismatch")
+            if len(trade_order_ids) != 1 or terminal_order_id not in trade_order_ids:
+                problems.append(f"external settlement {settlement['id']}: evidence spans multiple orders")
+            if len(trade_client_ids) != 1 or trade_client_ids != terminal_client_ids:
+                problems.append(f"external settlement {settlement['id']}: evidence spans multiple client ids")
         return problems
 
     # ---------------------------------------------------------------------------------------------- operator audits

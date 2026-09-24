@@ -14,7 +14,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.history import (
     HistoryScanner,
     InMemoryHistoryCursorView,
 )
-from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import LATEST_VERSION, MIGRATIONS
+from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MIGRATIONS
 from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     InvalidTransitionError,
     StoreIntegrityError,
@@ -223,7 +223,7 @@ def test_replayed_transport_ack_still_validates_exchange_id(tmp_path):
 
 def test_legacy_duplicate_exchange_ids_are_diagnosed_and_migration_fails_closed(tmp_path):
     env = Env(tmp_path)
-    legacy_migrations = MIGRATIONS[:-1]
+    legacy_migrations = tuple(migration for migration in MIGRATIONS if migration.version < 5)
     store = env.open(migrations=legacy_migrations)
     env.bootstrap(store)
     first = record_entry_intent(store, 1)
@@ -240,7 +240,7 @@ def test_legacy_duplicate_exchange_ids_are_diagnosed_and_migration_fails_closed(
 
     raw = sqlite3.connect(env.db)
     try:
-        assert raw.execute("PRAGMA user_version").fetchone()[0] == LATEST_VERSION - 1
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == 4
         assert raw.execute(
             "SELECT count(*) FROM orders WHERE exchange_order_id = ?", (EXCHANGE_ID,)
         ).fetchone()[0] == 2

@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import grid, risk
+from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import EMPTY_BUCKETS
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import OrderState
 from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import SNAPSHOT_VERSION, grid_config_to_json
 
@@ -53,7 +54,9 @@ def _cell_view(engine, ledger, now: float) -> Dict[str, Any]:
         for leg in cycle.entries:
             entry = _leg_view(engine, leg)
         tps.extend(_leg_view(engine, t) for t in cycle.tps)
-    b = ledger.buckets()
+    # Once a cycle is released, retain its final E/X/S in the cell view instead of replacing the audited history
+    # with zeroes.  For a live cell this remains the aggregate of its open cycles.
+    b = sum((cycle.buckets() for cycle in cycles), start=EMPTY_BUCKETS)
     since = [v for k, v in engine.meta.obligations.items() if k.split(":")[0] == str(ledger.cell_id)]
     blocker = engine.cell_blockers.get(ledger.cell_id)
     plan = engine.admission_plan
@@ -77,7 +80,8 @@ def _cell_view(engine, ledger, now: float) -> Dict[str, Any]:
         "entry": entry,
         "tp_children": tps,
         "obligation": {
-            "E": str(b.E), "X": str(b.X), "live_tp": str(b.live_tp_remainder),
+            "E": str(b.E), "X": str(b.X), "external_settled": str(b.external_settled),
+            "open": str(b.open_obligation), "live_tp": str(b.live_tp_remainder),
             "reserved_unassigned": str(b.reserved_tp_unassigned), "unassigned": str(b.unassigned),
             "dust": str(b.dust),
         },
@@ -189,6 +193,7 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
         "operator_paused": engine.meta.operator_paused,
         "started": bool(engine.meta.started),
         "stop_outcome": engine.meta.stop_outcome,
+        "external_close_candidate": engine.external_close_candidate(now),
         "tp_dispatch": {
             "slo_s": str(engine.options.tp_dispatch_slo_s),
             "last_latency_s": _s(round(latencies[-1], 3)) if latencies else None,
@@ -322,7 +327,10 @@ def format_status(snapshot: Optional[Dict[str, Any]], *, stale_after_s: float = 
         lines.append("  blocked: " + "; ".join([f"{k}: {v}" for k, v in sorted(s["freezes"].items())]
                                                + list(s["store_blockers"])))
     for cell in snapshot["cells"]:
-        if cell["state"] in ("IDLE", "QUEUED") and not cell["blocker"] and cell["obligation"]["dust"] == "0":
+        obligation = cell["obligation"]
+        if cell["state"] in ("IDLE", "QUEUED") and not cell["blocker"] and obligation["dust"] == "0" \
+                and obligation["E"] == "0" and obligation["X"] == "0" \
+                and obligation.get("external_settled", "0") == "0":
             continue
         e = cell["entry"] or {}
         tp_text = ",".join(f"{t['cid']}/{t['exchange_id']}:{t['filled']}/{t['requested']} remaining {t['remaining']} "
@@ -331,7 +339,8 @@ def format_status(snapshot: Optional[Dict[str, Any]], *, stale_after_s: float = 
             f"  cell {cell['cell_id']:>3} {cell['low']}-{cell['high']} {cell['entry_side']:<4} g{cell['generation']} "
             f"{cell['state']:<22} entry {e.get('cid')}/{e.get('exchange_id')} {e.get('filled')}/{e.get('requested')} "
             f"rem {e.get('remaining')} {e.get('state')} | TP [{tp_text}] | E {cell['obligation']['E']} "
-            f"X {cell['obligation']['X']} dust {cell['obligation']['dust']}"
+            f"X {cell['obligation']['X']} S {cell['obligation'].get('external_settled', '0')} "
+            f"open {cell['obligation'].get('open')} dust {cell['obligation']['dust']}"
             + (f" | blocker {cell['blocker']}" if cell["blocker"] else "")
             + (f" | queue {cell['queue_age_s']}s" if cell["queue_age_s"] else ""))
     for err in snapshot["errors"][-5:]:

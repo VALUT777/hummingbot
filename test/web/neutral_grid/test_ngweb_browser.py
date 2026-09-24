@@ -172,6 +172,94 @@ async def test_browser_attach_refreshes_identity_from_new_committed_snapshot(mak
 
 
 @pytest.mark.asyncio
+async def test_browser_external_close_flow_and_stopped_start_wording(make_web, tmp_path):
+    snap = _snapshot_with_engine_fields("STOPPED_WITH_INVENTORY")
+    snap["summary"]["authoritative_net"] = "0"
+    snap["summary"]["external_close_candidate"] = {
+        "proof_id": "a" * 64, "blockers": [], "observed_position": "0",
+        "cycle": {"grid_id": "ng-test", "cell_id": "11", "generation": "2", "E": "10", "X": "0",
+                  "external_settled": "0", "proposed_settlement": "10", "open_after": "0"},
+        "trades": [{"inbox_id": "154", "side": "SELL", "quantity": "4.38", "price": "5.25"},
+                   {"inbox_id": "155", "side": "SELL", "quantity": "5.62", "price": "5.26"}],
+        "terminal_order": {"inbox_id": "156", "side": "SELL", "reduce_only": True, "final": True,
+                           "filled": "10"},
+    }
+    web = await make_web(snap)
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'STOPPED_WITH_INVENTORY'")
+        assert await page.eval("document.querySelector('[data-cmd=resume]').disabled") is True
+        await page.eval("document.getElementById('external-close-open').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        assert await page.eval("document.getElementById('f-action').value") == "settle_external_close"
+        acknowledgement = await page.eval("document.getElementById('f-ack-text').textContent")
+        assert "внешнее закрытие" in acknowledgement and "fills, CID, P&L и история сохранятся" in acknowledgement
+        assert "не меняет обязательства" not in acknowledgement
+        evidence = await page.eval("document.getElementById('f-external-close').textContent")
+        assert all(text in evidence for text in ("E=10", "X биржа=0", "S вручную=10", "4.38", "5.62",
+                                                 "reduce-only=да", "бот останется остановлен")), evidence
+        await page.eval("document.getElementById('f-note').value='ручное закрытие сверено';"
+                        "document.getElementById('f-ack').checked=true;"
+                        "document.getElementById('f-confirmation').value="
+                        "'SETTLE EXTERNAL CLOSE ng-test AT FLAT 0'")
+        await page.eval("document.getElementById('cmd-submit').click()")
+        await page.wait_for("!document.getElementById('cmd-dialog').open")
+        [row] = web.gateway.commands
+        assert row["payload"]["proof_id"] == "a" * 64
+
+        await page.eval("document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-prices').children.length > 0 && "
+                            "!document.getElementById('start-open').disabled")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        assert "Продолжить сохранённую сетку" in await page.eval("document.getElementById('start-title').textContent")
+        wording = await page.eval("document.getElementById('start-ack-baseline-text').textContent")
+        assert "исходный baseline" in wording and "позиция на бирже равна" not in wording
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_external_close_dialog_never_submits_an_unseen_replacement_proof(make_web, tmp_path):
+    snap = _snapshot_with_engine_fields("STOPPED")
+    candidate = {
+        "proof_id": "a" * 64, "blockers": [], "observed_position": "0",
+        "cycle": {"grid_id": "ng-test", "cell_id": "11", "generation": "2", "E": "10", "X": "0",
+                  "external_settled": "0", "proposed_settlement": "10", "open_after": "0"},
+        "trades": [{"inbox_id": "154", "side": "SELL", "quantity": "4.38", "price": "5.25"},
+                   {"inbox_id": "155", "side": "SELL", "quantity": "5.62", "price": "5.26"}],
+        "terminal_order": {"inbox_id": "156", "side": "SELL", "reduce_only": True, "final": True,
+                           "filled": "10"},
+    }
+    snap["summary"]["external_close_candidate"] = candidate
+    web = await make_web(snap)
+    web.gateway.live_clock = True
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.eval("document.getElementById('external-close-open').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        assert await page.eval("document.getElementById('f-action').value") == "settle_external_close"
+        assert "4.38" in await page.eval("document.getElementById('f-external-close').textContent")
+
+        replacement = dict(candidate, proof_id="b" * 64,
+                           trades=[dict(candidate["trades"][0], quantity="4"),
+                                   dict(candidate["trades"][1], quantity="6")])
+        web.gateway.snapshot["summary"]["external_close_candidate"] = replacement
+        await page.eval("new Promise(r => setTimeout(r, 3000))")  # state poll updates S.state behind the open dialog
+        await page.eval("document.getElementById('f-note').value='проверено';"
+                        "document.getElementById('f-ack').checked=true;"
+                        "document.getElementById('f-confirmation').value="
+                        "'SETTLE EXTERNAL CLOSE ng-test AT FLAT 0';"
+                        "document.getElementById('cmd-submit').click()")
+        await page.wait_for("document.getElementById('cmd-error').textContent.includes('409')")
+        assert web.gateway.commands == []
+        refreshed = await page.eval("document.getElementById('f-external-close').textContent")
+        assert "SELL 4 LIT" in refreshed and "SELL 6 LIT" in refreshed
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scheme", ["light", "dark"])
 async def test_browser_contrast_and_mobile_layout(make_web, tmp_path, scheme):
     web = await make_web(_snapshot_with_engine_fields("PAUSED"))

@@ -14,6 +14,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import (
     m0003_drilldown_indexes,
     m0004_dispatch_owner,
     m0005_unique_exchange_order_id,
+    m0006_external_settlements,
 )
 
 
@@ -35,6 +36,8 @@ MIGRATIONS: Tuple[Migration, ...] = (
     Migration(m0004_dispatch_owner.VERSION, m0004_dispatch_owner.NAME, m0004_dispatch_owner.SQL),
     Migration(m0005_unique_exchange_order_id.VERSION, m0005_unique_exchange_order_id.NAME,
               m0005_unique_exchange_order_id.SQL),
+    Migration(m0006_external_settlements.VERSION, m0006_external_settlements.NAME,
+              m0006_external_settlements.SQL),
 )
 
 LATEST_VERSION = MIGRATIONS[-1].version

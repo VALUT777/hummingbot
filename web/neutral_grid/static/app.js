@@ -55,18 +55,22 @@
   // Offered only when the committed snapshot shows they apply; each needs a typed confirmation phrase.
   var EXTENDED_AUDIT_ACTIONS = {
     retire_colliding_cid: "Списать CID, занятый чужим ордером (снять заморозку CID_ALLOCATION)",
-    migrate_grid: "Миграция спокойной сетки (старые циклы сохраняются, журнал не сбрасывается)"
+    migrate_grid: "Миграция спокойной сетки (старые циклы сохраняются, журнал не сбрасывается)",
+    settle_external_close: "Зачесть проверенное ручное закрытие (не сброс истории)"
   };
   function extendedAuditAvailable(summary) {
     var out = [];
     if (summary && summary.freezes && summary.freezes.CID_ALLOCATION) out.push("retire_colliding_cid");
     if (summary && Array.isArray(summary.grid_mutation_blockers) && summary.grid_mutation_blockers.length === 0)
       out.push("migrate_grid");
+    if (summary && summary.external_close_candidate) out.push("settle_external_close");
     return out;
   }
   function confirmationPhrase(action, cid) {
     if (action === "retire_colliding_cid") return "СПИСАТЬ CID " + (cid || "");
     if (action === "ack_history_conflict") return "ПРИНЯТЬ НАБОР " + txt(S.dialogConflict && S.dialogConflict.id);
+    if (action === "settle_external_close") return "SETTLE EXTERNAL CLOSE " +
+      txt(S.dialogExternal && S.dialogExternal.grid_id) + " AT FLAT 0";
     return "МИГРАЦИЯ СЕТКИ " + txt(S.state && S.state.engine_identity && S.state.engine_identity.grid_id);
   }
   var COMMAND_HELP = {
@@ -87,7 +91,8 @@
     preview: null, tab: "overview",
     cellsCursor: null, cellsFilterKey: "",
     commandsCursor: null, auditCursor: null,
-    pendingCommand: null, dialogKey: null, dialogKind: null, dialogRevs: null
+    pendingCommand: null, dialogKey: null, dialogKind: null, dialogRevs: null,
+    dialogExternal: null
   };
 
   // ------------------------------------------------------------------ helpers
@@ -341,6 +346,13 @@
     tickAge();
     var engine = st.engine || {};
     var summary = st.summary || {};
+    $("external-close-open").hidden = !summary.external_close_candidate;
+    var display = engine.display_state;
+    var pauseBtn = document.querySelector("[data-cmd=pause]");
+    var resumeBtn = document.querySelector("[data-cmd=resume]");
+    pauseBtn.disabled = display === "PAUSED" || display === "STOPPED" || display === "STOPPED_WITH_INVENTORY";
+    resumeBtn.disabled = display !== "PAUSED";
+    resumeBtn.title = resumeBtn.disabled ? "Доступно только для состояния PAUSED" : "Снять паузу";
     // confirm_baseline only after an applied Start (the backend refuses it otherwise, 409 start_required)
     var confirmBtn = document.querySelector("[data-cmd=confirm_baseline]");
     confirmBtn.disabled = !(st.engine_started === true && (summary.baseline === null || summary.baseline === undefined));
@@ -650,14 +662,41 @@
         conflictBox.appendChild(conflictTable(c, committed ? null : { index: i }));
       });
       fields.appendChild(conflictBox);
+      var external = summaryNow.external_close_candidate || {};
+      // Pin the exact proof/evidence rendered in this dialog. Background state polling may replace S.state while
+      // the operator is reading; submission must name what was actually shown, then let the server return 409 if
+      // that proof is no longer current.
+      S.dialogExternal = { proof_id: external.proof_id || null,
+        grid_id: (external.cycle || {}).grid_id || (S.state && S.state.engine_identity && S.state.engine_identity.grid_id) };
+      var externalBox = el("div", { id: "f-external-close", cls: "stack" });
+      externalBox.appendChild(el("h3", { text: "Проверяемое ручное закрытие" }));
+      var cy = external.cycle || {};
+      externalBox.appendChild(el("p", { text: "Цикл " + txt(cy.cell_id) + " / поколение " + txt(cy.generation) +
+        ": E=" + txt(cy.E) + " · X биржа=" + txt(cy.X) + " · S вручную=" + txt(cy.proposed_settlement) +
+        " · остаток=" + txt(cy.open_after) }));
+      (external.trades || []).forEach(function (t) {
+        externalBox.appendChild(el("p", { cls: "mono", text: txt(t.side) + " " + txt(t.quantity) +
+          " LIT @ " + txt(t.price) + " · inbox " + txt(t.inbox_id) }));
+      });
+      var eo = external.terminal_order || {};
+      externalBox.appendChild(el("p", { text: "Ордер: reduce-only=" + txt(eo.reduce_only) +
+        " · final=" + txt(eo.final) + " · filled=" + txt(eo.filled) + ". Позиция: " +
+        txt(external.observed_position) + "." }));
+      if ((external.blockers || []).length) externalBox.appendChild(el("p", { cls: "form-error",
+        text: "Сейчас зачёт недоступен: " + external.blockers.join("; ") }));
+      else externalBox.appendChild(el("p", { cls: "banner banner-warn", text:
+        "Будет зачтено только это доказанное ручное закрытие. История, fills, CID и P&L не сбрасываются; бот останется остановлен." }));
+      fields.appendChild(externalBox);
       var confLabel = el("label", { for: "f-confirmation", text: "Фраза подтверждения" });
       var conf = el("input", { id: "f-confirmation", spellcheck: "false", maxlength: "80", autocomplete: "off" });
       var confHint = el("p", { cls: "hint", id: "f-confirmation-hint" });
       [obsLabel, obs, cidLabel, cid, confLabel, conf, confHint].forEach(function (n) { fields.appendChild(n); });
       var sync = function () {
         var extended = sel.value === "retire_colliding_cid" || sel.value === "migrate_grid" ||
+          sel.value === "settle_external_close" ||
           sel.value === "ack_history_conflict";
         conflictBox.hidden = sel.value !== "ack_history_conflict";
+        externalBox.hidden = sel.value !== "settle_external_close";
         obsLabel.hidden = obs.hidden = sel.value !== "baseline";
         cidLabel.hidden = cid.hidden = sel.value !== "resolve_unknown_submit" && sel.value !== "retire_colliding_cid";
         confLabel.hidden = conf.hidden = confHint.hidden = !extended;
@@ -669,8 +708,16 @@
       sync();
       fields.appendChild(el("label", { for: "f-note", text: "Что именно проверено (обязательно)" }));
       fields.appendChild(el("input", { id: "f-note", maxlength: "500" }));
-      fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-ack" }),
-        "Подтверждаю: аудит проведён по истории биржи и не меняет обязательства ячеек."]));
+      var ackText = el("span", { id: "f-ack-text",
+        text: "Подтверждаю: аудит проведён по истории биржи и не меняет обязательства ячеек." });
+      fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-ack" }), ackText]));
+      var syncAck = function () {
+        ackText.textContent = sel.value === "settle_external_close"
+          ? "Подтверждаю: будет записано только показанное внешнее закрытие; fills, CID, P&L и история сохранятся, бот останется остановлен."
+          : "Подтверждаю: аудит проведён по истории биржи и не меняет обязательства ячеек.";
+      };
+      sel.addEventListener("change", syncAck);
+      syncAck();
     } else {
       fields.appendChild(el("label", { for: "f-reason", text: "Комментарий (необязательно)" }));
       fields.appendChild(el("input", { id: "f-reason", maxlength: "500" }));
@@ -703,8 +750,10 @@
       if (payload.action === "resolve_unknown_submit" || payload.action === "retire_colliding_cid")
         payload.cid = $("f-cid").value.trim();
       if (payload.action === "retire_colliding_cid" || payload.action === "migrate_grid" ||
-          payload.action === "ack_history_conflict")
+          payload.action === "ack_history_conflict" || payload.action === "settle_external_close")
         payload.confirmation = $("f-confirmation").value.trim();
+      if (payload.action === "settle_external_close")
+        payload.proof_id = S.dialogExternal && S.dialogExternal.proof_id;
       if (payload.action === "ack_history_conflict") {
         payload.conflict_set_id = S.dialogConflict && S.dialogConflict.id;   // the set the operator looked at
         payload.accepted = {};
@@ -762,6 +811,8 @@
     box.appendChild(el("span", { cls: "status", text: COMMAND_STATUS[c.status] || txt(c.status) }));
     if (replay) box.appendChild(el("span", { text: " (повтор: возвращена та же команда)" }));
     if (c.result) box.appendChild(el("div", { cls: "hint", text: "Результат движка: " + (typeof c.result === "string" ? c.result : JSON.stringify(c.result)) }));
+    if (c.status === "APPLIED" && c.result && c.result.stopped === true)
+      box.appendChild(el("div", { cls: "banner", text: "Сверка выполнена; сетка остаётся остановленной. Проверьте превью и нажмите Старт отдельно." }));
     var auditError = auditErrorText(c.result);
     if (auditError) box.appendChild(el("div", { cls: "form-error", text: auditError }));
   }
@@ -779,6 +830,9 @@
   function wireCommands() {
     document.querySelectorAll("[data-cmd]").forEach(function (b) {
       b.addEventListener("click", function () { openCommand(b.getAttribute("data-cmd")); });
+    });
+    $("external-close-open").addEventListener("click", function () {
+      openCommand("baseline_audit", { action: "settle_external_close" });
     });
     $("cmd-cancel").addEventListener("click", function () { $("cmd-dialog").close(); });
     $("cmd-submit").addEventListener("click", async function () {
@@ -910,9 +964,15 @@
       ["preview_id", p.preview_id]
     ]);
     $("start-baseline").value = "";
+    var alreadyBootstrapped = !!(p.baseline && p.baseline.confirmed_in_ledger);
     $("start-baseline-help").textContent = "В конфигурации B = " + txt(p.baseline && p.baseline.signed) +
-      ". Введите то же значение вручную: это подтверждение, что фактическая позиция на бирже равна B. Бот не " +
-      "покупает и не закрывает её. После сверки движок попросит подтвердить B ещё раз по снимку биржи.";
+      (alreadyBootstrapped
+        ? ". Это исходный исторический baseline сетки. Текущая позиция может отличаться: Старт сохраняет уже учтённую позицию и обязательства."
+        : ". Введите то же значение вручную: до первого bootstrap оно должно совпадать с фактической позицией на бирже.");
+    $("start-ack-baseline-text").textContent = alreadyBootstrapped
+      ? "Подтверждаю исходный baseline B и продолжение с сохранённой позицией/историей."
+      : "Подтверждаю: перед первым bootstrap фактическая позиция на бирже равна B.";
+    $("start-title").textContent = alreadyBootstrapped ? "Продолжить сохранённую сетку после Stop" : "Подтверждение старта";
     $("start-ack-baseline").checked = false;
     $("start-ack-risk").checked = false;
     $("start-error").textContent = "";
@@ -1016,7 +1076,9 @@
       td("TP: запр./исп./ост.", [tpBox]),
       td("Живые ноги", [txt(live) + (unknown ? " · неизв.: " + unknown : "")]),
       td("ID client / exchange", [ids]),
-      td("Обязательство", [el("span", { cls: "mono", text: "E " + txt(ob.E) + " · X " + txt(ob.X) + " · TP " + txt(ob.live_tp) + " · резерв " + txt(ob.reserved_unassigned) })]),
+      td("Обязательство", [el("span", { cls: "mono", text: "E " + txt(ob.E) + " · X биржа " + txt(ob.X) +
+        " · S вручную " + txt(ob.external_settled) + " · остаток " + txt(ob.open) +
+        " · TP " + txt(ob.live_tp) + " · резерв " + txt(ob.reserved_unassigned) })]),
       td("Пыль", [el("span", { cls: "mono", text: txt(ob.dust) })]),
       td("Блокер", [txt(c.blocker)]),
       td("Очередь", [typeof c.queue_age_s === "number" ? fmtAge(c.queue_age_s) : txt(c.queue_age_s)])

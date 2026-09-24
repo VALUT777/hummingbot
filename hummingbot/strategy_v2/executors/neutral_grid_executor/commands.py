@@ -30,6 +30,7 @@ AUDIT_ACTIONS = (
 EXTENDED_AUDIT_ACTIONS = (
     "retire_colliding_cid",     # AC-43: audited retire of a CID a foreign order owns; clears the CID freeze
     "migrate_grid",             # AC-52: audited replacement of a quiescent grid (old cycles kept, no reset)
+    "settle_external_close",    # proof-bound accounting of one exact manual reduce-only close
 )
 ALL_AUDIT_ACTIONS = AUDIT_ACTIONS + EXTENDED_AUDIT_ACTIONS
 
@@ -62,6 +63,8 @@ def validate_kind(kind: str, payload: Dict[str, Any]) -> Optional[str]:
             return "baseline audit requires observed_position"
         if action == "resolve_unknown_submit" and "cid" not in payload:
             return "resolve_unknown_submit requires cid"
+        if action == "settle_external_close" and "proof_id" not in payload:
+            return "settle_external_close requires proof_id"
     for value in payload.values():
         if isinstance(value, float):
             return "payload numbers must be strings (no float)"

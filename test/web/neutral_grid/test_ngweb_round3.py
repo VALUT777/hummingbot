@@ -180,6 +180,60 @@ def test_d2_17_extended_actions_match_engine():
         assert engine_commands.validate_kind("baseline_audit", payload) is None
 
 
+@pytest.mark.asyncio
+async def test_external_close_intake_is_bound_to_published_proof_and_exact_phrase(make_web):
+    snap = sample_snapshot("STOPPED_WITH_INVENTORY")
+    snap["summary"]["external_close_candidate"] = {
+        "proof_id": "a" * 64, "blockers": [], "observed_position": "0",
+        "cycle": {"grid_id": "ng-test", "cell_id": "11", "generation": "2",
+                  "E": "10", "X": "0", "external_settled": "0",
+                  "proposed_settlement": "10", "open_after": "0"},
+        "trades": [{"inbox_id": "154", "side": "SELL", "quantity": "4.38", "price": "5.25"},
+                   {"inbox_id": "155", "side": "SELL", "quantity": "5.62", "price": "5.26"}],
+        "terminal_order": {"inbox_id": "156", "side": "SELL", "reduce_only": True, "final": True,
+                           "filled": "10"},
+    }
+    web = await make_web(snap)
+    await web.login()
+    body = {"action": "settle_external_close", "proof_id": "a" * 64,
+            "confirmation": "SETTLE EXTERNAL CLOSE ng-test AT FLAT 0",
+            "note": "manual close checked", "acknowledge": True}
+    ok = await web.command("baseline_audit", "settle-external-web-1", body)
+    assert ok.status == 202, await ok.text()
+    assert (await ok.json())["command"]["payload"] == body
+
+    changed = dict(body, proof_id="b" * 64)
+    stale = await web.command("baseline_audit", "settle-external-web-2", changed)
+    assert stale.status == 409 and (await stale.json())["error"] == "external_close_proof_changed"
+    wrong = await web.command("baseline_audit", "settle-external-web-3", dict(body, confirmation="RESET"))
+    assert wrong.status == 422
+    unacknowledged = await web.command("baseline_audit", "settle-external-web-6", dict(body, acknowledge=False))
+    message = (await unacknowledged.json())["message"]
+    assert unacknowledged.status == 422 and "внешнего закрытия" in message and "не меняет обязательства" not in message
+
+
+@pytest.mark.asyncio
+async def test_external_close_intake_shows_candidate_blockers_and_rejects_running_state(make_web):
+    snap = sample_snapshot("STOPPED")
+    snap["summary"]["external_close_candidate"] = {
+        "proof_id": None, "blockers": ["EXACTLY_ONE_CYCLE_REQUIRED", "EXACTLY_ONE_MANUAL_ORDER_REQUIRED"]}
+    web = await make_web(snap)
+    await web.login()
+    body = {"action": "settle_external_close", "proof_id": "a" * 64,
+            "confirmation": "SETTLE EXTERNAL CLOSE ng-test AT FLAT 0", "note": "x", "acknowledge": True}
+    blocked = await web.command("baseline_audit", "settle-external-web-4", body)
+    payload = await blocked.json()
+    assert blocked.status == 409 and payload["error"] == "external_close_not_eligible"
+    assert payload["blockers"] == snap["summary"]["external_close_candidate"]["blockers"]
+
+    snap["engine_state"] = "NORMAL"
+    candidate = snap["summary"]["external_close_candidate"]
+    snap["summary"]["external_close_candidate"] = dict(candidate, proof_id="a" * 64, blockers=[])
+    web.gateway.snapshot = snap
+    running = await web.command("baseline_audit", "settle-external-web-5", body)
+    assert running.status == 409 and (await running.json())["error"] == "external_close_not_stopped"
+
+
 def test_c1_redaction_keeps_ids_and_digests_inside_results():
     from web.neutral_grid.security import redact_tree
     digest = "4233715fe06fca5a1736214c6ea97cbc"

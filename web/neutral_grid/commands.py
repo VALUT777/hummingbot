@@ -40,7 +40,7 @@ AUDIT_ACTIONS = (
 )
 # Audited operator actions beyond the base set (engine ``commands.EXTENDED_AUDIT_ACTIONS``): offered only when the
 # committed snapshot shows they apply, and only with an explicit typed confirmation phrase.
-EXTENDED_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid")
+EXTENDED_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid", "settle_external_close")
 FREEZE_CID = "CID_ALLOCATION"
 COMMAND_KINDS = {k.value: k.value for k in CommandKind}
 MAX_CID = (1 << 48) - 1
@@ -192,6 +192,8 @@ class CommandService:
     def confirmation_phrase(self, action: str, cid: Optional[str] = None) -> str:
         if action == "retire_colliding_cid":
             return f"СПИСАТЬ CID {cid}"
+        if action == "settle_external_close":
+            return f"SETTLE EXTERNAL CLOSE {self.engine_identity.get('grid_id')} AT FLAT 0"
         return f"МИГРАЦИЯ СЕТКИ {self.engine_identity.get('grid_id')}"
 
     def _extended_audit_blocker(self, normalized: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[CommandOutcome]:
@@ -211,6 +213,25 @@ class CommandService:
                 return self._error(409, "audit_not_applicable",
                                    "Миграция сетки доступна только для полностью спокойной сетки "
                                    "(grid_mutation_blockers пуст и опубликован движком).", blockers=blockers)
+        if action == "settle_external_close":
+            state = snapshot.get("engine_state")
+            if state not in ("STOPPED", "STOPPED_WITH_INVENTORY"):
+                return self._error(409, "external_close_not_stopped",
+                                   "Зачесть ручное закрытие можно только когда сетка полностью остановлена.",
+                                   engine_state=state)
+            candidate = summary.get("external_close_candidate")
+            if not isinstance(candidate, dict):
+                return self._error(409, "external_close_not_eligible",
+                                   "Движок не опубликовал проверяемое ручное закрытие.", blockers=["NO_CANDIDATE"])
+            blockers = candidate.get("blockers")
+            if not isinstance(blockers, list) or blockers:
+                return self._error(409, "external_close_not_eligible",
+                                   "Доказательств недостаточно для точного зачёта ручного закрытия.",
+                                   blockers=blockers)
+            if normalized["proof_id"] != candidate.get("proof_id"):
+                return self._error(409, "external_close_proof_changed",
+                                   "Набор доказательств изменился после просмотра. Проверьте его заново.",
+                                   proof_id=candidate.get("proof_id"))
         return None
 
     def _conflict_set_blocker(self, normalized: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[CommandOutcome]:
@@ -303,6 +324,9 @@ class CommandService:
             if not note:
                 raise ValueError("Для аудита нужна причина (note) для журнала.")
             if payload.get("acknowledge") is not True:
+                if action == "settle_external_close":
+                    raise ValueError("Нужно подтвердить запись показанного внешнего закрытия с сохранением fills, "
+                                     "CID, P&L и истории и без запуска бота (acknowledge=true).")
                 raise ValueError("Нужно подтвердить, что аудит проведён и не меняет обязательства ячеек "
                                  "(acknowledge=true).")
             normalized = {"action": action, "note": note, "acknowledge": True}
@@ -313,6 +337,11 @@ class CommandService:
                 if not isinstance(cid, str) or not cid.isdigit() or int(cid) > MAX_CID:
                     raise ValueError("cid: строка с 48-битным client order ID.")
                 normalized["cid"] = cid
+            if action == "settle_external_close":
+                proof_id = payload.get("proof_id")
+                if not isinstance(proof_id, str) or not re.fullmatch(r"[0-9a-f]{64}", proof_id):
+                    raise ValueError("proof_id: нужен SHA-256 опубликованного набора доказательств.")
+                normalized["proof_id"] = proof_id
             if action == "ack_history_conflict":
                 # M1 (AC-40): bound to the exact conflict set the operator reviewed; accepted versions explicit.
                 set_id = payload.get("conflict_set_id")
