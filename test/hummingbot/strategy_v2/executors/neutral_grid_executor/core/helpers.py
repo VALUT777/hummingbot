@@ -130,6 +130,9 @@ class CoreSim:
     def endpoints(self):
         return self.risk.endpoints_from_ledgers(self.baseline, list(self.ledgers.values()))
 
+    def endpoints_with_obligations(self):
+        return self.risk.with_obligations(self.endpoints(), *self.risk.obligation_totals(list(self.ledgers.values())))
+
     def admission_views(self):
         from hummingbot.strategy_v2.executors.neutral_grid_executor.admission import CellAdmission, slot_need_from_ledger
         views = []
@@ -166,7 +169,8 @@ class CoreSim:
         owned = [self.router.RouterOrder.from_leg(leg) for leg in self.non_final()]
         rplan = self.router.plan_submits(candidates, owned, endpoints=self.endpoints(), limits=self.limits,
                                          slots=self.router.SlotBudget.from_plan(adm), mid=self.mid,
-                                         entries_allowed=self.entries_allowed)
+                                         entries_allowed=self.entries_allowed,
+                                         owed=self.risk.obligation_totals(list(self.ledgers.values())))
         self.last_router = rplan
         for action in rplan.actions:
             if action.kind == self.router.ActionKind.SUBMIT:
