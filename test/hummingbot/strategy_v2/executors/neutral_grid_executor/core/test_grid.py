@@ -166,6 +166,7 @@ class TestValidateConfig(unittest.TestCase):
         self.assertNotEqual(a, grid.config_fingerprint(config(order_amount_base=D("11"))))
         self.assertNotEqual(a, grid.config_fingerprint(config(cell_count=54)))
         self.assertNotEqual(a, grid.config_fingerprint(config(upper_price=D("6.1"))))
+        self.assertEqual(a, config().fingerprint())                    # contracts.GridConfig delegates here
 
 
 class TestPreview(unittest.TestCase):

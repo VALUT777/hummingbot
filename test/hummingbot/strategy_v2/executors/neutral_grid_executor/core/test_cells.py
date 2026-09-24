@@ -56,6 +56,15 @@ class TestNormalCycles(unittest.TestCase):
         h.ledger.release(True)
         self.assertEqual(Side.SELL, h.leg(h.entry()).side)
 
+    def test_market_order_type_cannot_be_built(self):
+        # AC-38 (core part): there is no MARKET policy and no fallback path to one.
+        h = Harness(BUY_CELL)
+        e = h.entry(accept=False)
+        for bad in ("MARKET", None, "LIMIT"):
+            with self.assertRaises(LedgerError):
+                h.ledger.submit_request(e, bad)
+        self.assertNotIn("MARKET", [p.value for p in OrderTypePolicy])
+
     def test_submit_request_is_exact_and_never_reduce_only(self):
         h = Harness(BUY_CELL)
         e = h.entry(accept=False)
@@ -191,11 +200,8 @@ class TestTerminalPartialEntryAndLateFills(unittest.TestCase):
         self.assertEqual(0, h.ledger.current.generation)
 
     def test_late_fill_after_release_goes_to_old_cycle_and_requires_audit(self):
-        h = Harness(BUY_CELL, r=rules(min_base="1", min_notional="0"))
-        e, _ = full_cycle(h)
-        h.ledger.release(True)
-        # Venue later reveals another execution for the released entry (cannot exceed requested here: use a
-        # cycle whose entry was only partially filled).
+        # Entry proven terminal at 6 of 10, cycle closed and released; the venue later reveals one more
+        # execution of that entry (late evidence beyond the settlement window).
         h2 = Harness(BUY_CELL, r=rules(min_base="1", min_notional="0"))
         e2 = h2.entry()
         h2.fill(e2, "6")

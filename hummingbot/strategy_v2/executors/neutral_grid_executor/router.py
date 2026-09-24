@@ -151,8 +151,14 @@ def crosses(side_a: Side, price_a: Decimal, side_b: Side, price_b: Decimal) -> b
 def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence[RouterOrder], *,
                  endpoints: Optional[risk_mod.RiskEndpoints] = None, limits: Optional[risk_mod.RiskLimits] = None,
                  slots: Optional[SlotBudget] = None, mid: Optional[Decimal] = None,
-                 entries_allowed: bool = True, entries_blocker: str = "ENTRIES_BLOCKED") -> RouterPlan:
-    """Deterministic routing plan (see module docstring). ``endpoints`` must exclude the candidates."""
+                 entries_allowed: bool = True, entries_blocker: str = "ENTRIES_BLOCKED",
+                 owed: Tuple[Decimal, Decimal] = (ZERO, ZERO)) -> RouterPlan:
+    """Deterministic routing plan (see module docstring).
+
+    ``endpoints`` are the order-only endpoints (spec formula) and must exclude the candidates. ``owed`` is
+    ``risk.obligation_totals`` (TP obligations without an order, candidates included): entries are admitted
+    against ``endpoints + owed`` so they never consume headroom an exit needs (TP priority).
+    """
     keys = [i.key for i in pending_intents]
     if len(set(keys)) != len(keys):
         raise ValueError("duplicate candidate keys")
@@ -168,7 +174,9 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
     withdraw_requested: Set[str] = set()
     approved: List[RouterIntent] = []
     waiting_tps: List[RouterIntent] = []
+    blocked_tps: List[RouterIntent] = []
     ep = endpoints
+    owed_buy, owed_sell = owed
     budget = SlotBudget(free=slots.free, cell_unused=dict(slots.cell_unused)) if slots is not None else None
     # Slots that will come back when already-requested entry cancels become terminal (avoid cancel spam).
     slot_frees_in_flight = sum(1 for o in owned_orders
@@ -216,8 +224,11 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
                                    for o in live if o.key in cancel_requested or o.key in withdraw_requested]
                 decision = risk_mod.plan_tp_headroom(ep, tp.side, tp.qty, entry_views + in_flight_extra, limits, mid)
                 if decision.risk_blocked:
+                    # Operator required. It does not hold the TP FIFO head (another exit may be what frees the
+                    # headroom); entries still may not cross it. Safety is unaffected: conflicts are always
+                    # checked against live orders.
                     actions.append(RouterAction(ActionKind.BLOCKED, tp.key, decision.reason))
-                    waiting_tps.append(tp)
+                    blocked_tps.append(tp)
                     continue
                 by_key = {o.key: o for o in live}
                 for k in decision.cancel + decision.withdraw:
@@ -249,6 +260,11 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
         approved.append(tp)
         if ep is not None:
             ep = risk_mod.add_to_endpoints(ep, tp.side, tp.qty, LegRole.TP)
+        # The obligation became an order: it is now counted by ``ep``.
+        if tp.side == Side.BUY:
+            owed_buy = max(owed_buy - tp.qty, ZERO)
+        else:
+            owed_sell = max(owed_sell - tp.qty, ZERO)
 
     # ---------------------------------------------------------------- entry candidates
     for entry in entries:
@@ -256,7 +272,8 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
             actions.append(RouterAction(ActionKind.WAIT, entry.key, entries_blocker))
             continue
         conflicts = tuple(o.key for o in live if crosses(entry.side, entry.price, o.side, o.price))
-        conflicts += tuple(c.key for c in approved + waiting_tps if crosses(entry.side, entry.price, c.side, c.price))
+        conflicts += tuple(c.key for c in approved + waiting_tps + blocked_tps
+                           if crosses(entry.side, entry.price, c.side, c.price))
         if conflicts:
             actions.append(RouterAction(ActionKind.WAIT, entry.key, "SELF_TRADE:ENTRY_WAITS", conflicts))
             continue
@@ -264,7 +281,8 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
             actions.append(RouterAction(ActionKind.WAIT, entry.key, "CELL_CANCEL_IN_FLIGHT"))
             continue
         if ep is not None:
-            blocker = risk_mod.check_submit(ep, entry.side, entry.qty, entry.role, limits)
+            blocker = risk_mod.check_submit(risk_mod.with_obligations(ep, owed_buy, owed_sell), entry.side,
+                                            entry.qty, entry.role, limits)
             if blocker is not None:
                 actions.append(RouterAction(ActionKind.WAIT, entry.key, blocker))
                 continue

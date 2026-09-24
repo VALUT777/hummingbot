@@ -168,6 +168,48 @@ class TestCapsAndHeadroom(unittest.TestCase):
         self.assertEqual((), plan.submits)
 
 
+class TestTpPriorityHeadroom(unittest.TestCase):
+    def test_entries_cannot_consume_headroom_owed_to_undispatched_exits(self):
+        # Regression (property sweep seed 193): SELL cell short 10 owes a BUY TP; a BUY entry that fits the
+        # order-only P_max must still wait, otherwise the owed BUY TP would later be RISK_BLOCKED.
+        limits = risk.RiskLimits(D("20"), D("1000"))
+        ep = risk.RiskEndpoints(P=D("0"), P_min=D("0"), P_max=D("10"), gross_worst=D("20"))
+        cand = [entry("e", Side.BUY, "5.1", cell=1)]
+        self.assertEqual(("e",), plan_submits(cand, [], endpoints=ep, limits=limits).submits)
+        plan = plan_submits(cand, [], endpoints=ep, limits=limits, owed=(D("10"), D("0")))
+        self.assertTrue(plan.action_for("e").reason.startswith("NET_CAP_LONG"))
+        # Once the owed exit is routed in the same plan it is an order, still counted exactly once.
+        cands = [tp("t", Side.BUY, "5.9", qty="10", cell=11, seq=1), entry("e", Side.BUY, "5.1", cell=1, seq=2)]
+        plan = plan_submits(cands, [], endpoints=ep, limits=limits, owed=(D("10"), D("0")))
+        self.assertEqual(("t",), plan.submits)
+        self.assertTrue(plan.action_for("e").reason.startswith("NET_CAP_LONG"))
+
+    def test_obligation_totals_from_ledgers(self):
+        cells = grid.assign_cells(grid.build_grid(D("5"), D("6"), 55, rules()), D("5.4"))
+        short, long_ = Harness(cells[40]), Harness(cells[3])
+        for h in (short, long_):
+            e = h.entry()
+            h.fill(e, "10")
+        self.assertEqual((D("10"), D("10")), risk.obligation_totals([short.ledger, long_.ledger]))
+        short.dispatch_tps()
+        self.assertEqual((D("0"), D("10")), risk.obligation_totals([short.ledger, long_.ledger]))
+        ep = risk.endpoints_from_ledgers(D("0"), [short.ledger, long_.ledger])
+        owed = risk.with_obligations(ep, *risk.obligation_totals([short.ledger, long_.ledger]))
+        self.assertEqual((D("-10"), D("10")), (owed.P_min, owed.P_max))
+
+    def test_risk_blocked_tp_does_not_hold_fifo_head_for_other_exits(self):
+        limits = risk.RiskLimits(D("20"), D("1000"))
+        ep = risk.RiskEndpoints(P=D("15"), P_min=D("15"), P_max=D("15"), gross_worst=D("30"))
+        cands = [tp("blocked_buy", Side.BUY, "5.9", qty="10", cell=11, seq=1),
+                 tp("sell_exit", Side.SELL, "5.1", qty="10", cell=1, seq=2),
+                 entry("e", Side.SELL, "5.85", qty="1", cell=10, seq=3)]
+        plan = plan_submits(cands, [], endpoints=ep, limits=limits)
+        self.assertEqual(ActionKind.BLOCKED, plan.action_for("blocked_buy").kind)
+        self.assertEqual(("sell_exit",), plan.submits)                  # the exit that frees headroom goes
+        self.assertEqual("SELF_TRADE:ENTRY_WAITS", plan.action_for("e").reason)
+        self.assertEqual(("blocked_buy",), plan.action_for("e").blocked_by)  # entries never cross a blocked TP
+
+
 class TestTpCapacity(unittest.TestCase):
     def test_ac44_full_cap_tp_cancels_one_cap_consuming_entry_then_waits_without_spam(self):
         owned = [order("e_near", Side.BUY, "5.38", cell=21), order("e_far", Side.SELL, "5.9", cell=49),
