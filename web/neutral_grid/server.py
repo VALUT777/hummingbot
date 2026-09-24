@@ -213,9 +213,17 @@ async def commands_list(request: web.Request) -> web.Response:
     if before is not None and not views.valid_lookup_id(before):
         return json_error(400, "bad_cursor", "Некорректный курсор.")
     limit = _int_param(request, "limit", 50, 1, views.MAX_PAGE)
-    rows = ctx.gateway.list_commands(limit=limit + 1, before=before)
+    rows, truncated = _page(ctx.gateway, "commands_page", "list_commands", before, limit + 1)
     next_cursor = str(rows[limit - 1]["id"]) if len(rows) > limit else None
-    return _json({"commands": rows[:limit], "next_cursor": next_cursor})
+    return _json({"commands": rows[:limit], "next_cursor": next_cursor, "truncated": truncated})
+
+
+def _page(gateway: Any, paged: str, plain: str, before: Optional[str], limit: int):
+    """Use the gateway's truncation-aware page when it has one (StoreGateway), else the plain listing."""
+    method = getattr(gateway, paged, None)
+    if callable(method):
+        return method(before=before, limit=limit)
+    return getattr(gateway, plain)(limit=limit, before=before), False
 
 
 async def command_get(request: web.Request) -> web.Response:
@@ -235,11 +243,15 @@ async def lookup(request: web.Request) -> web.Response:
     if not views.valid_lookup_id(wanted):
         return json_error(400, "bad_id", "ID: 1–96 символов [0-9A-Za-z_:.-]; сравнивается как строка.")
     snapshot = _snapshot(ctx)
+    lookup_fn = getattr(ctx.gateway, "lookup", None)
+    found = lookup_fn(wanted) if callable(lookup_fn) else {
+        "orders": ctx.gateway.find_orders(wanted), "trades": ctx.gateway.find_trades(wanted), "truncated": False}
     return _json({
         "id": wanted,
         "snapshot_matches": views.lookup_in_snapshot(snapshot, wanted),
-        "orders": ctx.gateway.find_orders(wanted),
-        "trades": ctx.gateway.find_trades(wanted),
+        "orders": found["orders"],
+        "trades": found["trades"],
+        "truncated": bool(found.get("truncated")),
     })
 
 
@@ -249,9 +261,9 @@ async def audit(request: web.Request) -> web.Response:
     if before is not None and not views.valid_lookup_id(before):
         return json_error(400, "bad_cursor", "Некорректный курсор.")
     limit = _int_param(request, "limit", 50, 1, views.MAX_PAGE)
-    rows = ctx.gateway.audit_events(limit=limit + 1, before=before)
+    rows, truncated = _page(ctx.gateway, "audit_page", "audit_events", before, limit + 1)
     next_cursor = str(rows[limit - 1]["id"]) if len(rows) > limit else None
-    return _json({"events": rows[:limit], "next_cursor": next_cursor})
+    return _json({"events": rows[:limit], "next_cursor": next_cursor, "truncated": truncated})
 
 
 # ---------------------------------------------------------------------------- write side

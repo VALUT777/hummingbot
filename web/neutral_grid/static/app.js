@@ -931,6 +931,8 @@
       var d = r.data;
       var total = d.snapshot_matches.length + d.orders.length + d.trades.length;
       out.appendChild(el("p", { text: "ID " + d.id + ": найдено " + total + " (сравнение строк, без преобразования в число)." }));
+      if (d.truncated) out.appendChild(el("p", { cls: "form-error", text: "Внимание: поиск ордеров охватил не все записи " +
+        "журнала (ограниченное окно). «Не найдено» здесь не доказывает отсутствие." }));
       d.snapshot_matches.forEach(function (m) {
         var title = m.source === "snapshot_leg" ? "Нога " + m.role + " ячейки " + m.cell_id + " (поколение " + txt(m.generation) + ")" : "Несопоставленные данные";
         out.appendChild(el("article", { cls: "card" }, [el("h3", { text: title }), objectDl(m.leg || m.evidence)]));
@@ -960,6 +962,8 @@
     });
     S.commandsCursor = r.data.next_cursor;
     $("journal-commands-more").hidden = !r.data.next_cursor;
+    if (r.data.truncated) body.appendChild(el("tr", {}, [el("td", { colspan: "7", cls: "form-error",
+      text: "Дальше история команд не прочитана (ограниченное окно) — это не конец журнала." })]));
   }
   async function loadAudit(reset) {
     if (reset) { S.auditCursor = null; clear($("journal-audit").tBodies[0]); }
@@ -977,6 +981,8 @@
     });
     S.auditCursor = r.data.next_cursor;
     $("journal-audit-more").hidden = !r.data.next_cursor;
+    if (r.data.truncated) body.appendChild(el("tr", {}, [el("td", { colspan: "4", cls: "form-error",
+      text: "Дальше аудит не прочитан (ограниченное окно) — это не конец журнала." })]));
   }
   function wireJournal() {
     $("journal-commands-more").addEventListener("click", function () { loadCommands(false); });
