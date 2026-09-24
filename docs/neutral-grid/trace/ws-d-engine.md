@@ -319,6 +319,53 @@ Deviation, recorded: C5's "expire trade-id labels after a covering walk" is appl
 tied to one of our live orders; expiring our own live order's label would hide genuine history lag (AC-13), which
 the merged web demo test (`test_ngweb_demo_engine.py::test_demo_engine_full_operator_flow`) asserts.
 
+## Round 4 (last engine round, integration `5f266ca83`)
+
+Merged first: `codex/neutral-grid-implementation` @ `5f266ca83` (fast-forward; tree identical to `624d7e643`).
+Red evidence: the round-4 tests (committed at `eea457d5a`, fix at `d0eef1804`) fail on `5f266ca83` for the reported reasons (scratch worktree of that tip with the
+new test files: **23 failed**; the two intended passes are the unattributable-conflict guard and the D2-18 pin);
+test-gap items are proven by mutation in a scratch copy of the fixed tree (`mutate4.py`, one guard removed per run).
+
+| Item | Fix | Test(s) |
+|---|---|---|
+| H1 (D2-15 + critic) | `resolve_unknown_submit`: refused while ANY pending WS label maps to the CID (trade-id labels via `_ws_label_cid`, not only a CID label); evidence must be taken after `unknown_resolution_delay_s` (EngineOptions / executor / controller config, default 120 s, never below `settlement_delay_s`): an active list read after dispatch + delay and `settlement_scans` complete walks started after it. A REJECTED_ZERO_FILL leg (venue reject or audited "never landed") is final but never "settled" for WS signals: a later trade signal for it is recorded and stays pending (lag visible, rebase refused) until history commits it (then the store's LATE_FILL path applies) | `E test_ng_engine_review4.py::test_h1_ws_trade_signal_of_the_cid_blocks_a_not_landed_resolution` (red: APPLIED at +12 s, second TP); `::test_h1_active_list_lag_beyond_settlement_never_yields_a_second_tp[15/30]` (red: APPLIED at +16 s); `::test_h1_not_landed_submit_is_resolvable_only_after_the_unknown_resolution_delay` (liveness); `::test_h1_a_ws_fill_of_an_audit_resolved_order_stays_visible_as_lag` |
+| H2 (CR-4 variant) | Executor: once Hummingbot asked to stop, the launcher START intent is dropped and never (re)sent (`early_stop` clears it; `_track_start` returns). Engine: every APPLIED STOP records `last_stop_applied_ms`; a launcher resume must name the LATEST applied STOP (a STOP while STOPPING keeps `stop_requested_ms` but supersedes a resume phrase typed before it) → `DURABLE_STOP_ACTIVE` with `latest_stop_ms`. `durable_stop_ms()` (launcher phrase) returns that latest stop | `CTL::test_h2_hummingbot_stop_at_launch_is_never_undone_by_a_resent_resume_start` (exact 3-tick race; red: stop cleared); `E test_ng_engine_review4.py::test_h2_launcher_resume_naming_a_stop_that_a_later_stop_reaffirmed_is_refused` |
+| M1 (conflict binding, CR-3) | Snapshot `summary.history_conflicts` = list of `{stream, key, cell_id, versions: [{fingerprint, summary (strings), committed}]}` and `summary.conflict_set_id` (32-hex digest of streams/keys/fingerprints). Entries: durable payload contradictions (M2), open store conflicts (`stream="store_conflict"`, key = conflict id), the manual-reconcile reason, a LEDGER_INVARIANT freeze, refused active-row evidence. `ack_history_conflict` must carry `conflict_set_id` (`CONFLICT_SET_ID_REQUIRED` / `CONFLICT_SET_CHANGED` otherwise) and may carry `accepted: {key: fingerprint}`; it audits only that set: a committed key accepts the committed version (a different choice → `ACCEPTED_INVALID` `LEDGER_CORRECTION_NOT_SUPPORTED`, R6), a never-committed key needs a choice (`ACCEPTED_CHOICE_REQUIRED`; the scanner then commits the chosen version as ordinary evidence), noise = every other version seen by any walk, merged with earlier noise of the same accepted payload. An empty set → `NOTHING_TO_AUDIT` | `E test_ng_engine_review4.py::test_m1_snapshot_publishes_the_history_conflict_set`, `::test_m1_ack_is_bound_to_the_reviewed_conflict_set` (probe P1), `::test_m1_ack_with_nothing_to_audit_is_refused`, `::test_m1_never_committed_duplicate_needs_an_accepted_choice_then_history_completes` (CR-3a), `::test_m1_flapping_key_converges_after_one_ack` (CR-3b) |
+| M2 (CR-2 transient) | Every finished walk records its unaudited payload contradictions (a key served with a payload other than the committed one, or with several payloads) with all versions in `engine_meta.history_conflicts` (own transaction, survives reload/restart) until `ack_history_conflict`. Each recorded key blocks its cell's TPs (own CID / exchange id; unattributable → global TP/entry block) and keeps the engine FROZEN | `E test_ng_engine_review4.py::test_m2_transient_contradiction_keeps_the_cell_blocked_until_acknowledged` (red: TP 5 from the unaudited quantity; also across a restart) |
+| M3 (D1-02 restart) | `startup_scoped`: a finished walk whose only problems are row contradictions attributed to own cells (`duplicate_key_payload_mismatch`, `committed_payload_mismatch`, `trades_exceed_order_cumulative`, `inactive_order_not_terminal`), or a store-refused history batch whose rows are all attributed (`history_refused_cells`), lifts RECONCILING from the TP blockers only: exits of unaffected cells and risk-reducing cancels run; RECONCILING stays an entry blocker; affected cells stay TP-blocked. Boundary/retention/schema problems or an unattributable row keep the global block | `E test_ng_engine_review4.py::test_m3_restart_with_a_cell_attributed_conflict_keeps_other_cells_exits_and_cancels`, `::test_m3_restart_with_a_recurring_history_refusal_keeps_unaffected_exits_and_cancels` (red: tp_blockers ['RECONCILING'], 0 cancels), `::test_m3_scoped_startup_keeps_risk_reducing_cancels_under_another_tp_blocker` (MARKET_NOT_TRADABLE also blocks TPs; red: 0 cancels); guard `::test_m3_unattributable_conflict_after_restart_keeps_the_global_block` |
+| M4 (D2-18 + D2-07) | Baseline audit also refused while active rows are unknown or older than the position read, and while ANY history row (own fill, unmatched manual trade, order row) was committed after the position read (`history_rows_commit_seq`) | `E test_ng_engine_review4.py::test_m4_audit_never_rebases_while_active_orders_are_unknown[1000/3]` (red: APPLIED with 11), `::test_m4_audit_refused_when_a_manual_trade_was_committed_after_the_position_read` (red: APPLIED with the stale 7), `::test_m4_audit_rebases_only_after_history_delivers_the_fill_the_active_row_shows` (D2-18 pin, loops past the settlement window; applies with 7) |
+| L1 (E-09) | Before bootstrap a START whose config fingerprint differs from the acknowledged one re-binds it (APPLIED `rebound: true`, audit `rebound_from`); after bootstrap it stays `already_started`. Executor: `START_CONFIG_CHANGED` on the baseline re-sends the launcher START (operator confirmed this config at launch) and retries the baseline instead of latching | `E test_ng_engine_review4.py::test_l1_start_before_bootstrap_rebinds_a_changed_config[operator/launcher]`; `CTL::test_l1_start_config_changed_makes_the_launcher_rebind_and_retry_the_baseline` |
+
+Mutation proofs (scratch copy of the fixed tree, one guard removed per run; 16/16 killed):
+
+| Mutation (one guard removed) | Killed by |
+|---|---|
+| WS gate checks only a CID label (`str(cid) in ws_pending`) | `test_h1_ws_trade_signal_of_the_cid_blocks_a_not_landed_resolution` |
+| unknown-resolution delay = settlement delay | `test_h1_active_list_lag_beyond_settlement_never_yields_a_second_tp[15/30]`, `test_h1_not_landed_submit_is_resolvable_only_after_the_unknown_resolution_delay` |
+| REJECTED_ZERO_FILL counted as settled for WS labels | `test_h1_a_ws_fill_of_an_audit_resolved_order_stays_visible_as_lag` |
+| engine: resume may name `stop_requested_ms` (not the latest applied STOP) | `test_h2_launcher_resume_naming_a_stop_that_a_later_stop_reaffirmed_is_refused` |
+| executor: START (re)sent after the Hummingbot stop | `CTL::test_h2_hummingbot_stop_at_launch_is_never_undone_by_a_resent_resume_start` |
+| ack not bound to `conflict_set_id` | `test_m1_ack_is_bound_to_the_reviewed_conflict_set` |
+| contradiction record keeps only the latest walk's versions | `test_m1_flapping_key_converges_after_one_ack` |
+| APPLIED with an empty set | `test_m1_ack_with_nothing_to_audit_is_refused` |
+| durable record does not block its cells | `test_m2_transient_contradiction_keeps_the_cell_blocked_until_acknowledged` |
+| scoped startup never lifts RECONCILING from the TP blockers | both `test_m3_restart_*` tests |
+| risk-reducing cancels (TP-blocked branch) need a full reconciliation | `test_m3_scoped_startup_keeps_risk_reducing_cancels_under_another_tp_blocker` |
+| only the "active ahead" audit check removed | `test_m4_audit_rebases_only_after_history_delivers_the_fill_the_active_row_shows` |
+| only the active-list freshness audit check removed | `test_m4_audit_never_rebases_while_active_orders_are_unknown[1000/3]` |
+| only the history-row ordering audit check removed | `test_m4_audit_refused_when_a_manual_trade_was_committed_after_the_position_read` |
+| engine: no pre-bootstrap rebind | `test_l1_start_before_bootstrap_rebinds_a_changed_config[operator/launcher]` |
+| executor: START_CONFIG_CHANGED latches | `CTL::test_l1_start_config_changed_makes_the_launcher_rebind_and_retry_the_baseline` |
+
+Contract for WS-E (M1): render `summary.history_conflicts` (all version summaries are strings; `committed` marks
+the ledger's version) and send `ack_history_conflict` with the viewed `summary.conflict_set_id` and, for keys whose
+versions are all `committed: false`, `accepted: {<key>: <fingerprint>}`. The web normalisation currently drops both
+fields, so a web ack is refused with `CONFLICT_SET_ID_REQUIRED` until WS-E passes them through (R7).
+
+Semantics changed by this round (older tests updated): `resolve_unknown_submit` waits `unknown_resolution_delay_s`
+(`test_ng_engine_crash.py::test_ac16_crash_after_dispatch_commit_is_unknown_not_proven_absent` retries until then); `ack_history_conflict`
+carries the reviewed `conflict_set_id` (`review1::test_r16_ledger_invariant_freeze_survives_reload_and_restart_until_acknowledged`, `review3::test_c3_audited_payload_conflict_restores_completeness_and_stop_finishes_honestly`).
+
 ## Requests to other workstreams / integrator
 
 * **R1 (integrator, blocking for a clean V2 restart).** Register the executor natively:
@@ -339,6 +386,9 @@ the merged web demo test (`test_ngweb_demo_engine.py::test_demo_engine_full_oper
   START already resumes; the launcher needs the `RESUME <grid_id> AFTER STOP <stop_ms>` phrase).
 * **R6 (WS-B, optional).** An audited store API to replace a committed payload/quantity (`LedgerCorrection` from
   the scanner) in one transaction; until then the engine audits accept only the committed version.
+* **R7 (WS-E, needed for web acks).** Pass `conflict_set_id` (required) and `accepted` (optional
+  `{key: fingerprint}`) of `ack_history_conflict` through the web normalisation and render
+  `summary.history_conflicts` (round 4, M1). Without them the engine refuses the ack (`CONFLICT_SET_ID_REQUIRED`).
 * **R4 (WS-C, optional).** `LighterExchangePort` does not forward `register/release_history_reconciled_order`; the
   executor calls the connector directly (the fake exchange implements the same names).
 
@@ -349,7 +399,12 @@ the merged web demo test (`test_ngweb_demo_engine.py::test_demo_engine_full_oper
   uses. The budget makes history go stale (entries blocked) rather than overspend; live tuning of
   `poll_interval_s`/`history_freshness_s` is needed before production.
 * SUBMIT_UNKNOWN whose request never landed stays unresolved until an operator audits it (by design: no venue
-  idempotence is documented); STOP then ends as STOP_UNCERTAIN.
+  idempotence is documented); STOP then ends as STOP_UNCERTAIN. The audit ("never landed") is accepted only
+  `unknown_resolution_delay_s` (default 120 s) after the dispatch, with no pending WS execution signal for the CID.
+  Absence is never provable: a venue whose active list lags longer than that delay AND whose history shows neither
+  a fill nor a terminal row for the order would let an operator audit a live order as "never landed" (a second TP
+  may follow). This is an operator-audit residual risk (check the venue UI/export before acking); a later
+  execution of that order is visible as lag and ends as LATE_FILL evidence (audited path).
 * TP–TP FIFO across the anchor line can delay exits in fast two-sided moves (A handoff #8); visible as
   `WAIT_TP_FIFO` with queue age.
 * The CLI confirmation is a config phrase, not an interactive prompt (no WS-D-owned launcher binary); the web
@@ -384,17 +439,18 @@ the merged web demo test (`test_ngweb_demo_engine.py::test_demo_engine_full_oper
   engine then fails closed, but Hummingbot's generic cancel paths could touch orders of a previous run until the
   connector restores its own tracking marker (logged as an error).
 
-## Commands run (code at `99cb39468`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
+## Commands run (code at `d0eef1804`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
 
 | Gate | Command | Result |
 |---|---|---|
-| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 264 passed |
+| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 289 passed |
 | Heavy property sweep | `NG_PROPERTY_SEEDS=60 NG_PROPERTY_STEPS=120 $PY -m pytest .../engine/test_ng_engine_properties.py -q` | 61 passed |
 | Lighter connector | `$PY -m pytest test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_derivative.py -q` | 85 passed, 8 subtests passed |
 | Committed neutral/risk | `$PY -m pytest test/scripts/test_lighter_robinhood_neutral_grid.py test/scripts/test_lighter_robinhood_grid_risk.py -q` | 73 passed |
-| Controller/executor regressions | `$PY -m pytest test/hummingbot/strategy_v2/executors/grid_executor test/controllers/generic test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py test/hummingbot/strategy_v2/executors/test_executor_base.py -q` | 147 passed |
+| Controller/executor regressions | `$PY -m pytest test/hummingbot/strategy_v2/executors/grid_executor test/controllers/generic test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py test/hummingbot/strategy_v2/executors/test_executor_base.py -q` | 150 passed |
 | Merged WS-A/B/C suites | `$PY -m pytest test/.../neutral_grid_executor/core test/.../neutral_grid_executor/store test/.../neutral_grid_executor/history test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_history_pagination.py -q` | 369 passed, 277 subtests passed |
 | Web suite (WS-E, merged) | `$PY -m pytest test/web/neutral_grid -q` (incl. browser tests) | 138 passed |
+| Round 4 red/green | `$PY -m pytest .../engine/test_ng_engine_review4.py` + the new `CTL` tests at the `5f266ca83` code (tests of `eea457d5a`) / at `d0eef1804` | 23 failed (+2 intended passes) / all passed; mutations 16/16 killed (`mutate4.py`) |
 | Round 3 red/green | `$PY -m pytest .../engine/test_ng_engine_review3.py test/controllers/generic/test_neutral_grid.py -q` at the `2fbb338e7` code / at `f654952ae` | 19 failed, 32 passed / 51 passed (+3 web-contract tests: red at `f48ed9490`, green at `99cb39468`) |
 | Review package 2 red/green | `$PY -m pytest .../engine/test_ng_engine_review2.py test/controllers/generic/test_neutral_grid.py -q` at the `969003ef4` code / at `f96d33c58` | 15 failed, 29 passed / 44 passed |
 | Review package 1 red/green | `$PY -m pytest .../engine/test_ng_engine_review1.py -q` at the `16b837428` engine / at `93c80b299` | 26 failed, 2 passed / 28 passed |
