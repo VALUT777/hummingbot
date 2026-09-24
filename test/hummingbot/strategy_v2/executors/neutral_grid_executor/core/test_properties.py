@@ -50,9 +50,11 @@ def make_sim(rng: random.Random) -> CoreSim:
 
 
 class Checker:
-    def __init__(self, tc: unittest.TestCase, sim: CoreSim):
+    def __init__(self, tc: unittest.TestCase, sim: CoreSim, strict_risk: bool = True):
         self.tc = tc
         self.sim = sim
+        self.strict_risk = strict_risk   # False only after injected late evidence (outside any reachable-set proof)
+        self.reopened = set()            # (cell, generation) released cycles re-opened by injected late evidence
         self.filled = {}
         self.cycle_eq = {}
         self.cycles_count = {}
@@ -64,7 +66,7 @@ class Checker:
         self.window = (ep.P_min, ep.P_max)
         owed = self.sim.endpoints_with_obligations()
         self.owed_window = (owed.P_min, owed.P_max)
-        if self.sim.last_router is not None:
+        if self.strict_risk and self.sim.last_router is not None:
             self.tc.assertFalse(self.sim.last_router.risk_blocked, self.sim.last_router.actions)
         self.check()
 
@@ -75,6 +77,12 @@ class Checker:
         tc.assertEqual(pos, ep.P)
         tc.assertLessEqual(ep.P_min, pos)
         tc.assertLessEqual(pos, ep.P_max)
+        if self.strict_risk:
+            self.check_risk(ep, pos)
+        self.check_ledgers()
+
+    def check_risk(self, ep, pos):
+        sim, tc = self.sim, self.tc
         if self.window is not None:
             lo, hi = self.window
             tc.assertLessEqual(lo, ep.P_min)                  # never widens between routing decisions
@@ -90,6 +98,9 @@ class Checker:
         tc.assertLessEqual(ep.P_max, sim.limits.max_abs_net_position)
         tc.assertGreaterEqual(ep.P_min, -sim.limits.max_abs_net_position)
         tc.assertLessEqual(ep.gross_worst, sim.limits.max_gross_position)
+
+    def check_ledgers(self):
+        sim, tc = self.sim, self.tc
         tc.assertLessEqual(len(sim.non_final()), sim.cap)
         if sim.last_admission is not None:
             tc.assertFalse(sim.last_admission.slots.oversubscribed)
@@ -108,7 +119,7 @@ class Checker:
                 tc.assertEqual(e - x, b.live_tp_remainder + b.reserved_tp_unassigned + b.unassigned + b.dust)
                 for part in (b.live_tp_remainder, b.reserved_tp_unassigned, b.unassigned, b.dust):
                     tc.assertGreaterEqual(part, 0)
-                if cycle.closed:
+                if cycle.closed and key not in self.reopened:
                     tc.assertEqual(e, x)
                     tc.assertTrue(all(leg.is_final for leg in cycle.legs))
                     tc.assertEqual(0, cycle.dust)
@@ -223,7 +234,56 @@ def drain(sim: CoreSim, checker: Checker, tc: unittest.TestCase):
                         for ledger in sim.ledgers.values()), Decimal(0)))
 
 
+def run_random(tc: unittest.TestCase, rng: random.Random, steps: int):
+    sim = make_sim(rng)
+    checker = Checker(tc, sim)
+    sim.tick()
+    checker.after_tick()
+    for _ in range(steps):
+        for _ in range(rng.randint(1, 4)):
+            random_event(rng, sim, checker, tc)
+        sim.tick()
+        checker.after_tick()
+    return sim, checker
+
+
 class TestCoreProperties(unittest.TestCase):
+    def test_late_evidence_is_resolved_by_ordinary_tps_and_never_latches(self):
+        """AC-42 (ledger part): late executions of already-final entries (incl. released cycles) are applied to
+        their own cycle, flagged for audit, and after the audit closed by ordinary TP legs; no cell stays locked."""
+        injected = 0
+        for seed in range(max(SEEDS // 2, 1)):
+            with self.subTest(seed=seed):
+                rng = random.Random(10_000 + seed)
+                sim, checker = run_random(self, rng, STEPS // 2)
+                finals = [leg for leg in sim.legs() if leg.identity.role == LegRole.ENTRY
+                          and leg.state == OrderState.TERMINAL and leg.remaining > 0]
+                rng.shuffle(finals)
+                late_checker = Checker(self, sim, strict_risk=False)
+                for leg in finals[:3]:
+                    ledger = sim.ledgers[leg.identity.cell_id]
+                    self.assertEqual(FillOutcome.LATE_EVIDENCE, sim.fill(leg, D(rng.randint(1, int(leg.remaining)))))
+                    self.assertIn("LATE_EVIDENCE_AUDIT", ledger.can_release(True).reasons)
+                    late_checker.reopened.add((leg.identity.cell_id, leg.identity.generation))
+                    injected += 1
+                for ledger in sim.ledgers.values():
+                    for cycle in ledger.cycles:
+                        if cycle.late_evidence:
+                            ledger.acknowledge_late_evidence(cycle.generation)
+                late_checker.check()                            # invariants clean again after the audit
+                drain(sim, late_checker, self)
+                for ledger in sim.ledgers.values():
+                    self.assertFalse(any(c.late_evidence for c in ledger.cycles))
+                    for cycle in ledger.cycles:                 # re-opened cycles are closed out again (or DUST)
+                        self.assertEqual(cycle.E - cycle.X, cycle.buckets().dust)
+                        self.assertTrue(all(leg.is_final for leg in cycle.legs))
+                    if ledger.buckets().dust == 0:
+                        if ledger.current is not None:
+                            self.assertTrue(ledger.can_release(True).ok, ledger.can_release(True).reasons)
+                            ledger.release(True)
+                        ledger.next_entry_identity()           # the cell can start a new cycle again
+        self.assertGreater(injected, 0)
+
     def test_random_orderings_preserve_invariants(self):
         for seed in range(SEEDS):
             with self.subTest(seed=seed):

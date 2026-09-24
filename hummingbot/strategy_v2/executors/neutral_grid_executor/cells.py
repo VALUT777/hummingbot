@@ -583,7 +583,10 @@ class CellLedger:
             return FillOutcome.CONFLICT_SIDE
         if leg.filled + qty > leg.requested:
             return FillOutcome.CONFLICT_OVERFILL
-        late = leg.is_final or cycle.closed
+        # Late evidence == an execution for a leg already proven final. A released cycle only ever holds final
+        # legs, so a non-final leg in a closed cycle is a resolution TP created after the late evidence: its
+        # fills are ordinary and must not re-latch the audit flag.
+        late = leg.is_final
         self.fills[key] = record
         leg.filled += qty
         if late:
@@ -618,21 +621,41 @@ class CellLedger:
         leg.terminal_cumulative = cumulative_filled
         return TerminalOutcome.TERMINAL
 
-    def acknowledge_late_evidence(self, generation: int) -> None:
-        """Operator audit acknowledged late evidence for ``generation`` (the obligation itself stays)."""
+    def acknowledge_late_evidence(self, generation: int) -> List[LegIdentity]:
+        """Operator audit acknowledged late evidence for ``generation``; returns the corrected legs.
+
+        The audited executions become the leg's proven cumulative (a "rejected" leg that did execute becomes
+        TERMINAL with that cumulative). The resulting obligation stays and is closed by ordinary TP legs;
+        the engine must record the audit event durably together with this transition.
+        """
         for c in self.cycles:
-            if c.generation == generation:
-                c.late_evidence = False
-                for leg in c.legs:
-                    leg.late_evidence = False
-                return
+            if c.generation != generation:
+                continue
+            corrected = []
+            for leg in c.legs:
+                if leg.late_evidence:
+                    if leg.state in REJECTED_STATES or leg.state == OrderState.TERMINAL:
+                        leg.state = OrderState.TERMINAL
+                        leg.terminal_cumulative = leg.filled
+                    corrected.append(leg.identity)
+                leg.late_evidence = False
+            c.late_evidence = False
+            return corrected
         raise LedgerError(f"no cycle {generation}")
 
     # ------------------------------------------------------------------ release (NG-CELL-001)
     def can_release(self, position_reconciled: bool) -> ReleaseCheck:
         cur = self.current
         if cur is None:
-            return ReleaseCheck(False, ("NO_OPEN_CYCLE",))
+            # Nothing to release, but still report what keeps the cell from a new cycle (operator visibility).
+            reasons = ["NO_OPEN_CYCLE"]
+            if any(c.dust > 0 or c.buckets().dust > 0 for c in self.open_cycles()):
+                reasons.append("DUST")
+            if any(c.late_evidence for c in self.cycles):
+                reasons.append("LATE_EVIDENCE_AUDIT")
+            if any(c.has_open_obligation_or_orders() for c in self.cycles):
+                reasons.append("OLD_CYCLE_OBLIGATION")
+            return ReleaseCheck(False, tuple(reasons))
         reasons: List[str] = []
         if not cur.entry_final:
             reasons.append("ENTRY_NOT_TERMINAL")
@@ -643,7 +666,7 @@ class CellLedger:
             reasons.append(f"OBLIGATION_OPEN:E={cur.E},X={cur.X}")
         if any(not leg.is_final for leg in cur.legs):
             reasons.append("ORDERS_NOT_TERMINAL")
-        if cur.dust > 0 or cur.buckets().dust > 0:
+        if any(c.dust > 0 or c.buckets().dust > 0 for c in self.open_cycles()):
             reasons.append("DUST")
         if cur.late_evidence or any(c.late_evidence for c in self.cycles):
             reasons.append("LATE_EVIDENCE_AUDIT")

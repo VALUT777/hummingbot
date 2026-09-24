@@ -1,4 +1,4 @@
-"""NG-CELL-001..004, NG-GRID-003 quantities; AC-01/02 (core part), AC-05, AC-06, AC-07, AC-08, AC-23, AC-33."""
+"""NG-CELL-001..004, NG-GRID-003 quantities; AC-01/02 (core part), AC-05..08, AC-23, AC-33, AC-42 (ledger)."""
 import json
 import unittest
 
@@ -218,6 +218,69 @@ class TestTerminalPartialEntryAndLateFills(unittest.TestCase):
         with self.assertRaises(LedgerError):
             h2.ledger.next_entry_identity()                            # no reuse while old cycle carries obligation
         self.assertTrue(any("terminal cumulative" in v for v in h2.ledger.check_invariants()))
+
+
+class TestLateEvidenceResolution(unittest.TestCase):
+    """AC-08/AC-42 resolution: late evidence -> audit -> ordinary TP closes it -> the cell keeps cycling."""
+
+    def test_resolution_tp_fills_do_not_relatch_and_later_cycles_release(self):
+        h = Harness(BUY_CELL, r=rules(min_base="1", min_notional="0"))
+        e0 = h.entry()
+        h.fill(e0, "4")
+        h.ledger.set_state(e0, OrderState.CANCEL_PENDING)
+        h.ledger.set_state(e0, OrderState.TERMINAL_UNKNOWN)
+        h.ledger.confirm_terminal(e0, D("4"))
+        _, (tp0,) = h.dispatch_tps()
+        h.fill(tp0, "4")
+        h.ledger.confirm_terminal(tp0, D("4"))
+        h.ledger.release(True)
+        e1 = h.entry()                                              # healthy, independent cycle 1
+        h.fill(e1, "6")
+        _, (tp1,) = h.dispatch_tps()
+        # Late execution of the cycle-0 entry surfaces after reuse.
+        outcome, _ = h.fill(e0, "1")
+        self.assertEqual(FillOutcome.LATE_EVIDENCE, outcome)
+        self.assertTrue(h.ledger.check_invariants())                # proven cumulative contradicted -> visible
+        self.assertIn("LATE_EVIDENCE_AUDIT", h.ledger.can_release(True).reasons)
+        # Operator audit: the executed quantity becomes the proven cumulative; the obligation stays.
+        self.assertEqual([e0], h.ledger.acknowledge_late_evidence(0))
+        self.assertEqual([], h.ledger.check_invariants())
+        self.assertEqual(D("5"), h.leg(e0).terminal_cumulative)
+        plan, legs = h.dispatch_tps()
+        self.assertEqual(((0, D("1")),), tuple((i.generation, i.qty) for i in plan.items))
+        (resolution,) = legs
+        self.assertEqual(FillOutcome.APPLIED, h.fill(resolution, "1")[0])   # ordinary fill, no re-latch
+        h.ledger.confirm_terminal(resolution, D("1"))
+        self.assertFalse(any(c.late_evidence for c in h.ledger.cycles))
+        self.assertEqual((D("5"), D("5")), (h.ledger.cycles[0].E, h.ledger.cycles[0].X))
+        # Cycle 1 completes and releases; cycle 2 starts with full Q on the fixed side.
+        h.fill(e1, "4")
+        h.ledger.confirm_terminal(e1, D("10"))
+        _, (tp1b,) = h.dispatch_tps()
+        for leg, q in ((tp1, "6"), (tp1b, "4")):
+            h.fill(leg, q)
+            h.ledger.confirm_terminal(leg, D(q))
+        self.assertTrue(h.ledger.can_release(True).ok)
+        h.ledger.release(True)
+        e2 = h.entry()
+        self.assertEqual((2, Side.BUY, D("10")), (e2.generation, h.leg(e2).side, h.leg(e2).requested))
+
+    def test_audited_execution_of_a_rejected_leg_becomes_terminal(self):
+        h = Harness(BUY_CELL, r=rules(min_base="1", min_notional="0"))
+        e = h.entry(accept=False)
+        h.ledger.record_transport(e, TransportResult(TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL))
+        self.assertEqual(FillOutcome.LATE_EVIDENCE, h.fill(e, "2")[0])   # venue contract broken -> audit
+        self.assertTrue(any("rejected leg has fills" in v for v in h.ledger.check_invariants()))
+        with self.assertRaises(LedgerError):
+            h.ledger.next_entry_identity()
+        h.ledger.acknowledge_late_evidence(0)
+        self.assertEqual((OrderState.TERMINAL, D("2")), (h.leg(e).state, h.leg(e).terminal_cumulative))
+        self.assertEqual([], h.ledger.check_invariants())
+        plan, (tp,) = h.dispatch_tps()
+        self.assertEqual((D("2"),), plan.quantities)
+        h.fill(tp, "2")
+        h.ledger.confirm_terminal(tp, D("2"))
+        self.assertTrue(h.ledger.can_release(True).ok)
 
 
 class TestIdempotencyAndConflicts(unittest.TestCase):
