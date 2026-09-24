@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import tempfile
 import time
@@ -129,6 +130,43 @@ def snapshot_market(gateway: StoreGateway) -> Callable[[], Awaitable[MarketConte
     return source
 
 
+def health_file_provider(db_path: Path) -> Callable[[], Dict[str, Any]]:
+    """Engine sidecar ``<db_path>.health.json`` (atomic write+fsync+replace by the engine).
+
+    It carries the persistence/fatal error the engine cannot commit into a snapshot while its store is
+    failing. Absent or unreadable -> ``known=False``; the caller decides how to present that.
+    """
+    path = Path(str(db_path) + ".health.json")
+
+    def read() -> Dict[str, Any]:
+        base: Dict[str, Any] = {"source": "health_file", "path": path.name}
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return dict(base, known=False, detail="нет файла здоровья движка")
+        except OSError:
+            return dict(base, known=False, detail="файл здоровья движка недоступен")
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            at = data.get("at")
+            revision = data.get("engine_revision")
+            return dict(base, known=True,
+                        persistence_error=_text_or_none(data.get("persistence_error")),
+                        fatal_reason=_text_or_none(data.get("fatal_reason")),
+                        at=float(at) if at not in (None, "") else None,
+                        engine_revision=revision if isinstance(revision, int) and not isinstance(revision, bool)
+                        else None)
+        except (ValueError, TypeError):
+            return dict(base, known=False, detail="файл здоровья движка повреждён")
+    return read
+
+
+def _text_or_none(value: Any) -> Optional[str]:
+    return None if value in (None, "") else str(value)
+
+
 def _security_policy(args: Any) -> SecurityPolicy:
     return SecurityPolicy(extra_hostnames=frozenset(getattr(args, "allowed_host", None) or []))
 
@@ -142,7 +180,8 @@ async def build_attach(args: Any) -> Bundle:
     context = WebContext(
         gateway=gateway, preview=preview, keystore=KeystoreService(demo=False),
         engine_identity=engine_identity_view(config), mode="attach", bind_host=args.host,
-        stale_after_s=args.stale_after, policy=_security_policy(args))
+        stale_after_s=args.stale_after, policy=_security_policy(args),
+        health_provider=health_file_provider(Path(args.attach_db)))
 
     async def close_gateway() -> None:
         gateway.close()
@@ -282,7 +321,7 @@ async def build_demo(args: Any) -> Bundle:
     context = WebContext(
         gateway=gateway, preview=PreviewService(config, market, mode="demo"), keystore=KeystoreService(demo=True),
         engine_identity=dict(engine_identity_view(config), db_path=str(db_path)), mode="demo",
-        bind_host=args.host, stale_after_s=args.stale_after, host_status=host.status,
+        bind_host=args.host, stale_after_s=args.stale_after, host_status=host.status, health_provider=host.health,
         demo=DemoControls(actions=dict(DEMO_ACTIONS), run=driver.run), policy=_security_policy(args))
 
     async def close_all() -> None:

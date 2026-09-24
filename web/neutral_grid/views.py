@@ -245,3 +245,27 @@ def is_engine_active(snapshot: Optional[Dict[str, Any]]) -> bool:
     if not snapshot or str(snapshot.get("engine_state")) not in ACTIVE_ENGINE_STATES:
         return False
     return engine_started(snapshot) is not False
+
+
+def health_view(health: Optional[Dict[str, Any]], fresh: Dict[str, Any], now: float) -> Dict[str, Any]:
+    """Uncommitted engine health next to the committed snapshot (NG-DB-004 / AC-55).
+
+    Shown as «не зафиксировано»: it is not part of the versioned snapshot, only a best-effort side channel
+    so a persistence failure (which prevents snapshot commits) is still visible.
+    """
+    health = dict(health or {})
+    known = bool(health.get("known"))
+    errors = [health.get("persistence_error"), health.get("fatal_reason")]
+    errors = [str(e) for e in errors if e]
+    at = health.get("at")
+    view = {"known": known, "uncommitted": True, "source": health.get("source"),
+            "persistence_error": health.get("persistence_error"), "fatal_reason": health.get("fatal_reason"),
+            "at": at, "age_s": round(max(0.0, now - at), 3) if isinstance(at, (int, float)) else None,
+            "engine_revision": health.get("engine_revision"), "detail": health.get("detail"), "banner": None}
+    if errors:
+        view["banner"] = ("Сбой хранилища движка (не зафиксировано в снимке): " + "; ".join(errors) +
+                          ". Новые submit/cancel без зафиксированного намерения не отправляются.")
+    elif not known and health.get("source") and fresh.get("stale"):
+        view["banner"] = ("Снимок устарел, а состояние хранилища неизвестно (" + str(health.get("detail") or
+                          "нет данных о здоровье движка") + ").")
+    return view

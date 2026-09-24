@@ -78,4 +78,13 @@ class EngineHost:
         alive = self._task is not None and not self._task.done()
         return {"engine_task_alive": alive, "ticks": self.ticks, "last_tick_at": self.last_tick_at,
                 "last_tick_error": self.last_error,
+                "persistence_error": getattr(self.engine, "persistence_error", None),
+                "fatal_reason": getattr(self.engine, "fatal_reason", None),
                 "note": "Процесс backend; состояние движка — только из зафиксированного снимка."}
+
+    def health(self) -> Dict[str, Any]:
+        """Uncommitted engine health read in-process: a failing store cannot commit a snapshot saying so."""
+        return {"source": "in_process", "known": True,
+                "persistence_error": getattr(self.engine, "persistence_error", None),
+                "fatal_reason": getattr(self.engine, "fatal_reason", None),
+                "at": self._clock(), "engine_revision": None}

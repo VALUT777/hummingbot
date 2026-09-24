@@ -415,9 +415,13 @@
   }
   function renderBlockers(s) {
     var banner = $("persistence-banner");
-    banner.hidden = !s.persistence_error;
-    banner.textContent = s.persistence_error ? "Сбой записи состояния (persistence): " + s.persistence_error +
-      ". Новые submit/cancel не отправляются без зафиксированного намерения." : "";
+    var health = (S.state && S.state.health) || {};
+    var texts = [];
+    if (s.persistence_error) texts.push("Сбой записи состояния (из снимка): " + s.persistence_error +
+      ". Новые submit/cancel не отправляются без зафиксированного намерения.");
+    if (health.banner) texts.push(health.banner + (typeof health.age_s === "number" ? " Данные " + fmtAge(health.age_s) + " назад." : ""));
+    banner.hidden = !texts.length;
+    banner.textContent = texts.join(" ");
     var boot = s.bootstrap || {};
     var tp = s.tp_dispatch || {};
     kv($("blockers-kv"), [

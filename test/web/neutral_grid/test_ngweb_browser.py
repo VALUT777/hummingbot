@@ -104,6 +104,12 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
         await page.wait_for("document.getElementById('state-badge').dataset.state === 'STALE'")
         assert "STOP_UNCERTAIN" in await page.eval("document.getElementById('state-code').textContent")
         assert await page.eval("!document.getElementById('stale-banner').hidden")
+        # persistence failure the engine could not commit: shown from the uncommitted health channel
+        web.ctx.health_provider = lambda: {"source": "health_file", "known": True,
+                                           "persistence_error": "database or disk is full", "at": time.time()}
+        await page.eval("document.getElementById('tab-overview').click()")
+        await page.wait_for("document.getElementById('persistence-banner').textContent.includes('disk is full')")
+        assert "не зафиксировано" in await page.eval("document.getElementById('persistence-banner').textContent")
         assert await page.eval("localStorage.length + sessionStorage.length") == 0
     finally:
         await browser.close()

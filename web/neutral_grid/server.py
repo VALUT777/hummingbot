@@ -58,6 +58,7 @@ class WebContext:
     access: AccessGate = field(default_factory=AccessGate)
     policy: SecurityPolicy = field(default_factory=SecurityPolicy)
     host_status: Callable[[], Dict[str, Any]] = lambda: {}
+    health_provider: Callable[[], Dict[str, Any]] = lambda: {}
     demo: Optional[DemoControls] = None
     commands: Optional[CommandService] = None
 
@@ -172,6 +173,7 @@ async def state(request: web.Request) -> web.Response:
         "recent_commands": views.for_display(ctx.gateway.list_commands(limit=10)),
         "engine_started": views.engine_started(snapshot),
         "host": ctx.host_status(),
+        "health": views.health_view(ctx.health_provider(), fresh, ctx.clock()),
     })
 
 
