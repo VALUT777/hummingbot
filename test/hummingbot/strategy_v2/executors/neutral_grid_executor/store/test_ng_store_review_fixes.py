@@ -503,3 +503,35 @@ def test_ws_a_aggregate_tp_water_fills_generations_like_cell_ledger(env, order):
     assert (c1.exit_filled, c2.exit_filled) == (Decimal("6"), Decimal("10"))  # independent of fill order
     assert store.late_obligation_cycles() == [] and store.verify_ledger() == []
     assert store.open_conflicts() == []  # the aggregate's fills on the released gen1 are not late evidence
+
+
+# ---------------------------------------------------------------------------------------------- round 3: B-09 restart
+
+
+@pytest.mark.parametrize("outcome", [TransportOutcome.NOT_SENT, TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL])
+def test_b09_restart_release_outcome_for_row_dispatched_by_dead_process_keeps_unknown(env, store, outcome):
+    """A DISPATCHED row left by a dead process (attempts == 1): after reopen nobody can prove the transport was not
+    called, so a NOT_SENT / zero-fill reject from the new process never releases the intent."""
+    intent = record_entry_intent(store, cell_id=3)
+    store.fault_hooks.arm("before_transport")
+    with pytest.raises(SimulatedCrash):
+        submit_via_protocol(store, FakeTransport(), intent)
+    reopened = env.open()
+    [row] = reopened.unresolved_outbox()
+    assert (row.status, row.attempts) == ("DISPATCHED", 1)
+    with reopened.transaction() as tx:
+        result = reopened.record_transport_result(tx, intent.cid, TransportResult(outcome, "fabricated"))
+    assert reopened.leg(intent.cid).state == OrderState.SUBMIT_UNKNOWN
+    assert [r.cid for r in reopened.reservations()] == [intent.cid]
+    assert result.outcome == TransportOutcome.UNKNOWN and "another process" in result.outcome_detail
+    assert [a["outcome"] for a in reopened.outbox_attempts(row.id)] == [outcome.value]  # attempt outcome kept
+
+
+def test_b09_same_process_dispatch_may_still_release_on_proven_pre_send_failure(store):
+    """Control: the process that committed the dispatch mark and got a proven pre-send NOT_SENT may release."""
+    intent = record_entry_intent(store, cell_id=3)
+    with store.transaction() as tx:
+        store.mark_dispatching(tx, intent.outbox_id)
+    with store.transaction() as tx:
+        store.record_transport_result(tx, intent.cid, TransportResult(TransportOutcome.NOT_SENT, "min notional"))
+    assert store.leg(intent.cid).state == OrderState.REJECTED_UNSENT and store.reservations() == []
