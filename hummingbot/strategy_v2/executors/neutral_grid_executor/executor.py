@@ -7,6 +7,7 @@ outbox (intent before transport). A forced shutdown therefore does NOT run a bes
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -24,6 +25,15 @@ from hummingbot.strategy_v2.models.executors import CloseType
 
 EXECUTOR_TYPE = "neutral_grid_executor"
 _TRANSIENT_BASELINE_ERRORS = {"BOOTSTRAP_NOT_READY", None}
+
+
+def launcher_start_payload(config: NeutralGridExecutorConfig) -> Dict[str, Any]:
+    """START as the launcher sends it after the operator typed the exact confirmation phrase (grid id + signed B):
+    the same acknowledgement fields as the web START (AC-47). The launcher has no web preview; its preview id is a
+    stable digest of what the operator confirmed."""
+    digest = hashlib.sha256(f"{config.grid_id}|{config.expected_initial_position}|{config.id}".encode()).hexdigest()
+    return {"source": "launcher", "risk_acknowledged": True, "baseline_acknowledged": True,
+            "expected_initial_position": str(config.expected_initial_position), "preview_id": digest[:24]}
 
 
 def has_cid_ownership(owner: Any) -> bool:
@@ -128,7 +138,7 @@ class NeutralGridExecutor(ExecutorBase):
         self._take_cid_ownership(port)
         self._subscribe_wakeups(port)
         if self.config.operator_confirmed_start:
-            self._enqueue(CommandKind.START, {"source": "launcher"}, key=f"launcher-start-{self.config.id}")
+            self._enqueue(CommandKind.START, launcher_start_payload(self.config), key=f"launcher-start-{self.config.id}")
 
     def _resolve_cid_owner(self, port) -> Any:
         if self._cid_owner is not None:

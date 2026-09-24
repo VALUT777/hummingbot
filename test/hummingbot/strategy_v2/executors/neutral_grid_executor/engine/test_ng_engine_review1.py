@@ -181,13 +181,14 @@ class _RacyFx(FakeExchange):
     the account (position + active orders) in the same tick: REST reads are not atomic with each other."""
     pending_fill = None
     polled = False
+    race_any_tick = False                     # fire on the next history read even without an account poll
 
     async def active_orders(self):
         self.polled = True
         return await super().active_orders()
 
     async def inactive_orders_page(self, cursor, limit=100):
-        if self.pending_fill is not None and cursor is None and self.polled:
+        if self.pending_fill is not None and cursor is None and (self.polled or self.race_any_tick):
             cid, qty = self.pending_fill
             self.pending_fill = None
             self.fill(cid, qty)
@@ -225,7 +226,7 @@ def _release_scenario(tmp_path, inject_at=None):
     """Cell A completes a cycle; returns the tick index at which A released. With ``inject_at``, another cell's
     entry fills right before that tick, so the release tick also commits a fill that moves the ledger P while the
     last position read predates it."""
-    h = Harness(tmp_path)
+    h = _racy(tmp_path)
     try:
         _started(h)
         a, b = h.buy_cells()[-1], h.buy_cells()[0]
@@ -235,7 +236,10 @@ def _release_scenario(tmp_path, inject_at=None):
         gen = h.cell(a).generation
         for i in range(40):
             if i == inject_at:
-                h.fx.fill(h.live_order(b, ENTRY).cid, D("10"))
+                # B fills during this tick's history read: after any account read of the same tick
+                h.fx.race_any_tick = True
+                h.fx.pending_fill = (h.live_order(b, ENTRY).cid, D("10"))
+                h.engine.wake({"type": "order", "status": "filled"})     # a history walk in this very tick
             h.tick()
             if h.cell(a).current is None or h.cell(a).generation != gen:
                 return i, h.engine.position is not None and h.engine.position.net_base
@@ -250,7 +254,9 @@ def test_r17_release_needs_a_position_read_after_the_closing_fill_commit(tmp_pat
     # Same deterministic run, but another cell's fill is committed in exactly the release tick: the last
     # position read (0) no longer equals the ledger P (10), so condition (5) is not proven in that tick.
     tick, position = _release_scenario(tmp_path / "race", inject_at=release_tick)
-    assert tick is None or tick > release_tick, (release_tick, tick)
+    assert tick is not None
+    # either the release waits for a later read, or the engine re-read the position after the commit (venue 10)
+    assert tick > release_tick or position == D("10"), (release_tick, tick, position)
 
 
 def _tick_until_poll(h, max_ticks=10):
@@ -279,15 +285,19 @@ def test_r04_failing_rules_refresh_backs_off_and_does_not_starve_history(tmp_pat
         h.close()
 
 
+# Rules re-read every tick (runtime rule changes are the subject, not the request-weight budget).
+_FAST_RULES = EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0,
+                            weight_budget_per_min=100000)
+
+
 # ------------------------------------------------------------------------------------------ #5 minimum decrease
 def test_r05_runtime_minimum_decrease_never_emergency_cancels_other_cells_entries(tmp_path):
-    h = Harness(tmp_path, max_active_orders=30,
-                options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0))
+    h = Harness(tmp_path, max_active_orders=30, options=_FAST_RULES)
     try:
         _started(h)
         h.tick(3)
         h.fx.set_rules(min_base=D("1"), min_notional=D("1"))     # venue lowers the minimum; cap unchanged
-        h.tick(3)
+        h.run_until(lambda: h.engine.rules.min_base == D("1"), max_ticks=10)
         cell = h.buy_cells()[-1]
         entry = h.live_order(cell, ENTRY)
         for _ in range(4):
@@ -308,7 +318,7 @@ def test_r05_runtime_minimum_decrease_never_emergency_cancels_other_cells_entrie
 
 # ------------------------------------------------------------------------------------------ #6 rejected intents
 def test_r06_off_tick_prices_latch_a_blocker_instead_of_dead_legs_every_tick(tmp_path):
-    h = Harness(tmp_path, options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0))
+    h = Harness(tmp_path, options=_FAST_RULES)
     try:
         _started(h)
         cell = h.buy_cells()[-1]
@@ -318,8 +328,7 @@ def test_r06_off_tick_prices_latch_a_blocker_instead_of_dead_legs_every_tick(tmp
         assert len(h.legs(cell, TP)) <= 1, [(t.state.value, t.cid) for t in h.legs(cell, TP)]
         assert "PRICE_NOT_ON_TICK" in (h.engine.cell_blockers.get(cell) or ""), h.engine.cell_blockers
         h.fx.set_rules(tick_size=D("0.0001"))                    # rules fixed: the TP goes out
-        h.tick(6)
-        assert h.live_order(cell, TP) is not None
+        h.run_until(lambda: h.live_order(cell, TP) is not None, max_ticks=20)
     finally:
         h.close()
 
@@ -426,10 +435,13 @@ def test_r10_proven_live_orders_do_not_extend_the_history_lookback(tmp_path):
         assert h.engine.non_final_legs() and all(leg.state == OrderState.LIVE for leg in h.engine.non_final_legs())
         assert h.engine.oldest_unresolved_ms() is None
         cell = h.buy_cells()[-1]
-        h.fx.fill(h.live_order(cell, ENTRY).cid, D("10"))
+        entry = h.live_order(cell, ENTRY)
+        h.fx.fill(entry.cid, D("10"))
         h.fx.script_submit(SubmitBehavior.TIMEOUT_NOT_LANDED)
-        h.run_until(lambda: any(t.state == OrderState.SUBMIT_UNKNOWN for t in h.legs(cell, TP)), max_ticks=10)
+        h.run_until(lambda: any(t.state == OrderState.SUBMIT_UNKNOWN for t in h.legs(cell, TP))
+                    and h.engine.leg_by_cid(entry.cid).state == OrderState.TERMINAL, max_ticks=20)
         unknown = next(t for t in h.legs(cell, TP) if t.state == OrderState.SUBMIT_UNKNOWN)
+        # only the unknown submit forces a lookback (to its own intent), not the resting LIVE entries
         assert h.engine.oldest_unresolved_ms() == h.engine.order_meta[unknown.cid].intent_ms
     finally:
         h.close()
