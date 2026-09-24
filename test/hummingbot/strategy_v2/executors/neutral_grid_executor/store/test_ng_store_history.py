@@ -240,9 +240,8 @@ def test_dedupe_key_is_the_canonical_tuple(live):
 
 
 def test_aggregated_tp_fill_allocation_is_exact_and_idempotent(store):
+    """Single-generation aggregate (WS-A shape ``{generation: share}``): fills are credited at history time."""
     transport = FakeTransport()
-    # an aggregated TP carries explicit per-cycle allocations (the split policy is WS-A's dust.aggregate); the
-    # store keeps the allocation, withholds cycle credit until the fill is allocated and checks the arithmetic
     entry = record_entry_intent(store, cell_id=5)
     submit_via_protocol(store, transport, entry)
     leg = store.leg(entry.cid)
@@ -252,25 +251,23 @@ def test_aggregated_tp_fill_allocation_is_exact_and_idempotent(store):
     with store.transaction() as tx:
         cid = store.allocate_cid(tx, tp_leg(5))
         store.record_intent(tx, tp_leg(5), SubmitRequest(cid, cycle.tp_side, cycle.tp_price, Decimal("10"),
-                                                         OrderTypePolicy.LIMIT),
-                            allocations=[(GRID_ID, 5, 1, Decimal("10"))])
+                                                         OrderTypePolicy.LIMIT), allocations={1: Decimal("10")})
     tp = store.leg(cid)
+    assert tp.allocation == {1: Decimal("10")} and tp.role == LegRole.TP
     with store.transaction() as tx:
         store.mark_dispatching(tx, store.outbox_for_cid(cid)[0].id)
         store.record_transport_result(tx, cid, TransportResult(TransportOutcome.ACCEPTED, exchange_order_id="T1"))
     result = _apply(store, [trade_row("tp-1", cid, tp.side, "3", price=str(tp.price), exchange_order_id="T1")])
-    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("0")  # not credited until allocated
-    assert [f.trade_id_str for f in store.unallocated_fills()] == ["tp-1"]
+    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("3") and store.unallocated_fills() == []
     key = result.new_fills[0].dedupe_key
-    with pytest.raises(ValueError):
+    with pytest.raises(InvalidTransitionError, match="differently"):
         store.allocate_fill(None, key, [(GRID_ID, 5, 1, Decimal("2"))])
     allocation = FillAllocation(key, ((GRID_ID, 5, 1, Decimal("3")),))
-    for _ in range(2):
+    for _ in range(2):  # asserting the automatic split is an idempotent no-op
         with store.transaction() as tx:
             store.apply_history_batch(tx, [], ledger_transitions=[allocation])
-    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("3") and store.unallocated_fills() == []
+    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("3")
     assert store.verify_ledger() == []
-    assert tp.role == LegRole.TP
 
 
 def test_caller_dedupe_keys_must_match_the_canonical_keys(store, live):

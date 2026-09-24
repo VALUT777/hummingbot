@@ -174,6 +174,8 @@ def _entry_filled(store, cell_id, size="10"):
 
 
 def test_review3_terminal_aggregate_tp_with_unallocated_fills_cannot_admit_duplicate_tp(store):
+    # red at 78d780164 (manual split model: TERMINAL + duplicate TP accepted); since the WS-A alignment fills are
+    # water-filled at history time, so the executed quantity is in X before TERMINAL and a duplicate is refused
     _entry_filled(store, 5)
     transport = FakeTransport()
     tp = _tp(store, 5, 0, "10", allocations=[(GRID_ID, 5, 1, Decimal("10"))], transport=transport)
@@ -181,9 +183,9 @@ def test_review3_terminal_aggregate_tp_with_unallocated_fills_cannot_admit_dupli
     _apply(store, [trade_row("tp-1", tp.cid, leg.side, "10", price=str(leg.price),
                              exchange_order_id=store.order(tp.cid).exchange_order_id),
                    _final_row(store, leg, "10", status="filled")])
-    with pytest.raises(InvalidTransitionError, match="unallocated"):
-        with store.transaction() as tx:
-            store.set_leg_state(tx, tp.cid, OrderState.TERMINAL, reason="final row")
+    assert store.unallocated_fills() == [] and store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("10")
+    with store.transaction() as tx:
+        store.set_leg_state(tx, tp.cid, OrderState.TERMINAL, reason="final row")
     with pytest.raises(InvalidTransitionError, match="exceeds confirmed entry"):
         _tp(store, 5, 1, "10")
 
@@ -273,6 +275,8 @@ def test_review5_dispatched_row_needs_explicit_same_cid_resend_and_respects_degr
 
 
 def test_review6_caught_guard_error_cannot_commit_half_applied_allocation(store):
+    # red at 78d780164 (a bad manual split committed X=4); with water-filled aggregate fills a conflicting split is
+    # refused before any write and the automatic split stays intact
     _entry_filled(store, 5)
     tp = _tp(store, 5, 0, "10", allocations=[(GRID_ID, 5, 1, Decimal("10"))], transport=FakeTransport())
     leg = store.leg(tp.cid)
@@ -285,10 +289,9 @@ def test_review6_caught_guard_error_cannot_commit_half_applied_allocation(store)
                 store.allocate_fill(tx, key, [(GRID_ID, 5, 1, Decimal("4")), (GRID_ID, 99, 1, Decimal("6"))])
             except (InvalidTransitionError, KeyError, ValueError):
                 pass  # engine shows the blocker and carries on
-    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("0")
-    assert [f.dedupe_key for f in store.unallocated_fills()] == [key]
-    store.allocate_fill(None, key, [(GRID_ID, 5, 1, Decimal("10"))])
-    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("10")
+    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("10") and store.unallocated_fills() == []
+    store.allocate_fill(None, key, [(GRID_ID, 5, 1, Decimal("10"))])  # the true split: idempotent
+    assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("10") and store.verify_ledger() == []
 
 
 def test_review6_caught_allocation_sum_error_leaves_no_dispatchable_intent(store):
@@ -431,3 +434,72 @@ def test_order_key_is_the_exact_exchange_order_id_like_ws_c(store):
     no_id = order_row(entry.cid, Side.BUY, entry.price, entry.amount, Decimal("0"), order_id=None)
     with pytest.raises(ValueError, match="exchange order id"):
         _apply(store, [no_id])
+
+
+# ---------------------------------------------------------------------------------------------- WS-A aggregate TP
+
+
+def _two_generations_of_one_cell(store):
+    """gen1 released, gen2 open with E2=10; a late fill reopens gen1 (E1=6, X1=4) and is audited."""
+    transport = FakeTransport()
+    gen1 = _live(store, 5, transport)
+    _fill(store, gen1, "g1-e", "4")
+    with store.transaction() as tx:
+        store.apply_history_batch(tx, [_final_row(store, gen1, "4")])
+        store.set_leg_state(tx, gen1.cid, OrderState.TERMINAL, reason="canceled after 4")
+    tp1 = _tp(store, 5, 0, "4", transport=transport)
+    fill_and_terminate(store, tp1.cid, "g1-t", size=Decimal("4"), ts=BOOT_CUT_MS + 20_000)
+    with store.transaction() as tx:
+        store.close_cycle(tx, GRID_ID, 5, 1, "released")
+    gen2 = _live(store, 5, transport)
+    _fill(store, gen2, "g2-e", "10", ts=BOOT_CUT_MS + 30_000)
+    _fill(store, gen1, "g1-late", "2", ts=BOOT_CUT_MS + 40_000)
+    store.record_manual_reconciliation(None, "operator", "late fill confirmed", {"trade": "g1-late"},
+                                       resolved_conflict_ids=[c.id for c in store.open_conflicts()])
+    return transport
+
+
+@pytest.mark.parametrize("order", ["5+7", "7+5"])
+def test_ws_a_aggregate_tp_water_fills_generations_like_cell_ledger(env, order):
+    store = env.open()
+    env.bootstrap(store)
+    transport = _two_generations_of_one_cell(store)
+    c1, c2 = store.cycle(GRID_ID, 5, 1), store.cycle(GRID_ID, 5, 2)
+    assert (c1.state, c1.entry_filled - c1.exit_filled, c2.entry_filled) == ("COMPLETE", Decimal("2"), Decimal("10"))
+    leg_id = tp_leg(5, generation=2)
+    wrong_host = tp_leg(5, generation=1, revision=1)
+    with pytest.raises(InvalidTransitionError, match="newest allocated generation"):
+        with store.transaction() as tx:
+            cid = store.allocate_cid(tx, wrong_host)
+            store.record_intent(tx, wrong_host, SubmitRequest(cid, c1.tp_side, c1.tp_price, Decimal("12"),
+                                                              OrderTypePolicy.LIMIT),
+                                allocations={"1": "2", "2": "10"})  # Leg.to_record() string shape
+    with pytest.raises(InvalidTransitionError, match="exceeds confirmed entry"):  # share > gen1 headroom (2)
+        with store.transaction() as tx:
+            cid = store.allocate_cid(tx, leg_id)
+            store.record_intent(tx, leg_id, SubmitRequest(cid, c2.tp_side, c2.tp_price, Decimal("12"),
+                                                          OrderTypePolicy.LIMIT),
+                                allocations=((1, Decimal("3")), (2, Decimal("9"))))
+    with store.transaction() as tx:  # TpDispatchItem.allocation shape: ((generation, share), ...)
+        cid = store.allocate_cid(tx, leg_id)
+        intent = store.record_intent(tx, leg_id, SubmitRequest(cid, c2.tp_side, c2.tp_price, Decimal("12"),
+                                                               OrderTypePolicy.LIMIT),
+                                     allocations=((1, Decimal("2")), (2, Decimal("10"))))
+    assert store.leg(cid).allocation == {1: Decimal("2"), 2: Decimal("10")}  # == WS-A Leg.allocation
+    submit_via_protocol(store, transport, intent)
+    leg, exchange_id = store.leg(cid), store.order(cid).exchange_order_id
+    sizes = ["5", "7"] if order == "5+7" else ["7", "5"]
+    for n, size in enumerate(sizes):
+        _apply(store, [trade_row(f"agg-{size}", cid, leg.side, size, price=str(leg.price),
+                                 ts=BOOT_CUT_MS + 50_000 + n, exchange_order_id=exchange_id)])
+        if n == 0:  # water-fill of the cumulative, oldest generation first
+            first = Decimal(size)
+            assert store.cycle(GRID_ID, 5, 1).exit_filled == Decimal("4") + min(first, Decimal("2"))
+            assert store.cycle(GRID_ID, 5, 2).exit_filled == max(first - Decimal("2"), Decimal("0"))
+    for _ in range(2):  # replay is idempotent
+        _apply(store, [trade_row(f"agg-{s}", cid, leg.side, s, price=str(leg.price), ts=BOOT_CUT_MS + 50_000 + n,
+                                 exchange_order_id=exchange_id) for n, s in enumerate(sizes)])
+    c1, c2 = store.cycle(GRID_ID, 5, 1), store.cycle(GRID_ID, 5, 2)
+    assert (c1.exit_filled, c2.exit_filled) == (Decimal("6"), Decimal("10"))  # independent of fill order
+    assert store.late_obligation_cycles() == [] and store.verify_ledger() == []
+    assert store.open_conflicts() == []  # the aggregate's fills on the released gen1 are not late evidence
