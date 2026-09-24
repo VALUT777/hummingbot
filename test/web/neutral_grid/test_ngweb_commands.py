@@ -379,3 +379,28 @@ def test_audit_actions_match_engine():
         if action == "resolve_unknown_submit":
             payload["cid"] = "1"
         assert engine_commands.validate_kind("baseline_audit", payload) is None, action
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("started_flag", [False, None])
+async def test_confirm_baseline_refused_before_start(make_web, started_flag):
+    """Review #1: confirm_baseline must not bootstrap an engine that never got a risk-acknowledged Start."""
+    snap = sample_snapshot("BOOTSTRAPPING")
+    snap["reasons"] = ["AWAITING_START", "BASELINE_NOT_CONFIRMED"]
+    snap["summary"]["baseline"] = None
+    if started_flag is not None:
+        snap["summary"]["started"] = started_flag
+    web = await make_web(snap)
+    await web.login()
+    resp = await web.command("confirm_baseline", "confirm-before-start", {"expected_initial_position": "0",
+                                                                         "confirm": True})
+    assert resp.status == 409
+    assert (await resp.json())["error"] == "start_required"
+    assert web.gateway.commands == []
+    # once the engine reports an applied Start, the confirmation is accepted
+    snap["summary"]["started"] = True
+    snap["reasons"] = ["BASELINE_NOT_CONFIRMED"]
+    web.gateway.snapshot = snap
+    ok = await web.command("confirm_baseline", "confirm-after-start1", {"expected_initial_position": "0",
+                                                                        "confirm": True})
+    assert ok.status == 202, await ok.text()

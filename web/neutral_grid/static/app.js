@@ -318,6 +318,10 @@
     tickAge();
     var engine = st.engine || {};
     var summary = st.summary || {};
+    // confirm_baseline only after an applied Start (the backend refuses it otherwise, 409 start_required)
+    var confirmBtn = document.querySelector("[data-cmd=confirm_baseline]");
+    confirmBtn.disabled = !(st.engine_started === true && (summary.baseline === null || summary.baseline === undefined));
+    confirmBtn.title = confirmBtn.disabled ? "Доступно после применённого «Старта» и до подтверждения baseline" : "";
     var boot = summary.bootstrap || {};
     var next = null;
     if (st.engine_started === false) next = "Следующий шаг: проверьте превью и отправьте «Старт» (вкладка «Превью и старт»).";

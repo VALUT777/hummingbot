@@ -27,7 +27,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import Com
 from web.neutral_grid import jsonsafe
 from web.neutral_grid.gateway import EngineGateway
 from web.neutral_grid.preview import parse_signed_decimal
-from web.neutral_grid.views import is_engine_active, snapshot_revisions
+from web.neutral_grid.views import engine_started, is_engine_active, snapshot_revisions
 
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{16,128}\Z")
 MAX_NOTE = 500
@@ -236,6 +236,12 @@ class CommandService:
             if snapshot is None:
                 return normalized, self._error(409, "engine_not_started",
                                                "Движок ещё не опубликовал состояние; команда неприменима.")
+            if kind == CommandKind.CONFIRM_BASELINE.value and engine_started(snapshot) is not True:
+                # The baseline is confirmed only after a Start that carried the risk acknowledgement and a
+                # checked preview_id was applied; otherwise confirm_baseline would bootstrap trading without them.
+                return normalized, self._error(
+                    409, "start_required", "Сначала отправьте «Старт» с подтверждением риска по превью; "
+                    "baseline подтверждается только после применённого старта.")
             return normalized, None
         pending = self._gateway.list_commands(limit=1, kind=CommandKind.START.value, status="QUEUED")
         if pending:
