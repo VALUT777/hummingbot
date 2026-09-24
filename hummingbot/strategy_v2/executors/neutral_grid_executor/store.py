@@ -23,7 +23,8 @@ A degraded store refuses new SUBMIT intents until :meth:`NeutralGridStore.clear_
 Single writer
 -------------
 The engine opener takes two ``fcntl.flock`` locks -- one keyed by ``(connector domain, account index,
-trading pair)`` in a host-wide lock directory and one next to the database file -- and then claims the
+trading pair)`` in the host-wide directory ``~/.hummingbot/neutral_grid/locks`` (independent of the checkout's
+``data_path``; see :func:`default_host_dir`) and one next to the database file -- and then claims the
 ``engine_owner`` row, which is re-checked inside every write transaction (fencing). This protects one host
 only: **it is NOT a distributed lock**. Two hosts sharing the database file or the exchange account are
 outside the guarantee (spec section 1); a foreign-host owner row is refused unless an operator explicitly
@@ -95,7 +96,7 @@ __all__ = [
     "PositionLedger", "PriorRunEvidenceError", "ReadOnlyStoreError", "Reservation", "ReservationRecord",
     "ReservationRelease", "SchemaVersionError", "SimulatedCrash", "StoreClosedError", "StoreCorruptError",
     "StoreError", "StoreIntegrityError", "StoreLockedError", "StoreMissingError", "StoredSnapshot",
-    "Transaction", "canonical_decimal", "canonical_json", "default_db_path", "default_lock_dir",
+    "Transaction", "canonical_decimal", "canonical_json", "default_db_path", "default_host_dir", "default_lock_dir",
     "order_dedupe_key", "parse_decimal", "trade_dedupe_key",
 ]
 
@@ -372,9 +373,17 @@ def _client_id_text(row: ExchangeOrderRow) -> str:
     return str(row.client_order_id) if row.client_order_id is not None else ""
 
 
+def _row_exchange_id(row: ExchangeOrderRow) -> str:
+    exchange_id = row.order_index or row.order_id
+    if not exchange_id:
+        raise ValueError("order row has no exchange order id (order_index/order_id)")
+    return exchange_id
+
+
 def order_dedupe_key(domain: str, row: ExchangeOrderRow) -> str:
-    return canonical_json(["ORDER", domain, row.account_index, row.market_id, row.order_id or "",
-                           _client_id_text(row)])
+    """Canonical order key ``(domain, account, market, exact exchange order id)`` -- the same identity as WS-C's
+    ``history.order_dedupe_key``; client ids are payload, so a changed client id under one key is a conflict."""
+    return canonical_json(["ORDER", domain, row.account_index, row.market_id, _row_exchange_id(row)])
 
 
 def _trade_payload(row: ExchangeTradeRow) -> Dict[str, Any]:
@@ -444,10 +453,25 @@ class EngineIdentity:
             _SAFE.sub("_", part) for part in (self.connector_domain, str(self.account_index), self.trading_pair))
 
 
+HOST_DIR_ENV = "HUMMINGBOT_NEUTRAL_GRID_HOST_DIR"
+
+
+def default_host_dir() -> Path:
+    """Host-wide home of the single-writer locks and prior-run markers: ``~/.hummingbot/neutral_grid``.
+
+    It deliberately does NOT depend on ``hummingbot.data_path()`` (which is per checkout), so two checkouts, worktrees
+    or launchers of the same user on one host contend for the same ``(domain, account, pair)`` lock and see the same
+    prior-run marker. ``$HUMMINGBOT_NEUTRAL_GRID_HOST_DIR`` overrides it (e.g. a directory shared by containers of one
+    host). This is still NOT a distributed lock: other hosts, users or unshared mounts are not covered.
+    """
+    override = os.environ.get(HOST_DIR_ENV)
+    return Path(override) if override else Path.home() / ".hummingbot" / "neutral_grid"
+
+
 def default_lock_dir(base_dir: Optional[Union[str, Path]] = None) -> Path:
+    """``<host dir>/locks`` (see :func:`default_host_dir`); ``base_dir`` keeps the old explicit layout."""
     if base_dir is None:
-        from hummingbot import data_path
-        base_dir = data_path()
+        return default_host_dir() / "locks"
     return Path(base_dir) / "neutral_grid" / "locks"
 
 
@@ -1052,6 +1076,7 @@ class CursorRecord:
     last_full_scan_ms: Optional[int]
     revision: int
     updated_at_ms: int
+    retention_gap_open: bool = False
 
 
 @dataclass(frozen=True)
@@ -1134,6 +1159,7 @@ class LedgerState:
     position: Optional[PositionLedger]
     entry_blockers: List[str]
     queued_commands: int
+    late_cycles: List[CycleRecord] = field(default_factory=list)  # released cycles with a late obligation
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -1333,7 +1359,9 @@ class NeutralGridStore:
 
     @staticmethod
     def _marker_paths(db_path: Path, identity: EngineIdentity, lock_dir: Path) -> List[Path]:
-        return [db_path.with_name(db_path.name + ".marker.json"), lock_dir / f"{identity.lock_key}.marker.json"]
+        # the host marker lives next to the lock directory, never inside the database's data directory
+        return [db_path.with_name(db_path.name + ".marker.json"),
+                lock_dir.parent / "markers" / f"{identity.lock_key}.marker.json"]
 
     @staticmethod
     def _prior_run_evidence(db_path: Path, identity: EngineIdentity, markers: Sequence[Path],
@@ -1709,7 +1737,8 @@ class NeutralGridStore:
                     self._verify_owner()
                 yield tx
                 if tx._failed is not None:
-                    raise PersistenceError(f"transaction had a failed statement: {tx._failed}") from tx._failed
+                    raise PersistenceError(f"transaction had a failed statement or a store call that failed after "
+                                           f"writing; refusing to commit: {tx._failed!r}") from tx._failed
                 self.fault_hooks.hit("before_commit")
                 try:
                     self._conn.commit()
@@ -1746,11 +1775,22 @@ class NeutralGridStore:
 
     @contextlib.contextmanager
     def _scope(self, tx: Optional[Transaction]) -> Iterator[Transaction]:
+        """Run in the caller's transaction (or an own one). If a store method raises after it has written rows,
+        the caller's transaction is poisoned: even if the caller catches the error, COMMIT is refused, so a guard
+        error can never leave half-applied state behind (AC-55, NG-DB-002)."""
         if tx is None:
             with self.transaction() as own:
                 yield own
-        else:
-            yield self._check_tx(tx)
+            return
+        scope = self._check_tx(tx)
+        before = self._conn.raw.total_changes
+        try:
+            yield scope
+        except BaseException as exc:
+            if scope._failed is None and self._tx is scope and not self.closed \
+                    and self._conn.raw.total_changes != before:
+                scope._failed = exc
+            raise
 
     def clear_degraded(self, actor: str, reason: str) -> None:
         """Operator/engine acknowledgement after storage recovered; succeeds only if an audit row commits."""
@@ -1948,12 +1988,23 @@ class NeutralGridStore:
             for row in self._x("SELECT o.id, o.cid FROM outbox o JOIN legs l ON l.cid = o.cid "
                                "WHERE l.grid_id = ? AND o.status != 'DONE'", (grid.grid_id,)).fetchall():
                 blockers.append(f"outbox {row['id']} (cid {row['cid']}) unresolved")
-            for cycle in self._cycles("grid_id = ? AND state = 'OPEN'", (grid.grid_id,)):
+            for cycle in self._cycles("grid_id = ?", (grid.grid_id,)):  # OPEN and released (late evidence)
                 if cycle.entry_filled != cycle.exit_filled:
                     blockers.append(f"cell {cycle.cell_id} gen {cycle.generation} obligation "
                                     f"E={cycle.entry_filled} X={cycle.exit_filled}")
                 if cycle.dust != 0:
                     blockers.append(f"cell {cycle.cell_id} gen {cycle.generation} dust {cycle.dust}")
+                if cycle.late_evidence == 1:
+                    blockers.append(f"cell {cycle.cell_id} gen {cycle.generation} late evidence not acknowledged")
+            unallocated = self._x("SELECT count(*) FROM fills f JOIN legs l ON l.cid = f.cid WHERE l.grid_id = ? "
+                                  "AND EXISTS (SELECT 1 FROM allocations a WHERE a.cid = f.cid) AND NOT EXISTS "
+                                  "(SELECT 1 FROM fill_allocations fa WHERE fa.dedupe_key = f.dedupe_key)",
+                                  (grid.grid_id,)).fetchone()[0]
+            conflicts = self._x("SELECT count(*) FROM history_conflicts WHERE resolved_at_ms IS NULL").fetchone()[0]
+        if unallocated:
+            blockers.append(f"{unallocated} aggregated fill(s) not yet allocated")
+        if conflicts:
+            blockers.append(f"{conflicts} unresolved history conflict(s)")
         return blockers
 
     def migrate_grid(self, tx: Optional[Transaction], migration: GridMigration) -> GridRecord:
@@ -2129,10 +2180,22 @@ class NeutralGridStore:
                 return self._cycles("state = 'OPEN'", ())
             return self._cycles("grid_id = ? AND state = 'OPEN'", (grid_id,))
 
+    def late_obligation_cycles(self, grid_id: Optional[str] = None) -> List[CycleRecord]:
+        """Released (COMPLETE) cycles that late history reopened: E != X or late evidence not yet acknowledged.
+        Their obligation still needs a TP (allowed once the late evidence is audited, see ``record_intent``)."""
+        where = "state = 'COMPLETE' AND (entry_filled != exit_filled OR late_evidence = 1)"
+        with self._rlock:
+            self._require_open()
+            if grid_id is None:
+                return self._cycles(where, ())
+            return self._cycles(f"grid_id = ? AND {where}", (grid_id,))
+
     def open_cycle(self, tx: Optional[Transaction], grid_id: str, cell_id: int,
                    planned_amount: Optional[Decimal] = None) -> CycleRecord:
         """Start the next cycle (generation + 1) of a cell with its fixed entry side and prices. Refused while
-        the previous cycle is not COMPLETE (whole-cell lock, NG-CELL-001)."""
+        the previous cycle is not COMPLETE (whole-cell lock, NG-CELL-001), while any released cycle of the cell
+        still has a late obligation (E != X) or unacknowledged late evidence, and while any history conflict is
+        unresolved (market freeze, NG-HIST-002)."""
         with self._scope(tx):
             self._require_writer()
             grid = self.grid(grid_id)
@@ -2143,6 +2206,15 @@ class NeutralGridStore:
                 previous = self.cycle(grid_id, cell_id, cell.generation)
                 if previous.state != "COMPLETE":
                     raise InvalidTransitionError(f"cell {cell_id} cycle {cell.generation} is still open")
+            late = [c for c in self.late_obligation_cycles(grid_id) if c.cell_id == cell_id]
+            if late:
+                raise InvalidTransitionError(
+                    f"cell {cell_id} has a late obligation on released cycle(s) "
+                    f"{[(c.generation, str(c.entry_filled), str(c.exit_filled)) for c in late]}; cover it first")
+            conflicts = self._x("SELECT count(*) FROM history_conflicts WHERE resolved_at_ms IS NULL").fetchone()[0]
+            if conflicts:
+                raise EntryBlockedError(f"{conflicts} unresolved history conflict(s): market frozen, no new cycle",
+                                        [f"{conflicts} unresolved history conflict(s)"])
             if planned_amount is None:
                 amount = grid.order_amount_base
             else:
@@ -2259,7 +2331,7 @@ class NeutralGridStore:
             if existing is not None:
                 return existing
             cycle = self.cycle(leg.grid_id, leg.cell_id, leg.generation)
-            if cycle.state != "OPEN":
+            if not self._cycle_accepts(cycle, role):
                 raise InvalidTransitionError(f"cycle {leg.grid_id}/{leg.cell_id}/{leg.generation} is not open")
             epoch, seq = self._x("SELECT cid_epoch, next_seq FROM cid_state WHERE id = 1").fetchone()
             while True:
@@ -2408,6 +2480,10 @@ class NeutralGridStore:
                 raise InvalidTransitionError(f"leg {cid}: no final zero-fill venue row; rejection unproven "
                                              f"(timeouts/not-found stay UNKNOWN)")
         elif to_state == OrderState.TERMINAL:
+            unallocated = self._unallocated_quantity(cid)
+            if unallocated:
+                raise InvalidTransitionError(f"leg {cid}: {unallocated} of its fills are unallocated; allocate them "
+                                             f"to cycles before TERMINAL (else they would vanish from X and reserve)")
             if order is None or not order.venue_final or order.venue_filled is None:
                 raise InvalidTransitionError(f"leg {cid}: no exact final venue order row; TERMINAL unproven")
             if order.venue_filled != leg.filled:
@@ -2422,13 +2498,26 @@ class NeutralGridStore:
     def _fill_count(self, cid: int) -> int:
         return self._x("SELECT count(*) FROM fills WHERE cid = ?", (cid,)).fetchone()[0]
 
+    def _unallocated_quantity(self, cid: int) -> Decimal:
+        """Fill quantity of an aggregated (allocated) leg not yet split to cycles; 0 for ordinary legs."""
+        rows = self._x("""SELECT f.size FROM fills f WHERE f.cid = ?
+                          AND EXISTS (SELECT 1 FROM allocations a WHERE a.cid = f.cid)
+                          AND NOT EXISTS (SELECT 1 FROM fill_allocations fa WHERE fa.dedupe_key = f.dedupe_key)""",
+                       (cid,)).fetchall()
+        return sum((parse_decimal(r[0]) for r in rows), Decimal(0))
+
     def record_order_evidence(self, tx: Optional[Transaction], row: ExchangeOrderRow, *,
                               final: bool = False) -> Optional[int]:
-        """Record an active (or other non-deduped) order row for an owned order; returns its CID or None.
+        """Record an active-orders (or other non-history) row for an owned order; returns its CID or None.
 
-        Unknown rows are not adopted (their client id is remembered as foreign)."""
+        Unknown rows are not adopted (their client id is remembered as foreign). Such a row is never terminal proof:
+        ``final=True`` is refused -- terminal rows only come from ``accountInactiveOrders`` through
+        :meth:`apply_history_batch` (NG-HIST-001: WS/cancel events and active-list rows are not proof)."""
         if not isinstance(row, ExchangeOrderRow):
             raise TypeError("row must be ExchangeOrderRow")
+        if final:
+            raise ValueError("final order rows are accepted only from history (apply_history_batch), never from "
+                             "active orders or WS events")
         with self._scope(tx):
             self._require_writer()
             cid = self._attribute_order(row)
@@ -2440,7 +2529,7 @@ class NeutralGridStore:
             problems = self._order_row_problems(cid, row)
             if problems:
                 raise InvalidTransitionError(f"order evidence for {cid} conflicts: {'; '.join(problems)}")
-            self._update_order_from_row(cid, row, final=final)
+            self._update_order_from_row(cid, row, final=False)
             return cid
 
     # ---------------------------------------------------------------------------------------------- intents
@@ -2455,6 +2544,11 @@ class NeutralGridStore:
             conflicts = self._x("SELECT count(*) FROM history_conflicts WHERE resolved_at_ms IS NULL").fetchone()[0]
             unmatched = self._x("SELECT count(*) FROM history_inbox WHERE stream = 'TRADES' AND status = 'UNMATCHED' "
                                 "AND resolved_at_ms IS NULL").fetchone()[0]
+            gaps = self._x("SELECT stream, required_boundary_ts_ms, oldest_available_ts_ms FROM cursors "
+                           "WHERE retention_gap_open = 1 ORDER BY stream").fetchall()
+        for gap in gaps:
+            blockers.append(f"retention gap on {gap[0]}: required boundary {gap[1]} older than available history "
+                            f"{gap[2]}; audited manual reconciliation naming this stream required")
         if conflicts:
             blockers.append(f"{conflicts} unresolved history conflict(s)")
         if unmatched:
@@ -2508,22 +2602,8 @@ class NeutralGridStore:
                     return IntentRecord(cid=cid, outbox_id=outbox["id"], request=submit_request, leg=existing,
                                         created=False)
                 raise InvalidTransitionError(f"CID {cid} already has a different intent; use a new revision")
-            cycle = self.cycle(leg_identity.grid_id, leg_identity.cell_id, leg_identity.generation)
-            if cycle.state != "OPEN":
-                raise InvalidTransitionError("intent for a closed cycle")
             role = LegRole(leg_identity.role)
-            expected_side = cycle.entry_side if role == LegRole.ENTRY else cycle.tp_side
-            expected_price = cycle.entry_price if role == LegRole.ENTRY else cycle.tp_price
-            if side != expected_side or price != expected_price:
-                raise InvalidTransitionError(f"{role.value} must be {expected_side.value} @ {expected_price} "
-                                             f"(fixed cell prices; no recenter/clamp)")
-            if role == LegRole.ENTRY:
-                blockers = self.entry_blockers()
-                if blockers:
-                    raise EntryBlockedError("new entry exposure is blocked: " + "; ".join(blockers), blockers)
-                self._check_single_physical_entry(cycle)
-            else:
-                self._check_tp_headroom(cycle, cid, amount, allocations)
+            parts = self._intent_preconditions(leg_identity, side, price, amount, allocations, cid)
             now = self._clock_ms()
             self._x("""INSERT INTO legs(cid, grid_id, cell_id, generation, role, revision, side, price, amount,
                        order_type, reduce_only, expiry_ms, state, filled, created_at_ms, updated_at_ms)
@@ -2537,8 +2617,10 @@ class NeutralGridStore:
             self._x("INSERT INTO reservations(cid, side, amount, slots, state, created_at_ms) "
                     "VALUES (?, ?, ?, ?, 'ACTIVE', ?)",
                     (cid, side.value, canonical_decimal(res_amount), reservation.slots, now))
-            if allocations:
-                self._insert_allocations(cid, amount, allocations)
+            for grid_id, cell_id, generation, part in parts:
+                self._x("INSERT INTO allocations(cid, grid_id, cell_id, generation, amount, created_at_ms) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (cid, grid_id, cell_id, generation, canonical_decimal(part), now))
             self._transition("LEG", str(cid), None, OrderState.INTENT.value, reason or "record_intent")
             if cell_state is not None:
                 self.set_cell_state(scope, leg_identity.grid_id, leg_identity.cell_id, cell_state,
@@ -2569,12 +2651,15 @@ class NeutralGridStore:
                       [s.value for s in sorted(FINAL_ORDER_STATES, key=lambda s: s.value)]).fetchall()
         for row in own:
             reserved += parse_decimal(row["amount"]) - parse_decimal(row["filled"])
-        allocated = self._x("""SELECT a.cid, a.amount FROM allocations a JOIN legs l ON l.cid = a.cid
-                               WHERE a.grid_id = ? AND a.cell_id = ? AND a.generation = ? AND l.role = 'TP'
-                               AND l.state NOT IN (?, ?, ?)""",
-                            [cycle.grid_id, cycle.cell_id, cycle.generation] +
-                            [s.value for s in sorted(FINAL_ORDER_STATES, key=lambda s: s.value)]).fetchall()
+        allocated = self._x("""SELECT a.cid, a.amount, l.state FROM allocations a JOIN legs l ON l.cid = a.cid
+                               WHERE a.grid_id = ? AND a.cell_id = ? AND a.generation = ? AND l.role = 'TP'""",
+                            [cycle.grid_id, cycle.cell_id, cycle.generation]).fetchall()
         for row in allocated:
+            if OrderState(row["state"]) in FINAL_ORDER_STATES:
+                # a final aggregate leg can still hold executed-but-unallocated quantity (e.g. a late fill): it is
+                # neither in X nor releasable, so it conservatively counts against every cycle it may belong to
+                reserved += self._unallocated_quantity(row["cid"])
+                continue
             used = sum((parse_decimal(r[0]) for r in self._x(
                 "SELECT fa.amount FROM fill_allocations fa JOIN fills f ON f.dedupe_key = fa.dedupe_key "
                 "WHERE f.cid = ? AND fa.grid_id = ? AND fa.cell_id = ? AND fa.generation = ?",
@@ -2599,26 +2684,80 @@ class NeutralGridStore:
                        amount: Decimal, order_type: OrderTypePolicy, reduce_only: bool = False,
                        expiry_ms: Optional[int] = None, reservation: Optional[Reservation] = None,
                        cell_state: Optional[CellState] = None, reason: str = "") -> IntentRecord:
-        """``allocate_cid`` + ``record_intent`` in one transaction."""
+        """``allocate_cid`` + ``record_intent`` in one transaction. Every guard runs before the CID is allocated, so a
+        refused intent (e.g. :class:`EntryBlockedError`) writes nothing."""
         with self._scope(tx) as scope:
+            self._require_writer()
+            if self.degraded_reason is not None:
+                raise PersistenceError(f"store is degraded ({self.degraded_reason}); no new submit intents until "
+                                       f"clear_degraded()")
+            if self.cid_for(leg_identity) is None:
+                self._intent_preconditions(leg_identity, _enum(Side, side, "side"), _require_positive(price, "price"),
+                                           _require_positive(amount, "amount"), None, None)
             cid = self.allocate_cid(scope, leg_identity)
             request = SubmitRequest(client_order_id=cid, side=side, price=price, amount=amount, order_type=order_type,
                                     reduce_only=reduce_only, expiry_ms=expiry_ms)
             return self.record_intent(scope, leg_identity, request, reservation, cell_state=cell_state, reason=reason)
 
-    def _insert_allocations(self, cid: int, amount: Decimal,
-                            allocations: Sequence[Tuple[str, int, int, Decimal]]) -> None:
-        total = Decimal(0)
+    def _intent_preconditions(self, leg_identity: LegIdentity, side: Side, price: Decimal, amount: Decimal,
+                              allocations: Optional[Sequence[Tuple[str, int, int, Decimal]]],
+                              cid: Optional[int]) -> List[Tuple[str, int, int, Decimal]]:
+        """Every read-only guard of a new intent (runs before any write). Returns validated allocation parts."""
+        cycle = self.cycle(leg_identity.grid_id, leg_identity.cell_id, leg_identity.generation)
+        role = LegRole(leg_identity.role)
+        if not self._cycle_accepts(cycle, role):
+            raise InvalidTransitionError("intent for a closed cycle (only an audited late obligation of a released "
+                                         "cycle may still get a TP)")
+        expected_side = cycle.entry_side if role == LegRole.ENTRY else cycle.tp_side
+        expected_price = cycle.entry_price if role == LegRole.ENTRY else cycle.tp_price
+        if side != expected_side or price != expected_price:
+            raise InvalidTransitionError(f"{role.value} must be {expected_side.value} @ {expected_price} "
+                                         f"(fixed cell prices; no recenter/clamp)")
+        parts = self._validated_allocations(role, side, price, amount, allocations)
+        if role == LegRole.ENTRY:
+            if amount != cycle.planned_amount:
+                raise InvalidTransitionError(f"ENTRY amount {amount} must equal the cycle's planned amount "
+                                             f"{cycle.planned_amount} (one physical entry, never glued or resized)")
+            blockers = self.entry_blockers()
+            if blockers:
+                raise EntryBlockedError("new entry exposure is blocked: " + "; ".join(blockers), blockers)
+            self._check_single_physical_entry(cycle)
+        else:
+            self._check_tp_headroom(cycle, cid, amount, parts or None)
+        return parts
+
+    def _cycle_accepts(self, cycle: CycleRecord, role: LegRole) -> bool:
+        """OPEN cycles accept legs; a released cycle accepts only a TP for its audited late obligation (E > X)."""
+        if cycle.state == "OPEN":
+            return True
+        return role == LegRole.TP and cycle.late_evidence == 2 and cycle.entry_filled > cycle.exit_filled
+
+    def _validated_allocations(self, role: LegRole, side: Side, price: Decimal, amount: Decimal,
+                               allocations: Optional[Sequence[Tuple[str, int, int, Decimal]]]
+                               ) -> List[Tuple[str, int, int, Decimal]]:
+        """Aggregation is only for TP remainders with the same TP side and fixed TP price (AC-33/AC-39)."""
+        if not allocations:
+            return []
+        if role != LegRole.TP:
+            raise InvalidTransitionError("ENTRY intents cannot carry allocations (no glued physical entries)")
+        parts, seen, total = [], set(), Decimal(0)
         for grid_id, cell_id, generation, part in allocations:
             part_d = _require_positive(part, "allocation amount")
-            if self.cycle(grid_id, cell_id, generation).state != "OPEN":
-                raise InvalidTransitionError("allocation to a closed cycle")
+            if (grid_id, cell_id, generation) in seen:
+                raise ValueError(f"duplicate allocation target {grid_id}/{cell_id}/{generation}")
+            seen.add((grid_id, cell_id, generation))
+            target = self.cycle(grid_id, cell_id, generation)
+            if not self._cycle_accepts(target, LegRole.TP):
+                raise InvalidTransitionError(f"allocation to closed cycle {grid_id}/{cell_id}/{generation}")
+            if target.tp_side != side or target.tp_price != price:
+                raise InvalidTransitionError(
+                    f"allocation target {grid_id}/{cell_id}/{generation} must have the same TP side and price "
+                    f"({target.tp_side.value} @ {target.tp_price} != {side.value} @ {price})")
             total += part_d
-            self._x("INSERT INTO allocations(cid, grid_id, cell_id, generation, amount, created_at_ms) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (cid, grid_id, cell_id, generation, canonical_decimal(part_d), self._clock_ms()))
+            parts.append((grid_id, cell_id, generation, part_d))
         if total != amount:
             raise ValueError(f"allocations sum {total} != order amount {amount}")
+        return parts
 
     @staticmethod
     def _outbox(row: sqlite3.Row) -> OutboxRecord:
@@ -2658,25 +2797,31 @@ class NeutralGridStore:
         """Commit "transport is about to be called" before calling it. After this the outcome is unknown until
         a result or history evidence: the leg becomes SUBMIT_UNKNOWN (cancel: CANCEL_UNKNOWN).
 
-        ``resend_same_cid`` re-dispatches a DONE/UNKNOWN row with the SAME CID; only allowed when the engine
-        relies on documented venue idempotence of that CID. A new CID is never issued here.
+        Only a PENDING row may be dispatched without ``resend_same_cid``. A DISPATCHED row (transport possibly
+        called, e.g. by a process that died) and a DONE/UNKNOWN row are re-dispatched only with
+        ``resend_same_cid=True`` -- the SAME CID, allowed only when the engine relies on documented venue idempotence
+        -- and every dispatch increments ``attempts`` and appends an ``outbox_attempts`` row. A degraded store refuses
+        every submit dispatch. A new CID is never issued here.
         """
         with self._scope(tx) as scope:
             self._require_writer()
             entry = self.outbox_entry(outbox_id)
-            if entry.status == "DISPATCHED":
-                return entry
+            if entry.kind == KIND_SUBMIT and self.degraded_reason is not None:
+                raise PersistenceError(f"store is degraded ({self.degraded_reason}); refusing to dispatch submit")
+            if entry.status == "DISPATCHED" and not resend_same_cid:
+                raise InvalidTransitionError(f"outbox {outbox_id} was already dispatched (outcome unknown); only an "
+                                             f"explicit resend_same_cid may call transport again")
             if entry.status == "DONE":
                 if not (resend_same_cid and entry.outcome == TransportOutcome.UNKNOWN):
                     raise InvalidTransitionError(f"outbox {outbox_id} already has result {entry.outcome}")
             leg = self.leg(entry.cid)
             if leg.final:
                 raise InvalidTransitionError(f"leg {leg.cid} is final ({leg.state.value})")
-            if entry.kind == KIND_SUBMIT and self.degraded_reason is not None:
-                raise PersistenceError(f"store is degraded ({self.degraded_reason}); refusing to dispatch submit")
             now = self._clock_ms()
             self._x("UPDATE outbox SET status = 'DISPATCHED', attempts = attempts + 1, dispatched_at_ms = ?, "
                     "outcome = NULL, outcome_detail = NULL, result_at_ms = NULL WHERE id = ?", (now, outbox_id))
+            self._x("INSERT INTO outbox_attempts(outbox_id, attempt, dispatched_at_ms) VALUES (?, ?, ?)",
+                    (outbox_id, entry.attempts + 1, now))
             if entry.kind == KIND_SUBMIT:
                 self._x("UPDATE orders SET submission_state = 'DISPATCHED', updated_at_ms = ? WHERE cid = ?",
                         (now, leg.cid))
@@ -2722,14 +2867,22 @@ class NeutralGridStore:
 
     def record_transport_result(self, tx: Optional[Transaction], cid: int, result: TransportResult, *,
                                 kind: str = KIND_SUBMIT, leg_state: Optional[OrderState] = None) -> OutboxRecord:
-        """Durably record what transport returned. Only NOT_SENT (proven no transport call) and a documented
-        DEFINITIVE_REJECT_ZERO_FILL release the reservation; UNKNOWN keeps it (NG-DB-005, AC-56)."""
+        """Durably record what transport returned (NG-DB-005, AC-56).
+
+        Every dispatched attempt keeps its own outcome in ``outbox_attempts``. For a SUBMIT, NOT_SENT (proven: no
+        transport call) and DEFINITIVE_REJECT_ZERO_FILL release the intent only when the CID cannot be at the venue:
+        the first attempt of a row that was never resent, no earlier UNKNOWN, no fills and no venue evidence
+        (acceptance, exchange order id, a recorded venue row, a LIVE leg). In every other case the CID may already be
+        resting on the venue, so the leg stays SUBMIT_UNKNOWN (or its evidenced state), the reservation is kept and
+        the row's effective outcome is UNKNOWN. UNKNOWN never releases anything.
+        """
         self.fault_point("after_transport_before_result_commit")
         if not isinstance(result, TransportResult):
             raise TypeError("result must be TransportResult")
         outcome = _enum(TransportOutcome, result.outcome, "transport outcome")
         if kind not in (KIND_SUBMIT, KIND_CANCEL):
             raise ValueError("kind must be SUBMIT or CANCEL")
+        detail = result.detail or ""
         with self._scope(tx) as scope:
             self._require_writer()
             row = self._x("SELECT * FROM outbox WHERE cid = ? AND kind = ? AND status != 'DONE' ORDER BY id DESC "
@@ -2737,8 +2890,7 @@ class NeutralGridStore:
             if row is None:
                 done = self._x("SELECT * FROM outbox WHERE cid = ? AND kind = ? ORDER BY id DESC LIMIT 1",
                                (cid, kind)).fetchone()
-                if done is not None and done["outcome"] == outcome.value and \
-                        (done["outcome_detail"] or "") == (result.detail or ""):
+                if done is not None and self._same_last_result(self._outbox(done), outcome, detail):
                     if leg_state is not None:  # replayed result + refinement: still evidence-checked
                         self.set_leg_state(scope, cid, leg_state, reason=f"{kind} transport {outcome.value}")
                     return self._outbox(done)
@@ -2749,23 +2901,33 @@ class NeutralGridStore:
                                              f"have been called")
             leg = self.leg(cid)
             order = self.order(cid)
+            if result.exchange_order_id and order.exchange_order_id and \
+                    order.exchange_order_id != result.exchange_order_id:
+                raise InvalidTransitionError(f"CID {cid}: exchange order id {result.exchange_order_id} differs "
+                                             f"from recorded {order.exchange_order_id}")
+            releasing = outcome in (TransportOutcome.NOT_SENT, TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL)
             now = self._clock_ms()
+            effective, effective_detail = outcome, detail
             target: Optional[OrderState] = None
             if kind == KIND_SUBMIT:
-                submission = {TransportOutcome.NOT_SENT: "REJECTED_UNSENT", TransportOutcome.ACCEPTED: "ACCEPTED",
-                              TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL: "REJECTED_ZERO_FILL",
-                              TransportOutcome.UNKNOWN: "UNKNOWN"}[outcome]
-                if outcome in (TransportOutcome.NOT_SENT, TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL) and \
-                        (leg.filled != 0 or self._fill_count(cid)):
+                if releasing and (leg.filled != 0 or self._fill_count(cid)):
                     raise InvalidTransitionError(f"CID {cid} has fills; {outcome.value} contradicts history")
-                if outcome == TransportOutcome.NOT_SENT:
-                    target = OrderState.REJECTED_UNSENT
-                elif outcome == TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL:
-                    target = OrderState.REJECTED_ZERO_FILL
-                elif outcome == TransportOutcome.ACCEPTED:
+                if releasing:
+                    blocker = self._release_blocker(entry, leg, order)
+                    if blocker is not None:
+                        effective = TransportOutcome.UNKNOWN
+                        effective_detail = f"{outcome.value} on attempt {entry.attempts} not accepted as release " \
+                                           f"({blocker}): {detail}"
+                if effective == TransportOutcome.NOT_SENT:
+                    target, submission = OrderState.REJECTED_UNSENT, "REJECTED_UNSENT"
+                elif effective == TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL:
+                    target, submission = OrderState.REJECTED_ZERO_FILL, "REJECTED_ZERO_FILL"
+                elif effective == TransportOutcome.ACCEPTED:
                     target = OrderState.LIVE if leg.state in (OrderState.INTENT, OrderState.SUBMIT_UNKNOWN) else None
+                    submission = "ACCEPTED"
                 else:
                     target = OrderState.SUBMIT_UNKNOWN if leg.state == OrderState.INTENT else None
+                    submission = "ACCEPTED" if order.submission_state == "ACCEPTED" else "UNKNOWN"
                 self._x("UPDATE orders SET submission_state = ?, updated_at_ms = ? WHERE cid = ?",
                         (submission, now, cid))
             else:
@@ -2773,7 +2935,7 @@ class NeutralGridStore:
                                 TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL: "REJECTED",
                                 TransportOutcome.UNKNOWN: "UNKNOWN"}[outcome]
                 cancelling = (OrderState.CANCEL_PENDING, OrderState.CANCEL_UNKNOWN)
-                if outcome in (TransportOutcome.NOT_SENT, TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL):
+                if releasing:
                     target = OrderState(entry.prev_leg_state) if leg.state in cancelling and entry.prev_leg_state \
                         else None
                 elif outcome == TransportOutcome.ACCEPTED:
@@ -2783,20 +2945,51 @@ class NeutralGridStore:
                     target = OrderState.CANCEL_UNKNOWN if leg.state == OrderState.CANCEL_PENDING else None
                 self._x("UPDATE orders SET cancel_state = ?, updated_at_ms = ? WHERE cid = ?",
                         (cancel_state, now, cid))
-            if result.exchange_order_id:
-                if order.exchange_order_id and order.exchange_order_id != result.exchange_order_id:
-                    raise InvalidTransitionError(f"CID {cid}: exchange order id {result.exchange_order_id} differs "
-                                                 f"from recorded {order.exchange_order_id}")
+            if result.exchange_order_id and not order.exchange_order_id:
                 self._x("UPDATE orders SET exchange_order_id = ? WHERE cid = ?", (result.exchange_order_id, cid))
             if target is not None and not leg.final:
-                self._set_leg_state_raw(leg, target, f"{kind} transport {outcome.value}")
+                self._set_leg_state_raw(leg, target, f"{kind} transport {effective.value}")
             if leg_state is not None:  # engine refinement: same evidence rules as set_leg_state
-                self.set_leg_state(scope, cid, leg_state, reason=f"{kind} transport {outcome.value}")
+                self.set_leg_state(scope, cid, leg_state, reason=f"{kind} transport {effective.value}")
+            if entry.attempts >= 1:
+                self._x("UPDATE outbox_attempts SET outcome = ?, outcome_detail = ?, result_at_ms = ? "
+                        "WHERE outbox_id = ? AND attempt = ?", (outcome.value, detail or None, now, entry.id,
+                                                                entry.attempts))
             self._x("UPDATE outbox SET status = 'DONE', outcome = ?, outcome_detail = ?, result_at_ms = ? WHERE id = ?",
-                    (outcome.value, result.detail or None, now, entry.id))
+                    (effective.value, effective_detail or None, now, entry.id))
             self.fault_hooks.hit("before_result_commit")
             scope.after_commit("after_result_commit")
             return self.outbox_entry(entry.id)
+
+    def _release_blocker(self, entry: OutboxRecord, leg: LegRecord, order: OrderRecord) -> Optional[str]:
+        """Why a NOT_SENT / zero-fill reject may NOT finalise this submit (None = it may)."""
+        if entry.attempts > 1:
+            return "the CID was resent after an unknown outcome"
+        earlier = self._x("SELECT count(*) FROM outbox_attempts WHERE outbox_id = ? AND attempt < ? "
+                          "AND (outcome IS NULL OR outcome != 'NOT_SENT')", (entry.id, max(entry.attempts, 1))
+                          ).fetchone()[0]
+        if earlier:
+            return "an earlier attempt may have reached the venue"
+        if leg.state not in (OrderState.INTENT, OrderState.SUBMIT_UNKNOWN):
+            return f"leg is {leg.state.value}"
+        if order.submission_state == "ACCEPTED" or order.exchange_order_id or order.last_evidence_ms is not None:
+            return "the venue already reported this CID"
+        return None
+
+    def _same_last_result(self, entry: OutboxRecord, outcome: TransportOutcome, detail: str) -> bool:
+        if entry.attempts >= 1:
+            attempt = self._x("SELECT outcome, outcome_detail FROM outbox_attempts WHERE outbox_id = ? AND attempt = ?",
+                              (entry.id, entry.attempts)).fetchone()
+            if attempt is not None:
+                return attempt[0] == outcome.value and (attempt[1] or "") == detail
+        return entry.outcome == outcome and (entry.outcome_detail or "") == detail
+
+    def outbox_attempts(self, outbox_id: int) -> List[Dict[str, Any]]:
+        """Every transport attempt of an outbox row with its own outcome (a resend never erases the earlier one)."""
+        with self._rlock:
+            self._require_open()
+            rows = self._x("SELECT * FROM outbox_attempts WHERE outbox_id = ? ORDER BY attempt", (outbox_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     # ---------------------------------------------------------------------------------------------- reservations
 
@@ -2833,8 +3026,9 @@ class NeutralGridStore:
         client = _row_client_id(row)
         if client is not None and self._x("SELECT 1 FROM cid_map WHERE cid = ?", (client,)).fetchone():
             return client
-        if row.order_id:
-            found = self._x("SELECT cid FROM orders WHERE exchange_order_id = ?", (row.order_id,)).fetchall()
+        exchange_id = row.order_id or row.order_index
+        if exchange_id:
+            found = self._x("SELECT cid FROM orders WHERE exchange_order_id = ?", (exchange_id,)).fetchall()
             if len(found) == 1:
                 return found[0][0]
         return None
@@ -2875,13 +3069,14 @@ class NeutralGridStore:
                    nonce = COALESCE(?, nonce), venue_status = ?, venue_filled = ?, venue_remaining = ?,
                    venue_final = MAX(venue_final, ?), venue_row_json = ?, last_evidence_ms = ?, updated_at_ms = ?
                    WHERE cid = ?""",
-                (row.order_id, row.order_index, row.nonce, row.status, canonical_decimal(row.filled_base_amount),
+                (row.order_id or row.order_index, row.order_index, row.nonce, row.status,
+                 canonical_decimal(row.filled_base_amount),
                  canonical_decimal(row.remaining_base_amount), int(final), row.raw_json, row.timestamp_ms,
                  self._clock_ms(), cid))
 
     def _conflict(self, result: HistoryBatchResult, kind: str, inbox_id: Optional[int], cid: Optional[int],
-                  detail: str) -> None:
-        conflict_key = f"{kind}:{inbox_id}:{cid}"
+                  detail: str, discriminator: str = "") -> None:
+        conflict_key = f"{kind}:{inbox_id}:{cid}" + (f":{discriminator}" if discriminator else "")
         cursor = self._x("INSERT OR IGNORE INTO history_conflicts(conflict_key, kind, inbox_id, cid, detail, "
                          "created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
                          (conflict_key, kind, inbox_id, cid, detail, self._clock_ms()))
@@ -2974,7 +3169,8 @@ class NeutralGridStore:
         if isinstance(row, ExchangeTradeRow):
             canonical, native = trade_dedupe_key(domain, row), tuple(row.dedupe_key(domain))
         elif isinstance(row, ExchangeOrderRow):
-            canonical, native = order_dedupe_key(domain, row), None
+            canonical = order_dedupe_key(domain, row)
+            native = (domain, row.account_index, row.market_id, _row_exchange_id(row))
         else:
             raise TypeError(f"unsupported history row {type(row).__name__}")
         if given != canonical and (native is None or tuple(given) != native):
@@ -3084,7 +3280,8 @@ class NeutralGridStore:
             return
         now = self._clock_ms()
         cycle = self.cycle(leg.grid_id, leg.cell_id, leg.generation)
-        late = leg.final or cycle.state == "COMPLETE"
+        # a non-final TP on a released cycle is the audited cover of its late obligation, not late evidence
+        late = leg.final or (cycle.state == "COMPLETE" and leg.role == LegRole.ENTRY)
         if row.own_exchange_order_id and not order.exchange_order_id:
             self._x("UPDATE orders SET exchange_order_id = ? WHERE cid = ?", (row.own_exchange_order_id, cid))
         self._x("""INSERT INTO fills(dedupe_key, domain, account_index, market_id, trade_id_str, own_side,
@@ -3145,8 +3342,10 @@ class NeutralGridStore:
         if leg.filled > order.venue_filled:
             inbox = self._x("SELECT id FROM history_inbox WHERE stream = 'INACTIVE_ORDERS' AND cid = ? "
                             "AND status = 'APPLIED' ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
+            # keyed by the excess cumulative: a further excess after an audited resolution is flagged again
             self._conflict(result, "CUMULATIVE_EXCEEDS_ORDER", inbox[0] if inbox else None, cid,
-                           f"trade cumulative {leg.filled} > terminal order cumulative {order.venue_filled}")
+                           f"trade cumulative {leg.filled} > terminal order cumulative {order.venue_filled}",
+                           discriminator=canonical_decimal(leg.filled))
 
     def _apply_cursor_update(self, update: CursorUpdate) -> None:
         if update.stream not in STREAMS:
@@ -3175,6 +3374,19 @@ class NeutralGridStore:
             if value is not None:
                 sets.append(f"{column} = ?")
                 params.append(_require_text(value, column, 4096))
+        required = update.required_boundary_ts_ms if update.required_boundary_ts_ms is not None \
+            else current.required_boundary_ts_ms
+        oldest = update.oldest_available_ts_ms if update.oldest_available_ts_ms is not None \
+            else current.oldest_available_ts_ms
+        gap = current.retention_gap_open
+        if (update.required_boundary_ts_ms is not None or update.oldest_available_ts_ms is not None) \
+                and required is not None and oldest is not None and required < oldest:
+            gap = True  # AC-53: the required overlap boundary is older than the retained history
+            sets.append("retention_gap_open = 1")
+        if update.complete is True and gap:
+            raise InvalidTransitionError(f"{update.stream} has a retention gap (required boundary {required} < "
+                                         f"oldest available {oldest}); it cannot be complete until an audited "
+                                         f"manual reconciliation names this stream")
         if update.complete is True:
             sets.extend(["complete = 1", "incomplete_reason = NULL"])
         elif update.complete is False:
@@ -3227,7 +3439,9 @@ class NeutralGridStore:
                 raise InvalidTransitionError(f"fill {dedupe_key} already allocated differently")
             if sum((a for *_, a in normalized), Decimal(0)) != fill.size or any(a <= 0 for *_, a in normalized):
                 raise ValueError("allocation parts must be positive and sum to the fill size")
-            for grid_id, cell_id, generation, amount in normalized:
+            if len({(g, c, n) for g, c, n, _ in normalized}) != len(normalized):
+                raise ValueError("allocation parts must name distinct cycles")
+            for grid_id, cell_id, generation, amount in normalized:  # validate every part before the first write
                 cap = allowed.get((grid_id, cell_id, generation))
                 if cap is None:
                     raise InvalidTransitionError(f"cycle {grid_id}/{cell_id}/{generation} is not allocated to CID "
@@ -3238,6 +3452,7 @@ class NeutralGridStore:
                     (fill.cid, grid_id, cell_id, generation))), Decimal(0))
                 if used + amount > cap:
                     raise InvalidTransitionError(f"allocation to {grid_id}/{cell_id}/{generation} exceeds {cap}")
+            for grid_id, cell_id, generation, amount in normalized:
                 self._x("INSERT INTO fill_allocations(dedupe_key, grid_id, cell_id, generation, amount) "
                         "VALUES (?, ?, ?, ?, ?)", (dedupe_key, grid_id, cell_id, generation, canonical_decimal(amount)))
                 self._credit_cycle(grid_id, cell_id, generation, fill.role, amount)
@@ -3279,7 +3494,8 @@ class NeutralGridStore:
                             required_boundary_marker=row["required_boundary_marker"],
                             oldest_available_ts_ms=row["oldest_available_ts_ms"], complete=bool(row["complete"]),
                             incomplete_reason=row["incomplete_reason"], last_full_scan_ms=row["last_full_scan_ms"],
-                            revision=row["revision"], updated_at_ms=row["updated_at_ms"])
+                            revision=row["revision"], updated_at_ms=row["updated_at_ms"],
+                            retention_gap_open=bool(row["retention_gap_open"]))
 
     def cursor(self, stream: str) -> CursorRecord:
         with self._rlock:
@@ -3390,38 +3606,33 @@ class NeutralGridStore:
                                      resolved_conflict_ids: Sequence[int] = (),
                                      resolved_inbox_ids: Sequence[int] = (),
                                      leg_resolutions: Optional[Mapping[int, OrderState]] = None,
+                                     resolved_retention_gaps: Sequence[str] = (),
                                      clear_manual_reconcile: bool = True) -> int:
-        """Audited operator reconciliation (NG-DB-004, AC-53/54). Resolves the listed conflicts/unmatched rows and
-        leg states with the operator's evidence. It never resets the ledger, never changes the baseline, cells or
-        fill quantities, and keeps every row it resolves."""
+        """Audited operator reconciliation (NG-DB-004, AC-53/54). Resolves the listed conflicts/unmatched rows,
+        leg states and retention gaps with the operator's evidence. A retention gap is cleared ONLY when its stream
+        is named in ``resolved_retention_gaps`` (clearing the generic manual-reconcile flag does not lift it). It
+        never resets the ledger, never changes the baseline, cells or fill quantities, and keeps every row it
+        resolves. Every argument is validated before anything is written."""
         _require_text(actor, "actor")
         _require_text(reason, "reason", 2000)
         if not isinstance(evidence, Mapping) or not evidence:
             raise ValueError("manual reconciliation requires non-empty evidence")
         resolutions = {int(cid): _enum(OrderState, state, "leg resolution")
                        for cid, state in (leg_resolutions or {}).items()}
+        gaps = list(resolved_retention_gaps)
         with self._scope(tx):
             self._require_writer()
-            audit_id = self._audit("manual_reconcile", actor, {
-                "reason": reason, "evidence": dict(evidence), "resolved_conflict_ids": list(resolved_conflict_ids),
-                "resolved_inbox_ids": list(resolved_inbox_ids),
-                "leg_resolutions": {str(k): v.value for k, v in resolutions.items()}})
-            now = self._clock_ms()
-            tag = f"manual_reconcile:{audit_id}"
+            conflicts = []
             for conflict_id in resolved_conflict_ids:
                 row = self._x("SELECT * FROM history_conflicts WHERE id = ?", (conflict_id,)).fetchone()
                 if row is None:
                     raise KeyError(f"unknown conflict {conflict_id}")
-                self._x("UPDATE history_conflicts SET resolved_at_ms = ?, resolution = ? WHERE id = ? "
-                        "AND resolved_at_ms IS NULL", (now, tag, conflict_id))
-                if row["kind"] == "LATE_FILL" and row["cid"] is not None:
-                    leg = self.leg(row["cid"])
-                    self._x("UPDATE cycles SET late_evidence = 2 WHERE grid_id = ? AND cell_id = ? AND generation = ?",
-                            (leg.grid_id, leg.cell_id, leg.generation))
+                conflicts.append(row)
             for inbox_id in resolved_inbox_ids:
-                if self._x("UPDATE history_inbox SET resolved_at_ms = ?, resolution = ? WHERE id = ? "
-                           "AND resolved_at_ms IS NULL", (now, tag, inbox_id)).rowcount != 1:
+                if self._x("SELECT 1 FROM history_inbox WHERE id = ? AND resolved_at_ms IS NULL",
+                           (inbox_id,)).fetchone() is None:
                     raise KeyError(f"inbox row {inbox_id} unknown or already resolved")
+            legs = {}
             for cid, state in resolutions.items():
                 leg = self.leg(cid)
                 if leg is None:
@@ -3430,10 +3641,38 @@ class NeutralGridStore:
                     raise InvalidTransitionError(f"leg {cid} is final ({leg.state.value})")
                 if state in _REJECTED_STATES and (leg.filled != 0 or self._fill_count(cid)):
                     raise InvalidTransitionError(f"leg {cid} has fills; cannot resolve as zero-fill")
-                self._set_leg_state_raw(leg, state, tag)
+                if state in FINAL_ORDER_STATES and self._unallocated_quantity(cid):
+                    raise InvalidTransitionError(f"leg {cid} has unallocated aggregate fills; allocate them first")
+                legs[cid] = leg
+            for stream in gaps:
+                if stream not in STREAMS:
+                    raise ValueError(f"unknown stream {stream!r}")
+                if not self.cursor(stream).retention_gap_open:
+                    raise InvalidTransitionError(f"{stream} has no open retention gap")
+            audit_id = self._audit("manual_reconcile", actor, {
+                "reason": reason, "evidence": dict(evidence), "resolved_conflict_ids": list(resolved_conflict_ids),
+                "resolved_inbox_ids": list(resolved_inbox_ids),
+                "leg_resolutions": {str(k): v.value for k, v in resolutions.items()},
+                "resolved_retention_gaps": gaps})
+            now = self._clock_ms()
+            tag = f"manual_reconcile:{audit_id}"
+            for row in conflicts:
+                self._x("UPDATE history_conflicts SET resolved_at_ms = ?, resolution = ? WHERE id = ? "
+                        "AND resolved_at_ms IS NULL", (now, tag, row["id"]))
+                if row["kind"] == "LATE_FILL" and row["cid"] is not None:
+                    leg = self.leg(row["cid"])
+                    self._x("UPDATE cycles SET late_evidence = 2 WHERE grid_id = ? AND cell_id = ? AND generation = ?",
+                            (leg.grid_id, leg.cell_id, leg.generation))
+            for inbox_id in resolved_inbox_ids:
+                self._x("UPDATE history_inbox SET resolved_at_ms = ?, resolution = ? WHERE id = ?", (now, tag, inbox_id))
+            for cid, state in resolutions.items():
+                self._set_leg_state_raw(legs[cid], state, tag)
                 self._x("UPDATE outbox SET status = 'DONE', outcome = COALESCE(outcome, 'UNKNOWN'), "
                         "outcome_detail = ?, result_at_ms = COALESCE(result_at_ms, ?) WHERE cid = ? AND status != 'DONE'",
                         (tag, now, cid))
+            for stream in gaps:
+                self._x("UPDATE cursors SET retention_gap_open = 0, revision = revision + 1, updated_at_ms = ? "
+                        "WHERE stream = ?", (now, stream))
             if clear_manual_reconcile:
                 self._x("UPDATE engine SET manual_reconcile_required = 0, manual_reconcile_reason = NULL, "
                         "reconciliation_revision = reconciliation_revision + 1, updated_at_ms = ? WHERE id = 1", (now,))
@@ -3450,14 +3689,18 @@ class NeutralGridStore:
         observed = canonical_decimal(observed_position, "observed_position")
         with self._scope(tx):
             self._require_writer()
+            for inbox_id in resolved_inbox_ids:
+                if self._x("SELECT 1 FROM history_inbox WHERE id = ? AND status = 'UNMATCHED' "
+                           "AND resolved_at_ms IS NULL", (inbox_id,)).fetchone() is None:
+                    raise KeyError(f"inbox row {inbox_id} is not an unresolved unmatched row")
+            new_text = None if new_baseline is None else canonical_decimal(new_baseline, "new_baseline")
             ledger = self.position_ledger()
             payload = {"reason": reason, "observed_position": observed, "baseline": ledger.baseline,
                        "confirmed_buys": ledger.confirmed_buys, "confirmed_sells": ledger.confirmed_sells,
                        "ledger_net": ledger.net, "new_baseline": new_baseline,
                        "resolved_inbox_ids": list(resolved_inbox_ids)}
             audit_id = self._audit("baseline_audit", actor, payload)
-            if new_baseline is not None:
-                new_text = canonical_decimal(new_baseline, "new_baseline")
+            if new_text is not None:
                 if Decimal(new_text) != ledger.baseline:
                     self._x("INSERT INTO baseline_adjustments(at_ms, actor, reason, old_baseline, new_baseline, "
                             "observed_position, audit_event_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3465,10 +3708,8 @@ class NeutralGridStore:
                              audit_id))
             now = self._clock_ms()
             for inbox_id in resolved_inbox_ids:
-                if self._x("UPDATE history_inbox SET resolved_at_ms = ?, resolution = ? WHERE id = ? "
-                           "AND status = 'UNMATCHED' AND resolved_at_ms IS NULL",
-                           (now, f"baseline_audit:{audit_id}", inbox_id)).rowcount != 1:
-                    raise KeyError(f"inbox row {inbox_id} is not an unresolved unmatched row")
+                self._x("UPDATE history_inbox SET resolved_at_ms = ?, resolution = ? WHERE id = ?",
+                        (now, f"baseline_audit:{audit_id}", inbox_id))
             self._x("UPDATE engine SET engine_revision = engine_revision + 1, updated_at_ms = ? WHERE id = 1", (now,))
             return audit_id
 
@@ -3698,7 +3939,8 @@ class NeutralGridStore:
         grid = self.grid() if engine.current_grid_id else None
         cells = self.cells(grid.grid_id) if grid else []
         open_cycles = self.open_cycles()
-        legs = [leg for cycle in open_cycles
+        late_cycles = self.late_obligation_cycles()
+        legs = [leg for cycle in open_cycles + late_cycles
                 for leg in self.legs(grid_id=cycle.grid_id, cell_id=cycle.cell_id, generation=cycle.generation)]
         known = {leg.cid for leg in legs}
         legs.extend(leg for leg in self.legs(non_final_only=True) if leg.cid not in known)
@@ -3710,7 +3952,7 @@ class NeutralGridStore:
                            cursors=self.cursors(), open_conflicts=self.open_conflicts(),
                            unmatched=self.unmatched_evidence(),
                            position=self.position_ledger() if engine.bootstrapped else None,
-                           entry_blockers=self.entry_blockers(), queued_commands=queued)
+                           entry_blockers=self.entry_blockers(), queued_commands=queued, late_cycles=late_cycles)
 
 
 def _command_client_authorizer(action: int, arg1: Optional[str], arg2: Optional[str], db_name: Optional[str],

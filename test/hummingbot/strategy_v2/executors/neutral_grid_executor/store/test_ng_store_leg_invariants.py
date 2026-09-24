@@ -11,7 +11,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     TransportOutcome,
     TransportResult,
 )
-from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MIGRATIONS, Migration
+from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import LATEST_VERSION, MIGRATIONS, Migration
 from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     EngineIdentity,
     IdentityMismatchError,
@@ -184,11 +184,11 @@ def test_resend_is_refused_while_degraded(env, store):
 def test_foreign_database_is_not_migrated_before_identity_check(env):
     env.open().close()
     other = EngineIdentity(connector_name=DOMAIN, connector_domain=DOMAIN, account_index=99, trading_pair="LIT-USDG")
-    v2 = Migration(2, "add_example", "CREATE TABLE example_v2 (id INTEGER PRIMARY KEY) STRICT;")
+    nxt = Migration(LATEST_VERSION + 1, "add_example", "CREATE TABLE example_next (id INTEGER PRIMARY KEY) STRICT;")
     with pytest.raises(IdentityMismatchError):
-        NeutralGridStore.open(env.db, other, lock_dir=env.locks, clock_ms=env.clock, migrations=MIGRATIONS + (v2,))
+        NeutralGridStore.open(env.db, other, lock_dir=env.locks, clock_ms=env.clock, migrations=MIGRATIONS + (nxt,))
     raw = sqlite3.connect(str(env.db))
     try:
-        assert raw.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == LATEST_VERSION
     finally:
         raw.close()
