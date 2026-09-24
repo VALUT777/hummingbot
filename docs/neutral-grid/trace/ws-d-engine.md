@@ -203,6 +203,44 @@ risk/admission/router (`E ng_engine_harness.py`); nothing restates the implement
     `store.mark_retention_gap(stream, required_boundary, oldest_available)`; while a gap is open the engine never
     writes `complete=True` for that stream; `ack_retention_gap` passes `resolved_retention_gaps=[open streams]`.
 
+## Review package 1 (engine @ `bcd2eebef`: lifecycle / risk / router / dispatch + web contract)
+
+Merged first: `codex/ng-engine` fast-forwarded to `codex/ng-web` @ `b693ac615`, which already contains
+`codex/neutral-grid-implementation` @ `bb49f434e`, `codex/ng-store` @ `3d0a4d162` and this branch.
+Red evidence: the tests were committed at `16b837428` against the unchanged engine and
+`test_ng_engine_review1.py` fails there **26/28** for the reported reasons (the two passing ones are the #14
+test-gap item and a harness contract check). The final test file was re-run against the `16b837428` engine
+in a scratch worktree with the same result, and it passes 28/28 with the fixes. Test-gap items are proven by
+mutation: (#14) "release ignores the position condition" is killed by the #14 test; (#15) "an in-progress walk
+counts as complete" is killed by the rewritten restart test and survived the old one.
+
+| # | Finding | Fix | Test(s) (red before → green after) |
+|---|---|---|---|
+| 1 | TP SLO measured with the tick-start clock, anchored to the first (below-minimum) fill; transports awaited before later TP intents; entry cancels before TPs | SLO clock starts at the history commit of the fill that made the obligation dispatchable (`_cell_fill_commit_ms`); latency stamped at the actual intent commit; every router-approved TP intent is committed before any transport (`_commit_intent`), and TP transports go before withdrawals, resumed intents, cancels and entries | `E test_ng_engine_review1.py::test_r01_every_tp_intent_commits_within_slo_although_each_transport_takes_time` (fake transport latency 0.4 s: red 4 400 ms > 2 000 ms); `E test_ng_engine_review1.py::test_r01_tp_transports_are_sent_before_entry_cancels`; `E test_ng_engine_review1.py::test_r01_slo_clock_starts_when_the_obligation_becomes_dispatchable` (red 60.0 s) |
+| 2 | One cell's history conflict / any store-ledger refusal withheld every cell's TP and the outside-bounds cancels | TP blocking scoped per cell (`tp_blocked_cells`: store conflicts naming a CID; under LEDGER_INVARIANT only cells failing `check_invariants`/`verify_ledger`); risk-reducing cancels (outside bounds, cancel retries, unsent cancels) flow in every non-persistence-failure state; entries stay blocked globally (FROZEN) | `E test_ng_engine_review1.py::test_r02_one_cells_history_conflict_does_not_withhold_other_cells_tps_or_risk_cancels`; `E test_ng_engine_review1.py::test_r02_ledger_invariant_freeze_keeps_tps_of_exact_cells_and_outside_bounds_cancels` |
+| 3 + 17 | Drift judged on a position read that predates the same tick's fill commit; release used last tick's flag | Reads and commits carry a causal sequence (`position_seq`, `active_seq`, `fills_commit_seq`) and request-time stamps; drift and NG-CELL-001 (5) only on a position requested after the latest fill commit; `_settle` recomputes reconciliation; when a release waits only on (5) the position is re-read after the commit (weight-budgeted) | `E test_ng_engine_review1.py::test_r03_position_read_before_the_same_ticks_history_commit_is_not_drift` (red: false "position drift", RISK_BLOCKED); `E test_ng_engine_review1.py::test_r17_release_needs_a_position_read_after_the_closing_fill_commit` (red: released at tick 5 with read 0 while P = 10) |
+| 4 | Failing rules refresh retried every tick, starving history | Exponential backoff (2 s → 60 s); the rules read is lower priority (only with one page of each stream + one account poll left) and bounded to what the poll/scan cadence leaves of the budget (≥ 1 read/min) | `E test_ng_engine_review1.py::test_r04_failing_rules_refresh_backs_off_and_does_not_starve_history` (red: 46 rules calls / 120 s) |
+| 5 | Runtime minimum decrease: small partial fills split into many TPs → emergency cancels of other cells' entries | Entry intent stores the arming-time minimum TP (`OrderMeta.arming_min_tp`); while the entry is live a smaller TP accumulates inside the cell's reservation (`TP_ACCUMULATING`); once the entry is final everything is dispatched; emergency cancels remain only for real cap drops / hard risk | `E test_ng_engine_review1.py::test_r05_runtime_minimum_decrease_never_emergency_cancels_other_cells_entries` (red: `SLOT_EMERGENCY_TP_PRIORITY`) |
+| 6 | Rejected intents re-issued with a new CID every tick, no blocker | Off-tick grid prices blocked in admission/TP planning (`PRICE_NOT_ON_TICK`); pre-send and definitive venue rejects latch the cell/role (`meta.reject_latches`) until the rules/config fingerprint changes or an exponential backoff elapses (first venue reject: one immediate retry, AC-56); blocker visible per cell | `E test_ng_engine_review1.py::test_r06_off_tick_prices_latch_a_blocker_instead_of_dead_legs_every_tick` (red: 30 dead TP legs); `E test_ng_engine_review1.py::test_r06_definitive_venue_reject_is_latched_with_backoff_not_resent_every_tick` |
+| 7 | STOP never dispatched a committed-but-unsent CANCEL | The stop branch and the blocked branch dispatch CANCEL_PENDING legs with a PENDING cancel row | `E test_ng_engine_review1.py::test_r07_stop_drain_dispatches_a_committed_but_unsent_cancel` (red: STOPPING forever) |
+| 8 | `resolve_unknown_submit` accepted a missing/stale active list | Requires an active list requested after the dispatch and fresh, plus a complete walk started after the dispatch (`_absence_not_proven`) | `E test_ng_engine_review1.py::test_r08_resolve_unknown_submit_is_refused_without_an_active_list`; `E test_ng_engine_review1.py::test_r08_resolve_unknown_submit_is_refused_with_an_active_list_older_than_the_dispatch` |
+| 9 | STOPPED with baseline B ≠ 0 / unknown position | Stop outcome only with a fresh position requested after the latest fill; B ≠ 0 counts as inventory; otherwise STOPPING → STOP_UNCERTAIN after the timeout | `E test_ng_engine_review1.py::test_r09_stop_is_never_stopped_with_an_unknown_position_and_counts_the_baseline` |
+| 10 | Steady-state walks re-read all history since the oldest LIVE entry | Lookback only for SUBMIT_UNKNOWN / TERMINAL_UNKNOWN / CANCEL_* / terminal-row-pending legs | `E test_ng_engine_review1.py::test_r10_proven_live_orders_do_not_extend_the_history_lookback` |
+| 11 | Active rows read before the same tick's terminal commit recorded as evidence → store refusal loop | No live evidence for a CID whose terminal row is committed; a row older than that commit (`active_seq`) is ignored, a newer one for a final leg is a manual-reconcile contradiction | `E test_ng_engine_review1.py::test_r11_active_row_older_than_the_terminal_commit_is_ignored_not_a_store_refusal` (red: LEDGER_INVARIANT "cumulative filled regressed") |
+| 12 | Phantom history lag for a WS signal of an already committed trade | Committed trade ids are skipped in `wake`; client-id-only signals expire after a complete walk that started after them (trade-id signals stay until committed) | `E test_ng_engine_review1.py::test_r12_ws_signal_for_an_already_committed_trade_is_not_history_lag` |
+| 13 | RISK_BLOCKED TP without per-cell blocker, only the first reason kept | Per-cell blocker + `meta.risk_blocked` (TP key → reason) in the freeze detail; cleared by `ack_risk_blocked` | `E test_ng_engine_review1.py::test_r13_risk_blocked_tps_name_their_cells_and_every_reason` |
+| 14 | No engine test for release condition (5) | test gap | `E test_ng_engine_review1.py::test_r14_release_waits_until_the_account_position_equals_the_ledger` (mutation-proven) |
+| 15 | Restart test never observed RECONCILING; `hasattr` tautology | test rewritten: own-fill backlog > one bounded scanner step → RECONCILING, nothing sent; NORMAL only after the walk completed | `E test_ng_engine_ops.py::test_status_states_are_honest_during_bootstrap_and_reconcile` (mutation-proven) |
+| 16 | LEDGER_INVARIANT freeze lost on reload | Re-applied and persisted by `_reload` (`_sticky_freezes`); only `ack_history_conflict` clears it | `E test_ng_engine_review1.py::test_r16_ledger_invariant_freeze_survives_reload_and_restart_until_acknowledged` |
+| W1 | A lone CONFIRM_BASELINE went live | START requires `risk_acknowledged=true` + a 24-hex `preview_id` (and B equal to the config when given); CONFIRM_BASELINE requires an applied START and the enabled/offline gate; the launcher START carries the same fields (preview id = digest of the confirmed grid id + B) | `E test_ng_engine_review1.py::test_w1_confirm_baseline_requires_an_applied_acknowledged_start`; `E test_ng_engine_review1.py::test_w1_confirm_baseline_applies_the_enabled_gate` |
+| W2 | Web needs the running config and rules bounds | `summary.engine_config` (every GridConfig field, decimals as strings, + core fingerprint), `summary.started`, `runtime_rules.supports_limit/supports_post_only/fetched_at/max_age_s` (`max(rules_max_age_s, 3 × rules_refresh_s)`) | `E test_ng_engine_review1.py::test_w2_snapshot_publishes_engine_config_started_and_runtime_rules_bounds` (parsed by `web.neutral_grid.runtime.engine_config_from_snapshot`) |
+| W3 | UI cannot see persistence failures | `<db_path>.health.json` atomically written (tmp + fsync + replace + dir fsync) whenever `(persistence_error, fatal_reason)` changes, incl. recovery and fail-closed open; `engine.health()` in process | `E test_ng_engine_review1.py::test_w3_health_sidecar_reports_persistence_failure_and_recovery`; `E test_ng_engine_review1.py::test_w3_health_sidecar_reports_a_fail_closed_engine` |
+| W4 | Per-tick DEGRADED↔NORMAL flapping churns engine_revision | Back to NORMAL only after `normal_hysteresis_ticks` (3) clean ticks; meanwhile DEGRADED with `STABILIZING` (no new entries); `engine_revision` bumps only on committed state changes | `E test_ng_engine_review1.py::test_w4_no_per_tick_degraded_normal_flapping` (red: 11 flips / 12 ticks) |
+
+Adapted existing tests: `test_ng_engine_risk.py::test_ac43_*` (DEGRADED, from the previous package), the harness sends
+the acknowledged START payload (a bare `{}` START is now refused), the AC-56 new-revision behaviour is kept by the
+one immediate retry after a first definitive venue reject.
+
 ## Requests to other workstreams / integrator
 
 * **R1 (integrator, blocking for a clean V2 restart).** Register the executor natively:
@@ -242,20 +280,31 @@ risk/admission/router (`E ng_engine_harness.py`); nothing restates the implement
 * Audited-only walks do not advance the durable cursor high-water (the walk floor lives in `engine_meta`); until a
   genuinely complete walk, the high-water-row retention check is skipped for those streams (the horizon check of
   C still applies).
+* Rules refresh is bounded to what the poll/scan cadence leaves of the weight budget (at least one read per
+  minute; ~2/min with the defaults), so `rules_refresh_s` below ~30 s is effectively capped; a venue rules change
+  is picked up within that cadence (entries of off-tick/invalid cells stay blocked meanwhile).
+* Anti-flap: after any DEGRADED blip new entries wait `normal_hysteresis_ticks` (3) clean ticks (TPs never wait).
+* The release re-read after a fill commit costs one extra account read (300 weight) in such ticks; when the budget
+  is short the release simply waits for the next regular poll.
+* TP accumulation after a runtime minimum decrease applies to entries created by this version
+  (`arming_min_tp`); older live entries keep the previous per-fill dispatch.
+* The launcher START has no web preview: its `preview_id` is a digest of the confirmed grid id + B + executor id.
 * If the launcher cannot read the ledger at construction (corrupt/unreadable DB), nothing is registered; the
   engine then fails closed, but Hummingbot's generic cancel paths could touch orders of a previous run until the
   connector restores its own tracking marker (logged as an error).
 
-## Commands run (code at `5f0137c85`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
+## Commands run (code at `93c80b299`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
 
 | Gate | Command | Result |
 |---|---|---|
-| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 186 passed |
+| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 214 passed |
 | Heavy property sweep | `NG_PROPERTY_SEEDS=60 NG_PROPERTY_STEPS=120 $PY -m pytest .../engine/test_ng_engine_properties.py -q` | 61 passed |
 | Lighter connector | `$PY -m pytest test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_derivative.py -q` | 85 passed, 8 subtests passed |
 | Committed neutral/risk | `$PY -m pytest test/scripts/test_lighter_robinhood_neutral_grid.py test/scripts/test_lighter_robinhood_grid_risk.py -q` | 73 passed |
 | Controller/executor regressions | `$PY -m pytest test/hummingbot/strategy_v2/executors/grid_executor test/controllers/generic test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py test/hummingbot/strategy_v2/executors/test_executor_base.py -q` | 135 passed |
-| Merged WS-A/B/C suites | `$PY -m pytest test/.../neutral_grid_executor/core test/.../neutral_grid_executor/store test/.../neutral_grid_executor/history test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_history_pagination.py -q` | 351 passed, 268 subtests passed |
+| Merged WS-A/B/C suites | `$PY -m pytest test/.../neutral_grid_executor/core test/.../neutral_grid_executor/store test/.../neutral_grid_executor/history test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_history_pagination.py -q` | 355 passed, 268 subtests passed |
+| Web suite (WS-E, merged) | `$PY -m pytest test/web/neutral_grid -q` (incl. browser tests) | 130 passed |
+| Review package 1 red/green | `$PY -m pytest .../engine/test_ng_engine_review1.py -q` at the `16b837428` engine / at `93c80b299` | 26 failed, 2 passed / 28 passed |
 | Compile/import | `$PY -m py_compile <9 WS-D modules>` + import of engine/executor/fake_exchange/commands/snapshot/data_types/controller/script | OK |
 | Lint | `$PY -m flake8 <WS-D modules> test/.../engine test/controllers/generic/test_neutral_grid.py` | clean |
 | Whitespace | `git diff --check a18cb37d4 HEAD` | clean |
