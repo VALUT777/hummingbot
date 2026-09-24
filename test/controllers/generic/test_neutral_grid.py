@@ -246,3 +246,30 @@ def test_launcher_baseline_mismatch_is_refused_once_not_spammed(tmp_path, monkey
     finally:
         executor.engine.store.close()
         loop.close()
+
+
+def test_executor_wires_live_history_wakeups_as_hints_only(tmp_path):
+    clock = FakeClock()
+    fx = FakeExchange(clock)
+    subscribed = []
+    fx.subscribe_history_wakeups = subscribed.append                    # the LighterExchangePort hook
+    fx.unsubscribe_history_wakeups = lambda cb: subscribed.remove(cb)
+    executor = _executor(tmp_path, clock, fx)
+    import hummingbot.strategy_v2.executors.neutral_grid_executor.store as store_mod
+    original = store_mod.default_lock_dir
+    store_mod.default_lock_dir = lambda base_dir=None: tmp_path / "locks"
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(executor.on_start())
+        assert len(subscribed) == 1
+        before = executor.engine.scanner._wake_requested
+        subscribed[0]()                                                   # private-stream activity
+        assert executor.engine.scanner._wake_requested and not before     # only a poll hint
+        assert executor.engine.all_legs() == []                           # never evidence
+        executor.on_stop()
+        assert subscribed == [] and executor.engine.store.closed          # lock released on stop
+    finally:
+        store_mod.default_lock_dir = original
+        if executor.engine.store is not None and not executor.engine.store.closed:
+            executor.engine.store.close()
+        loop.close()

@@ -63,6 +63,8 @@ class NeutralGridExecutor(ExecutorBase):
         self._bootstrap_attempts = 0
         self._baseline_key: Optional[str] = None
         self._baseline_refused = False
+        self._wakeup_callback = None
+        self._wakeup_unsubscribe = None
 
     # ------------------------------------------------------------------ construction
     def _build_port(self):
@@ -96,11 +98,32 @@ class NeutralGridExecutor(ExecutorBase):
             self.start_error = self.engine.fatal_reason
             self.logger().error(f"Neutral grid engine is fail-closed: {self.start_error}")
             return
-        add_listener = getattr(port, "add_ws_listener", None)
-        if callable(add_listener):
-            add_listener(self.engine.wake)
+        self._subscribe_wakeups(port)
         if self.config.operator_confirmed_start:
             self._enqueue(CommandKind.START, {"source": "launcher"}, key=f"launcher-start-{self.config.id}")
+
+    def _subscribe_wakeups(self, port) -> None:
+        """Private-stream activity only hints the history poller (coalesced); it is never evidence."""
+        subscribe = getattr(port, "subscribe_history_wakeups", None)        # LighterExchangePort
+        if callable(subscribe):
+            self._wakeup_callback = lambda: self.engine.wake({"type": "private_stream"})
+            subscribe(self._wakeup_callback)
+            self._wakeup_unsubscribe = lambda: port.unsubscribe_history_wakeups(self._wakeup_callback)
+            return
+        add_listener = getattr(port, "add_ws_listener", None)                # FakeExchange (offline)
+        if callable(add_listener):
+            add_listener(self.engine.wake)
+            self._wakeup_unsubscribe = lambda: port.remove_ws_listener(self.engine.wake)
+
+    def on_stop(self):
+        if self._wakeup_unsubscribe is not None:
+            self._wakeup_unsubscribe()
+            self._wakeup_unsubscribe = None
+        store = self.engine.store if self.engine is not None else None
+        if store is not None and not store.closed:
+            # Releases the single-writer host lock and marks the owner row released; the ledger stays on disk.
+            store.close()
+        super().on_stop()
 
     async def validate_sufficient_balance(self):  # pragma: no cover - never used by this executor
         return None
