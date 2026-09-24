@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -98,7 +99,7 @@ def _files(tmp_path: Path, *, resume: str | None = None, account_index: int = 10
     return controller, script, connector, data_dir
 
 
-def _runtime(*, stop_ms: int | None, db_exists=True, tty=True, running=False):
+def _runtime(*, stop_ms: int | None, db_exists=True, db_attach_ready=None, tty=True, running=False):
     now = [0.0]
 
     def sleep(seconds: float):
@@ -109,6 +110,7 @@ def _runtime(*, stop_ms: int | None, db_exists=True, tty=True, running=False):
         bot_running=lambda: running,
         durable_stop=lambda path: stop_ms,
         path_exists=(lambda path: db_exists() if callable(db_exists) else bool(db_exists)),
+        db_attach_ready=db_attach_ready or (lambda path: db_exists() if callable(db_exists) else bool(db_exists)),
         monotonic=lambda: now[0],
         sleep=sleep,
         default_db_path=lambda connector, domain, account, pair, data: (
@@ -256,6 +258,67 @@ def test_missing_ledger_after_native_start_times_out_without_opening_web(tmp_pat
     assert rc == launcher.DB_WAIT_TIMEOUT
     assert len(calls) == 1
     assert "--replace" not in calls[0]
+
+
+def test_existing_v5_ledger_waits_for_readable_current_schema_before_web(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MIGRATIONS
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import EngineIdentity, NeutralGridStore
+
+    controller, script, connector, data_dir = _files(tmp_path)
+    db_path = (
+        data_dir
+        / "neutral_grid/neutral_grid.lighter_perpetual_robinhood.10123.LIT-USDG.sqlite3"
+    )
+    identity = EngineIdentity(
+        "lighter_perpetual_robinhood", "lighter_perpetual_robinhood", 10123, "LIT-USDG"
+    )
+    lock_dir = tmp_path / "locks"
+    legacy = NeutralGridStore.open(
+        db_path, identity, create_if_missing=True, lock_dir=lock_dir, migrations=MIGRATIONS[:-1]
+    )
+    legacy.close()
+    assert db_path.exists()
+    assert sqlite3.connect(db_path).execute("PRAGMA user_version").fetchone()[0] == 5
+    assert launcher._database_attach_ready(db_path) is False
+    assert sqlite3.connect(db_path).execute("PRAGMA user_version").fetchone()[0] == 5
+
+    now = [0.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+        if len(sleeps) == 1:
+            upgraded = NeutralGridStore.open(db_path, identity, lock_dir=lock_dir)
+            upgraded.close()
+
+    runtime = launcher.LaunchRuntime(
+        stdin_isatty=lambda: True,
+        bot_running=lambda: False,
+        durable_stop=lambda path: None,
+        path_exists=Path.exists,
+        db_attach_ready=launcher._database_attach_ready,
+        monotonic=lambda: now[0],
+        sleep=sleep,
+        default_db_path=lambda connector, domain, account, pair, data: db_path,
+    )
+    calls = []
+    rc = launcher.run_launch(
+        controller_path=controller,
+        script_path=script,
+        connector_path=connector,
+        data_dir=data_dir,
+        runtime=runtime,
+        input_fn=lambda prompt: "START",
+        invoke=lambda command: calls.append(command) or 0,
+        tell=lambda message: None,
+        db_wait_seconds=2,
+    )
+
+    assert rc == 0
+    assert sleeps
+    assert len(calls) == 2 and "--attach-db" in calls[1]
+    assert launcher._database_attach_ready(db_path) is True
 
 
 def test_policy_and_loader_are_validated_without_constructing_a_connector(tmp_path):

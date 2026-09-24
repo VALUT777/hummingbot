@@ -44,6 +44,7 @@ class LaunchRuntime:
     bot_running: Callable[[], bool]
     durable_stop: Callable[[Path], int | None]
     path_exists: Callable[[Path], bool]
+    db_attach_ready: Callable[[Path], bool]
     monotonic: Callable[[], float]
     sleep: Callable[[float], None]
     default_db_path: Callable[[str, str, int, str, Path], Path]
@@ -109,10 +110,26 @@ def _default_runtime() -> LaunchRuntime:
         bot_running=bot.running,
         durable_stop=lambda path: durable_stop_ms(str(path)),
         path_exists=Path.exists,
+        db_attach_ready=_database_attach_ready,
         monotonic=time.monotonic,
         sleep=time.sleep,
         default_db_path=resolve,
     )
+
+
+def _database_attach_ready(path: Path) -> bool:
+    """Read-only proof that the web sidecar can see the complete current store schema."""
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore, StoreError
+
+    store = None
+    try:
+        store = NeutralGridStore.open_readonly(path, integrity_check="none")
+        return True
+    except (OSError, StoreError):
+        return False
+    finally:
+        if store is not None:
+            store.close()
 
 
 def _read_yaml(path: Path) -> dict:
@@ -390,13 +407,15 @@ def run_launch(*, controller_path: Path = CONTROLLER_CONFIG_PATH,
         return result
 
     deadline = runtime.monotonic() + db_wait_seconds
-    while not runtime.path_exists(plan.db_path) and runtime.monotonic() < deadline:
+    ready = runtime.db_attach_ready(plan.db_path)
+    while not ready and runtime.monotonic() < deadline:
         runtime.sleep(0.25)
-    if not runtime.path_exists(plan.db_path):
-        tell(
-            f"Журнал {plan.db_path} не появился за {db_wait_seconds:g} с; "
-            "веб-панель не запущена."
-        )
+        ready = runtime.db_attach_ready(plan.db_path)
+    if not ready:
+        detail = ("не появился" if not runtime.path_exists(plan.db_path)
+                  else "ещё не готов для безопасного подключения (схема движка не актуальна)")
+        tell(f"Журнал {plan.db_path} {detail} за {db_wait_seconds:g} с; "
+             "веб-панель не запущена.")
         return DB_WAIT_TIMEOUT
 
     web = [

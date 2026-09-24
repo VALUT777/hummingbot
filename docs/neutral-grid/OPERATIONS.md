@@ -50,6 +50,6 @@
 1. Остановите maintenance-процесс штатно, не удаляя журнал.
 2. Установите новый `grid_id: lit-neutral-fixed-v2`, диапазон `4.9…5.9`, `24` ячейки (`25` границ), `20 LIT` на ячейку, плечо `5`, `max_active_orders: 120`; лимиты net/gross остаются `1000/1000 LIT`.
 3. Оставьте `resume_after_stop_confirmation` пустой. В поле `migrate_grid_confirmation` задайте точную фразу `MIGRATE lighter_perpetual_robinhood LIT-USDG TO lit-neutral-fixed-v2`, а в `live_start_confirmation` — `START lit-neutral-fixed-v2 ON lighter_perpetual_robinhood LIT-USDG WITH B=0`. Откройте launcher словом `OPEN`.
-4. Выполните существующее аудируемое действие `migrate_grid`. Оно сохраняет старые циклы, settlement evidence, fills и CID.
+4. При указанной миграционной фразе нативный runner сам отправит аудируемое действие `migrate_grid`, когда получит свежие данные. Дождитесь `APPLIED` и нового `grid_id` в панели. Старые циклы, settlement evidence, fills и CID сохраняются; вручную повторять уже применённую миграцию не нужно.
 5. Проверьте превью: диапазон, `24` ячейки, `25` границ, `20 LIT`, до `120` слотов для входов и тейк-профитов и нулевой остаток старого поколения.
 6. Только после проверки нажмите отдельный **Старт** в панели и заново подтвердите baseline и риск. Старое settled-поколение не должно создавать TP; новые входы относятся только к v2.
