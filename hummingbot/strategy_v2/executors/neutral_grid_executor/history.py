@@ -357,6 +357,7 @@ class HistoryScanner:
         self._last_scan_started_at: Optional[float] = None
         self._backoff_until: Optional[float] = None
         self._consecutive_failures = 0
+        self._retry_after_failure = False
         self.completed_scans: Deque[ScanRecord] = deque(maxlen=scan_log_size)
         self.last_result: Optional[HistoryScanResult] = None
         self.coalesced_calls = 0
@@ -389,7 +390,7 @@ class HistoryScanner:
             return False
         if self._backoff_until is not None and now < self._backoff_until:
             return False
-        if self._progress is not None or self._last_scan_started_at is None:
+        if self._progress is not None or self._last_scan_started_at is None or self._retry_after_failure:
             return True
         elapsed = Decimal(str(now)) - Decimal(str(self._last_scan_started_at))
         if self._wake_requested and elapsed >= self._min_wake_interval_s:
@@ -493,6 +494,7 @@ class HistoryScanner:
         result = self._result(False, reason, pages, weight)
         self._progress = None
         self._consecutive_failures += 1
+        self._retry_after_failure = True
         delay = self._backoff_initial_s * (2 ** (self._consecutive_failures - 1))
         delay = min(delay, self._backoff_max_s)
         self._backoff_until = float(Decimal(str(now)) + delay)
@@ -686,6 +688,7 @@ class HistoryScanner:
         started_at = self._scan_started_at if self._scan_started_at is not None else now
         self._progress = None
         self._consecutive_failures = 0
+        self._retry_after_failure = False
         self._backoff_until = None
         if complete:
             self.completed_scans.append(ScanRecord(started_at=started_at, completed_at=now))
