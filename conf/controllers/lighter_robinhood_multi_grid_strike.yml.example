@@ -1,0 +1,37 @@
+id: lit-robinhood-multi-grid-strike-v1
+controller_name: lighter_robinhood_multi_grid_strike
+controller_type: generic
+total_amount_quote: '3000'
+manual_kill_switch: false
+initial_positions: []
+leverage: 5
+position_mode: ONEWAY
+connector_name: lighter_perpetual_robinhood
+trading_pair: LIT-USDG
+max_abs_net_position: '1000'
+max_data_age_seconds: 10
+snapshot_poll_seconds: 10
+grids:
+  - grid_id: lit-main
+    start_price: '5'
+    end_price: '6'
+    limit_price: '4.9999'
+    side: 1
+    amount_quote_pct: '1'
+    enabled: true
+min_spread_between_orders: '0.0036'
+min_order_amount_quote: '50'
+max_open_orders: 2
+max_orders_per_batch: 1
+order_frequency: 3
+activation_bounds: '0.005'
+keep_position: true
+triple_barrier_config:
+  stop_loss: null
+  take_profit: '0.018'
+  time_limit: null
+  trailing_stop: null
+  open_order_type: 3
+  take_profit_order_type: 3
+  stop_loss_order_type: 1
+  time_limit_order_type: 1

@@ -14,6 +14,29 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 
 
+def exact_int(value: Any, field_name: str) -> int:
+    """Parse an exchange integer without truncating floats, decimals, or booleans."""
+    if type(value) is int:
+        return value
+    if isinstance(value, str):
+        if value == "0" or (value.startswith("-") and value[1:].isdigit() and value[1:2] != "0"):
+            return int(value)
+        if value.isdigit() and not value.startswith("0"):
+            return int(value)
+    raise ValueError(f"{field_name} must be an exact integer")
+
+
+def leverage_from_account_margin_percentage(value: Any) -> Optional[Decimal]:
+    """Convert the account-position margin percentage (for example ``20.00``) to leverage."""
+    try:
+        percentage = Decimal(str(value))
+    except Exception:
+        return None
+    if not percentage.is_finite() or percentage <= 0:
+        return None
+    return Decimal("100") / percentage
+
+
 @dataclass(frozen=True)
 class LighterMarketInfo:
     market_id: int
@@ -29,6 +52,11 @@ class LighterMarketInfo:
     maker_fee: Decimal
     taker_fee: Decimal
     raw_info: Dict[str, Any]
+
+    @property
+    def max_leverage(self) -> Decimal:
+        fraction = Decimal(str(self.raw_info.get("min_initial_margin_fraction", "0")))
+        return Decimal("0") if fraction <= 0 else Decimal("10000") / fraction
 
     @property
     def min_base_increment(self) -> Decimal:
@@ -55,27 +83,30 @@ class LighterMarketInfo:
         )
 
 
-def perpetual_markets_from_exchange_info(exchange_info: Dict[str, Any]) -> List[LighterMarketInfo]:
+def perpetual_markets_from_exchange_info(
+    exchange_info: Dict[str, Any], domain: str = CONSTANTS.DOMAIN
+) -> List[LighterMarketInfo]:
+    quote_token = CONSTANTS.get_domain_settings(domain).quote_token
     markets = []
     for raw_market in exchange_info.get("order_book_details", []):
         if not web_utils.is_exchange_information_valid(raw_market):
             continue
+        if raw_market.get("market_type", "perp") != "perp":
+            continue
         base_asset = str(raw_market["symbol"]).upper()
-        trading_pair = combine_to_hb_trading_pair(
-            base=base_asset, quote=CONSTANTS.PERPETUAL_QUOTE_TOKEN
-        )
+        trading_pair = combine_to_hb_trading_pair(base=base_asset, quote=quote_token)
         markets.append(
             LighterMarketInfo(
-                market_id=int(raw_market["market_id"]),
+                market_id=exact_int(raw_market["market_id"], "market_id"),
                 exchange_symbol=base_asset,
                 trading_pair=trading_pair,
                 base_asset=base_asset,
-                quote_asset=CONSTANTS.PERPETUAL_QUOTE_TOKEN,
+                quote_asset=quote_token,
                 market_type="perp",
                 min_base_amount=Decimal(str(raw_market["min_base_amount"])),
                 min_quote_amount=Decimal(str(raw_market["min_quote_amount"])),
-                size_decimals=int(raw_market["supported_size_decimals"]),
-                price_decimals=int(raw_market["supported_price_decimals"]),
+                size_decimals=exact_int(raw_market["supported_size_decimals"], "supported_size_decimals"),
+                price_decimals=exact_int(raw_market["supported_price_decimals"], "supported_price_decimals"),
                 maker_fee=Decimal(str(raw_market["maker_fee"])),
                 taker_fee=Decimal(str(raw_market["taker_fee"])),
                 raw_info=raw_market,
@@ -142,30 +173,37 @@ def order_state_from_order_data(order_data: Dict[str, Any]) -> OrderState:
 
 
 def account_index_from_account(account: Dict[str, Any]) -> int:
-    return int(account.get("account_index", account.get("accountIndex", account.get("index"))))
+    return exact_int(
+        account.get("account_index", account.get("accountIndex", account.get("index"))),
+        "account_index",
+    )
 
 
 def extract_account_snapshot(
     account_response: Dict[str, Any], account_index: Optional[int] = None, l1_address: Optional[str] = None
 ) -> Dict[str, Any]:
     accounts = account_response.get("accounts", account_response.get("sub_accounts", []))
-    for account in accounts:
-        if account_index is not None and account_index_from_account(account) == account_index:
-            return account
-        if (
-            account_index is None
-            and l1_address is not None
-            and str(account.get("l1_address", "")).lower() == l1_address.lower()
-        ):
-            return account
-    if account_index is None and l1_address is not None and len(accounts) > 0:
-        return accounts[0]
+    if account_index is not None:
+        for account in accounts:
+            if account_index_from_account(account) == account_index:
+                return account
+    elif l1_address is not None:
+        matches = [
+            account for account in accounts
+            if str(account.get("l1_address", "")).lower() == l1_address.lower()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise IOError(
+                f"L1 address {l1_address} has multiple Lighter accounts; configure an explicit account index."
+            )
     raise IOError(f"Account {account_index or l1_address} was not found in Lighter account response.")
 
 
 def own_trade_details(trade: Dict[str, Any], account_index: int) -> Optional[Tuple[TradeType, str, str, bool]]:
-    ask_account_id = int(trade.get("ask_account_id", -1))
-    bid_account_id = int(trade.get("bid_account_id", -1))
+    ask_account_id = exact_int(trade.get("ask_account_id", -1), "ask_account_id")
+    bid_account_id = exact_int(trade.get("bid_account_id", -1), "bid_account_id")
     if ask_account_id == account_index:
         return (
             TradeType.SELL,

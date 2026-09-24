@@ -67,6 +67,25 @@ class LighterPerpetualUserStreamDataSourceTests(TestCase):
         stale_factory.get_ws_assistant.assert_not_called()
         self.assertEqual(CONSTANTS.PRIVATE_WS_PING_INTERVAL, ws.connect_calls[0]["ping_timeout"])
 
+    def test_robinhood_private_websocket_uses_robinhood_host_after_account_bootstrap(self):
+        ws = MockWSAssistant()
+        connector_factory = SimpleNamespace(get_ws_assistant=AsyncMock(return_value=ws))
+        connector = SimpleNamespace(
+            _ensure_account_ready=AsyncMock(),
+            _web_assistants_factory=connector_factory,
+        )
+        data_source = LighterPerpetualUserStreamDataSource(
+            auth=SimpleNamespace(),
+            connector=connector,
+            api_factory=SimpleNamespace(),
+            domain=CONSTANTS.ROBINHOOD_DOMAIN,
+        )
+
+        asyncio.run(data_source._connected_websocket_assistant())
+
+        connector._ensure_account_ready.assert_awaited_once()
+        self.assertEqual("wss://api.rh.lighter.xyz/stream", ws.connect_calls[0]["ws_url"])
+
     def test_subscribe_channels_inject_auth_token(self):
         # End-to-end: a real WSAssistant carrying a real LighterAuth must stamp the `auth` token
         # onto every private subscribe message (guards against the missing-auth regression).

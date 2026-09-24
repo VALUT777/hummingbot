@@ -1,0 +1,17 @@
+script_file_name: lighter_robinhood_neutral_grid.py
+controllers_config: []
+enabled: false
+connector_name: lighter_perpetual_robinhood
+trading_pair: LIT-USDG
+# Intentionally blank. Copy this file, choose both bounds, and run preflight.
+lower_price:
+upper_price:
+grid_levels: 21
+order_amount_base: 10
+max_abs_net_position: 1000
+leverage: 5
+max_open_orders: 2
+refresh_seconds: 30
+max_data_age_seconds: 10
+# Explicit fee/funding reserve in USDG is required before enabled: true.
+margin_reserve_usdg:

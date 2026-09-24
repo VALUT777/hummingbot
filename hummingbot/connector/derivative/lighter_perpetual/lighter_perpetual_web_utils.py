@@ -17,13 +17,8 @@ class LighterRESTPreProcessor(RESTPreProcessorBase):
         return request
 
 
-def is_testnet_domain(domain: str) -> bool:
-    return domain.endswith("testnet")
-
-
 def rest_url(path_url: str = "", domain: str = "lighter_perpetual") -> str:
-    base_url = CONSTANTS.TESTNET_BASE_URL if is_testnet_domain(domain) else CONSTANTS.MAINNET_BASE_URL
-    return f"{base_url}{path_url}"
+    return f"{CONSTANTS.get_domain_settings(domain).rest_url}{path_url}"
 
 
 def public_rest_url(path_url: str = "", domain: str = "lighter_perpetual") -> str:
@@ -35,7 +30,7 @@ def private_rest_url(path_url: str = "", domain: str = "lighter_perpetual") -> s
 
 
 def wss_url(domain: str = "lighter_perpetual") -> str:
-    return CONSTANTS.TESTNET_WS_URL if is_testnet_domain(domain) else CONSTANTS.MAINNET_WS_URL
+    return CONSTANTS.get_domain_settings(domain).ws_url
 
 
 def build_api_factory(

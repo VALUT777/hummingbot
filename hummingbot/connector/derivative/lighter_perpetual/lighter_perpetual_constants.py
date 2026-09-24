@@ -1,5 +1,7 @@
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import List
+from types import MappingProxyType
+from typing import List, Mapping
 
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
@@ -7,11 +9,43 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 EXCHANGE_NAME = "lighter_perpetual"
 DOMAIN = EXCHANGE_NAME
 TESTNET_DOMAIN = "lighter_perpetual_testnet"
+ROBINHOOD_DOMAIN = "lighter_perpetual_robinhood"
 
 MAINNET_BASE_URL = "https://mainnet.zklighter.elliot.ai"
 TESTNET_BASE_URL = "https://testnet.zklighter.elliot.ai"
 MAINNET_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 TESTNET_WS_URL = "wss://testnet.zklighter.elliot.ai/stream"
+ROBINHOOD_BASE_URL = "https://api.rh.lighter.xyz"
+ROBINHOOD_WS_URL = "wss://api.rh.lighter.xyz/stream"
+ROBINHOOD_COLLATERAL_ASSET_ID = 3
+
+
+@dataclass(frozen=True)
+class LighterPerpetualDomainSettings:
+    rest_url: str
+    ws_url: str
+    chain_id: int
+    quote_token: str
+    collateral_token: str
+
+
+DOMAIN_SETTINGS: Mapping[str, LighterPerpetualDomainSettings] = MappingProxyType(
+    {
+        DOMAIN: LighterPerpetualDomainSettings(MAINNET_BASE_URL, MAINNET_WS_URL, 304, "USDC", "USDC"),
+        TESTNET_DOMAIN: LighterPerpetualDomainSettings(TESTNET_BASE_URL, TESTNET_WS_URL, 300, "USDC", "USDC"),
+        ROBINHOOD_DOMAIN: LighterPerpetualDomainSettings(
+            ROBINHOOD_BASE_URL, ROBINHOOD_WS_URL, 466324, "USDG", "USDG"
+        ),
+    }
+)
+
+
+def get_domain_settings(domain: str) -> LighterPerpetualDomainSettings:
+    try:
+        return DOMAIN_SETTINGS[domain]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported Lighter perpetual domain: {domain}") from exc
+
 
 ORDER_BOOK_DETAILS_PATH_URL = "/api/v1/orderBookDetails"
 ORDER_BOOK_ORDERS_PATH_URL = "/api/v1/orderBookOrders"

@@ -1,6 +1,7 @@
 import asyncio
+import time
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Collection, Dict, List, Optional, Tuple
 
 from lighter import SignerClient
 
@@ -15,7 +16,9 @@ from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_api_ord
 from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_api_utils import (
     account_index_from_account,
     decimal_to_exchange_int,
+    exact_int,
     extract_account_snapshot,
+    leverage_from_account_margin_percentage,
     markets_by_exchange_symbol,
     markets_by_id,
     markets_by_trading_pair,
@@ -56,6 +59,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
         rate_limits_share_pct: Decimal = Decimal("100"),
         lighter_perpetual_l1_address: str = None,
+        lighter_perpetual_account_index: int = None,
         lighter_perpetual_api_key_index: int = None,
         lighter_perpetual_api_public_key: str = None,
         lighter_perpetual_api_private_key: str = None,
@@ -64,8 +68,13 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         trading_required: bool = True,
         domain: str = CONSTANTS.DOMAIN,
     ):
+        self._domain_settings = CONSTANTS.get_domain_settings(domain)
         self._l1_address = lighter_perpetual_l1_address
-        self._account_index = None
+        self._account_index = (
+            int(lighter_perpetual_account_index)
+            if lighter_perpetual_account_index not in (None, "")
+            else None
+        )
         self._api_key_index = (
             int(lighter_perpetual_api_key_index)
             if lighter_perpetual_api_key_index not in (None, "")
@@ -81,6 +90,9 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         self._markets_by_id = {}
         self._markets_by_trading_pair = {}
         self._markets_by_exchange_symbol = {}
+        # Populated only from authoritative account REST readback. A successful sendTx
+        # response merely means the leverage update was accepted for processing.
+        self._confirmed_leverage_by_trading_pair: Dict[str, Decimal] = {}
         self._tx_lock = asyncio.Lock()
         self._account_ready_lock = asyncio.Lock()
         # Single-flight task for WS-triggered balance refresh: Lighter's account_all_assets
@@ -224,7 +236,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             params={"filter": "all"},
         )
         prices = []
-        for market in perpetual_markets_from_exchange_info(exchange_info):
+        for market in perpetual_markets_from_exchange_info(exchange_info, domain=self.domain):
             prices.append({"symbol": market.exchange_symbol, "price": str(market.raw_info["last_trade_price"])})
         return prices
 
@@ -454,19 +466,45 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             path_url=CONSTANTS.BALANCE_PATH_URL,
             params=self._account_lookup_params(),
         )
-        account = extract_account_snapshot(
-            account_response, account_index=self._account_index, l1_address=self._l1_address
-        )
+        try:
+            account = extract_account_snapshot(
+                account_response, account_index=self._account_index, l1_address=self._l1_address
+            )
+        except ValueError as exc:
+            raise IOError("Lighter account snapshot contains an invalid account index.") from exc
         self._set_account_index_from_account(account)
         available = self._safe_decimal(account.get("available_balance", "0"))
+        assets = account.get("assets")
+        if not isinstance(assets, list):
+            raise IOError("Lighter account response is missing assets data.")
+        if self._domain == CONSTANTS.ROBINHOOD_DOMAIN:
+            symbol_rows = [
+                asset for asset in assets
+                if isinstance(asset, dict)
+                and str(asset.get("symbol", "")).upper() == self._domain_settings.collateral_token
+            ]
+            try:
+                collateral_asset_id = exact_int(symbol_rows[0].get("asset_id"), "asset_id")
+            except (IndexError, ValueError):
+                collateral_asset_id = None
+            if (
+                len(symbol_rows) != 1
+                or collateral_asset_id != CONSTANTS.ROBINHOOD_COLLATERAL_ASSET_ID
+            ):
+                raise IOError("Lighter account response must contain exactly one valid USDG asset 3 row.")
 
-        for asset in account.get("assets", []):
+        for asset in assets:
             asset_name = str(asset["symbol"]).upper()
             # spot_balance = self._safe_decimal(asset.get("balance", "0"))
             locked_balance = self._safe_decimal(asset.get("locked_balance", "0"))
             total_balance = self._safe_decimal(asset.get("margin_balance", "0"))
             self._account_balances[asset_name] = total_balance
-            self._account_available_balances[asset_name] = available if asset_name == CONSTANTS.COLLATERAL_TOKEN else total_balance - locked_balance
+            unlocked_balance = max(total_balance - locked_balance, Decimal("0"))
+            self._account_available_balances[asset_name] = (
+                min(available, unlocked_balance)
+                if asset_name == self._domain_settings.collateral_token
+                else unlocked_balance
+            )
             remote_asset_names.add(asset_name)
 
         for asset_name in local_asset_names.difference(remote_asset_names):
@@ -491,9 +529,12 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             path_url=CONSTANTS.BALANCE_PATH_URL,
             params=self._account_lookup_params(),
         )
-        account = extract_account_snapshot(
-            account_response, account_index=self._account_index, l1_address=self._l1_address
-        )
+        try:
+            account = extract_account_snapshot(
+                account_response, account_index=self._account_index, l1_address=self._l1_address
+            )
+        except ValueError as exc:
+            raise IOError("Lighter account snapshot contains an invalid account index.") from exc
         self._set_account_index_from_account(account)
 
         active_position_keys = set()
@@ -541,6 +582,10 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
 
         return True, ""
 
+    def confirmed_leverage(self, trading_pair: str) -> Optional[Decimal]:
+        """Leverage most recently confirmed by an authoritative account readback."""
+        return self._confirmed_leverage_by_trading_pair.get(trading_pair)
+
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[float, Decimal, Decimal]:
         if self._markets_by_exchange_symbol == {}:
             await self._update_trading_rules()
@@ -578,7 +623,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             path_url=CONSTANTS.EXCHANGE_INFO_PATH_URL,
             params={"market_id": market.market_id},
         )
-        refreshed_markets = perpetual_markets_from_exchange_info(response)
+        refreshed_markets = perpetual_markets_from_exchange_info(response, domain=self.domain)
         if len(refreshed_markets) == 0:
             return float(self._safe_decimal(market.raw_info.get("last_trade_price", "0")))
         return float(self._safe_decimal(refreshed_markets[0].raw_info["last_trade_price"]))
@@ -604,14 +649,17 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                 await self._sleep(5.0)
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
-        markets = perpetual_markets_from_exchange_info(exchange_info_dict)
+        markets = perpetual_markets_from_exchange_info(exchange_info_dict, domain=self.domain)
         self._markets_by_id = markets_by_id(markets)
         self._markets_by_trading_pair = markets_by_trading_pair(markets)
         self._markets_by_exchange_symbol = markets_by_exchange_symbol(markets)
-        return [market.trading_rule(collateral_token=CONSTANTS.COLLATERAL_TOKEN) for market in markets]
+        return [
+            market.trading_rule(collateral_token=self._domain_settings.collateral_token)
+            for market in markets
+        ]
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
-        markets = perpetual_markets_from_exchange_info(exchange_info)
+        markets = perpetual_markets_from_exchange_info(exchange_info, domain=self.domain)
         self._markets_by_id = markets_by_id(markets)
         self._markets_by_trading_pair = markets_by_trading_pair(markets)
         self._markets_by_exchange_symbol = markets_by_exchange_symbol(markets)
@@ -657,6 +705,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                 url=web_utils.public_rest_url(domain=self._domain),
                 account_index=self._account_index,
                 api_private_keys={self._api_key_index: self._api_private_key},
+                chain_id=self._domain_settings.chain_id,
             )
         except Exception as e:
             raise IOError(f"Error creating Lighter signer client: {e}")
@@ -717,6 +766,342 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                 self._auth = self.authenticator
                 self._web_assistants_factory = self._create_web_assistants_factory()
                 self._user_stream_tracker = self._create_user_stream_tracker()
+
+    async def get_grid_account_snapshot(
+        self,
+        trading_pair: str,
+        client_order_ids: Optional[Collection[str]] = None,
+        force_refresh: bool = True,
+    ) -> Dict[str, Any]:
+        """Return a fresh, read-only reconciliation snapshot for bounded strategies.
+
+        This intentionally reads all account orders for the selected market. Requested
+        client IDs are also looked up in inactive orders and reconciled with account trades,
+        so disappearance from the active set is never treated as final by itself.
+        """
+        del force_refresh  # Every call is authoritative; retained for a stable strategy API.
+        await self._ensure_account_ready()
+        market = self.market_info_for_trading_pair(trading_pair)
+        account_params = self._account_lookup_params()
+        # `active_only=false` retains zero-position rows containing per-market leverage
+        # configuration, allowing flat accounts to confirm leverage authoritatively.
+        account_params["active_only"] = "false"
+        request_started_at = time.time()
+        account_response, active_response, inactive_response, trades_response, markets_response = await safe_gather(
+            self._api_get(path_url=CONSTANTS.BALANCE_PATH_URL, params=account_params),
+            self._api_get(
+                path_url=CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL,
+                params={"account_index": self._account_index, "market_id": market.market_id},
+                is_auth_required=True,
+            ),
+            self._api_get(
+                path_url=CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL,
+                params={"account_index": self._account_index, "market_id": market.market_id, "limit": 100},
+                is_auth_required=True,
+            ),
+            self._api_get(
+                path_url=CONSTANTS.TRADES_PATH_URL,
+                params={
+                    "account_index": self._account_index,
+                    "market_id": market.market_id,
+                    "sort_by": "trade_id",
+                    "sort_dir": "desc",
+                    "limit": 100,
+                },
+                is_auth_required=True,
+            ),
+            self._api_get(path_url=CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL),
+        )
+
+        def require_response(payload: Any, field: str, accepted_types: tuple) -> Any:
+            if not isinstance(payload, dict):
+                raise IOError(f"Lighter snapshot response for {field} is not an object.")
+            if "code" in payload:
+                try:
+                    code = exact_int(payload["code"], "code")
+                except (TypeError, ValueError):
+                    raise IOError(f"Lighter snapshot response for {field} has an invalid code.")
+                if code != 200:
+                    raise IOError(f"Lighter snapshot response for {field} failed with code {code}.")
+            value = payload.get(field)
+            if not isinstance(value, accepted_types):
+                raise IOError(f"Lighter snapshot response is missing valid {field} data.")
+            return value
+
+        require_response(
+            account_response,
+            "accounts" if "accounts" in account_response else "sub_accounts",
+            (list,),
+        )
+        active_orders = list(require_response(active_response, "orders", (list,)))
+        inactive_orders = list(require_response(inactive_response, "orders", (list,)))
+        raw_trades = require_response(trades_response, "trades", (list, dict))
+        raw_markets = require_response(markets_response, "order_book_details", (list,))
+        try:
+            account = extract_account_snapshot(
+                account_response, account_index=self._account_index, l1_address=self._l1_address
+            )
+        except ValueError as exc:
+            raise IOError("Lighter account snapshot contains an invalid account index.") from exc
+
+        def strict_non_negative_decimal(value: Any) -> Optional[Decimal]:
+            try:
+                parsed = Decimal(str(value))
+            except Exception:
+                return None
+            if not parsed.is_finite() or parsed < 0:
+                return None
+            return parsed
+
+        all_orders = active_orders + inactive_orders
+        tracked_ids = {
+            order.client_order_id
+            for order in self._order_tracker.all_updatable_orders.values()
+            if order.trading_pair == trading_pair
+        }
+        requested_ids = {str(client_id) for client_id in (client_order_ids or [])} | tracked_ids
+        orders_by_client_id: Dict[str, Dict[str, Any]] = {}
+        for order in all_orders:
+            if not isinstance(order, dict):
+                raise IOError("Lighter snapshot orders data contains a malformed order.")
+            client_id = str(order.get("client_order_id_str", order.get("client_order_id", "")))
+            if client_id == "" or (requested_ids and client_id not in requested_ids):
+                continue
+            status = str(order.get("status", ""))
+            cumulative_fill = strict_non_negative_decimal(order.get("filled_base_amount"))
+            orders_by_client_id[client_id] = {
+                "client_order_id": client_id,
+                "exchange_order_id": str(order.get("order_id", "")),
+                "status": status,
+                "terminal": status in CONSTANTS.CANCELED_ORDER_STATES
+                or status in CONSTANTS.FAILED_ORDER_STATES
+                or status == "filled",
+                "cumulative_fill_base": cumulative_fill,
+                "cumulative_fill_known": cumulative_fill is not None,
+                "observed_trade_fill_base": Decimal("0"),
+                "trade_ids": [],
+            }
+
+        trade_totals: Dict[str, Decimal] = {}
+        trade_ids: Dict[str, set] = {}
+        trade_sizes_by_id: Dict[str, Dict[str, Decimal]] = {}
+        invalid_trade_clients = set()
+        unattributed_trade_evidence = False
+
+        def iter_trades(payload: Any):
+            if isinstance(payload, list):
+                for item in payload:
+                    yield from iter_trades(item)
+            elif isinstance(payload, dict):
+                if "trade_id" in payload or "ask_account_id" in payload or "bid_account_id" in payload:
+                    yield payload
+                else:
+                    for value in payload.values():
+                        yield from iter_trades(value)
+
+        for trade in iter_trades(raw_trades):
+            try:
+                details = own_trade_details(trade, account_index=self._account_index)
+            except ValueError as exc:
+                raise IOError("Lighter snapshot trades data contains an invalid account id.") from exc
+            if details is None:
+                continue
+            _, client_id, _, _ = details
+            if client_id == "":
+                unattributed_trade_evidence = True
+                continue
+            if requested_ids and client_id not in requested_ids:
+                continue
+            trade_id = str(trade.get("trade_id", ""))
+            trade_size = strict_non_negative_decimal(trade.get("size"))
+            if trade_id == "" or trade_size is None:
+                invalid_trade_clients.add(client_id)
+                continue
+            seen_sizes = trade_sizes_by_id.setdefault(client_id, {})
+            if trade_id in seen_sizes:
+                if seen_sizes[trade_id] != trade_size:
+                    invalid_trade_clients.add(client_id)
+                continue
+            seen_sizes[trade_id] = trade_size
+            trade_ids.setdefault(client_id, set()).add(trade_id)
+            trade_totals[client_id] = trade_totals.get(client_id, Decimal("0")) + trade_size
+
+        for client_id, total in trade_totals.items():
+            detail = orders_by_client_id.setdefault(
+                client_id,
+                {
+                    "client_order_id": client_id,
+                    "exchange_order_id": "",
+                    "status": "unknown",
+                    "terminal": False,
+                    "cumulative_fill_base": None,
+                    "cumulative_fill_known": False,
+                    "observed_trade_fill_base": Decimal("0"),
+                    "trade_ids": [],
+                },
+            )
+            detail["observed_trade_fill_base"] = total
+            detail["trade_ids"] = sorted(trade_ids[client_id])
+
+        for client_id in requested_ids:
+            orders_by_client_id.setdefault(
+                client_id,
+                {
+                    "client_order_id": client_id,
+                    "exchange_order_id": "",
+                    "status": "unknown",
+                    "terminal": False,
+                    "cumulative_fill_base": None,
+                    "cumulative_fill_known": False,
+                    "observed_trade_fill_base": Decimal("0"),
+                    "trade_ids": [],
+                },
+            )
+
+        for client_id, detail in orders_by_client_id.items():
+            observed_total = trade_totals.get(client_id, Decimal("0"))
+            evidence_conflicts = (
+                client_id in invalid_trade_clients
+                or (
+                    detail["cumulative_fill_known"]
+                    and observed_total > detail["cumulative_fill_base"]
+                )
+            )
+            if evidence_conflicts:
+                detail["cumulative_fill_base"] = None
+                detail["cumulative_fill_known"] = False
+
+        raw_positions = account.get("positions")
+        net_position_known = isinstance(raw_positions, list)
+        net_position = Decimal("0") if net_position_known else None
+        leverage = None
+        leverage_confirmed = False
+        for raw_position in raw_positions or []:
+            if not isinstance(raw_position, dict):
+                net_position_known = False
+                net_position = None
+                break
+            try:
+                position_market_id = exact_int(raw_position["market_id"], "market_id")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise IOError("Lighter account snapshot contains an invalid position market id.") from exc
+            if position_market_id != market.market_id:
+                continue
+            size = strict_non_negative_decimal(raw_position.get("position"))
+            try:
+                sign = Decimal(exact_int(raw_position.get("sign"), "sign"))
+            except (TypeError, ValueError):
+                sign = None
+            valid_sign = sign in (Decimal("-1"), Decimal("1")) or (size == 0 and sign == 0)
+            if size is None or sign is None or not sign.is_finite() or not valid_sign:
+                raise IOError("Lighter account snapshot contains an invalid position size or sign.")
+            net_position += size * sign
+            account_leverage = leverage_from_account_margin_percentage(
+                raw_position.get("initial_margin_fraction")
+            )
+            if account_leverage is not None:
+                leverage = account_leverage
+                leverage_confirmed = True
+
+        if leverage_confirmed:
+            self._confirmed_leverage_by_trading_pair[trading_pair] = leverage
+        else:
+            self._confirmed_leverage_by_trading_pair.pop(trading_pair, None)
+
+        aggregate_available = strict_non_negative_decimal(account.get("available_balance"))
+        assets = account.get("assets")
+        if not isinstance(assets, list):
+            raise IOError("Lighter account snapshot is missing assets data.")
+        collateral_rows = [
+            asset for asset in assets
+            if isinstance(asset, dict)
+            and str(asset.get("symbol", "")).upper() == self._domain_settings.collateral_token
+        ]
+        if self._domain == CONSTANTS.ROBINHOOD_DOMAIN:
+            try:
+                collateral_asset_id = exact_int(collateral_rows[0].get("asset_id"), "asset_id")
+            except (IndexError, ValueError):
+                collateral_asset_id = None
+            if (
+                len(collateral_rows) != 1
+                or collateral_asset_id != CONSTANTS.ROBINHOOD_COLLATERAL_ASSET_ID
+            ):
+                collateral_rows = []
+        if len(collateral_rows) != 1:
+            raise IOError(
+                f"Lighter account snapshot must contain exactly one valid "
+                f"{self._domain_settings.collateral_token} collateral row."
+            )
+        collateral_total = strict_non_negative_decimal(collateral_rows[0].get("margin_balance"))
+        collateral_locked = strict_non_negative_decimal(collateral_rows[0].get("locked_balance"))
+        available_margin = None
+        if aggregate_available is not None and collateral_total is not None and collateral_locked is not None:
+            available_margin = min(aggregate_available, max(collateral_total - collateral_locked, Decimal("0")))
+
+        matching_markets = []
+        for raw_market in raw_markets:
+            if not isinstance(raw_market, dict):
+                raise IOError("Lighter market metadata contains a malformed market.")
+            try:
+                if exact_int(raw_market.get("market_id"), "market_id") == market.market_id:
+                    matching_markets.append(raw_market)
+            except (TypeError, ValueError):
+                raise IOError("Lighter market metadata contains an invalid market id.")
+        if len(matching_markets) != 1:
+            raise IOError(f"Lighter market metadata did not uniquely identify market {market.market_id}.")
+        raw_market = matching_markets[0]
+        market_config = raw_market.get("market_config")
+        if (
+            not isinstance(raw_market.get("status"), str)
+            or not isinstance(market_config, dict)
+            or not isinstance(market_config.get("hidden"), bool)
+            or not isinstance(market_config.get("force_reduce_only"), bool)
+        ):
+            raise IOError("Lighter market metadata is missing required safety state.")
+        market_status = raw_market["status"]
+        force_reduce_only = market_config["force_reduce_only"]
+        market_tradable = market_status == "active" and not market_config["hidden"] and not force_reduce_only
+
+        user_stream_tracker = getattr(self, "_user_stream_tracker", None)
+        user_stream_last_recv_time = getattr(user_stream_tracker, "last_recv_time", 0)
+        if hasattr(user_stream_tracker, "_user_stream_tracking_task"):
+            user_stream_task = user_stream_tracker._user_stream_tracking_task
+            private_stream_connected = (
+                user_stream_last_recv_time > 0
+                and user_stream_task is not None
+                and not user_stream_task.done()
+            )
+        else:
+            private_stream_connected = user_stream_last_recv_time > 0
+        order_book_data_source = getattr(getattr(self, "order_book_tracker", None), "data_source", None)
+        public_ws = getattr(order_book_data_source, "_ws_assistant", None)
+        public_last_recv_time = getattr(public_ws, "last_recv_time", 0)
+        return {
+            "request_started_at": request_started_at,
+            "fetched_at": time.time(),
+            "account_index": self._account_index,
+            "net_position": net_position,
+            "net_position_known": net_position_known,
+            "active_orders": active_orders,
+            "orders_by_client_id": orders_by_client_id,
+            "pending_submissions_unknown": unattributed_trade_evidence or not net_position_known or any(
+                detail["status"] == "unknown" or not detail["cumulative_fill_known"]
+                for detail in orders_by_client_id.values()
+            ),
+            "available_margin": available_margin,
+            "available_margin_known": available_margin is not None,
+            "collateral_token": self._domain_settings.collateral_token,
+            "position_mode": "ONEWAY",
+            "leverage": leverage,
+            "leverage_confirmed": leverage_confirmed,
+            "market_state_known": True,
+            "market_status": market_status,
+            "market_tradable": market_tradable,
+            "force_reduce_only": force_reduce_only,
+            "private_stream_last_recv_time": user_stream_last_recv_time,
+            "private_stream_connected": private_stream_connected,
+            "public_data_last_recv_time": public_last_recv_time,
+        }
 
     @staticmethod
     def _match_order(tracked_order: InFlightOrder, orders: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -868,10 +1253,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         leverage = Decimal("1")
         initial_margin_fraction = raw_position.get("initial_margin_fraction")
         if initial_margin_fraction not in (None, "", "0", 0):
-            try:
-                leverage = Decimal("1") / self._safe_decimal(initial_margin_fraction)
-            except Exception:
-                leverage = Decimal("1")
+            leverage = leverage_from_account_margin_percentage(initial_margin_fraction) or Decimal("1")
 
         return Position(
             trading_pair=market.trading_pair,
@@ -902,18 +1284,16 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             code = tx_response.get("code")
             if code is not None:
                 try:
-                    return int(code)
+                    return exact_int(code, "code")
                 except (TypeError, ValueError):
                     return None
         if hasattr(tx_response, "code"):
             try:
-                return int(getattr(tx_response, "code"))
+                return exact_int(getattr(tx_response, "code"), "code")
             except (TypeError, ValueError):
                 return None
         return None
 
     def _is_tx_response_success(self, tx_response: Any) -> bool:
         code = self._extract_tx_code(tx_response)
-        if code is None:
-            return True
         return code == 200

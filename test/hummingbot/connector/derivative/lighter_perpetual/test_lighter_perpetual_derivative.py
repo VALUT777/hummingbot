@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, Callable, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -93,6 +94,592 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
             trading_required=True,
             domain=self.domain,
         )
+
+    def test_signer_uses_explicit_chain_for_every_domain(self):
+        expected = {
+            CONSTANTS.DOMAIN: ("https://mainnet.zklighter.elliot.ai", 304),
+            CONSTANTS.TESTNET_DOMAIN: ("https://testnet.zklighter.elliot.ai", 300),
+            CONSTANTS.ROBINHOOD_DOMAIN: ("https://api.rh.lighter.xyz", 466324),
+        }
+        for domain, (url, chain_id) in expected.items():
+            with self.subTest(domain=domain), patch(
+                "hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_derivative.SignerClient"
+            ) as signer_cls:
+                LighterPerpetualDerivative(
+                    lighter_perpetual_l1_address="0xabc",
+                    lighter_perpetual_account_index=0,
+                    lighter_perpetual_api_key_index=1,
+                    lighter_perpetual_api_private_key="secret",
+                    trading_pairs=["LIT-USDG"],
+                    trading_required=True,
+                    domain=domain,
+                )
+
+                signer_cls.assert_called_once_with(
+                    url=url,
+                    account_index=0,
+                    api_private_keys={1: "secret"},
+                    chain_id=chain_id,
+                )
+
+    def test_robinhood_trading_rules_use_usdg_collateral(self):
+        exchange = LighterPerpetualDerivative(
+            trading_pairs=["LIT-USDG"], trading_required=False, domain=CONSTANTS.ROBINHOOD_DOMAIN
+        )
+        response = self.all_symbols_request_mock_response
+        response["order_book_details"][0].update(
+            symbol="LIT", market_id=5, market_type="perp", min_base_amount="5",
+            min_quote_amount="10", supported_size_decimals=2, supported_price_decimals=4,
+            min_initial_margin_fraction=2000,
+        )
+
+        rules = asyncio.run(exchange._format_trading_rules(response))
+
+        self.assertEqual("LIT-USDG", rules[0].trading_pair)
+        self.assertEqual("USDG", rules[0].buy_order_collateral_token)
+        self.assertEqual("USDG", rules[0].sell_order_collateral_token)
+
+    def test_grid_account_snapshot_reconciles_account_orders_and_cumulative_fills(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        self.exchange._user_stream_tracker = SimpleNamespace(last_recv_time=123.0)
+        self.exchange._set_order_book_tracker(SimpleNamespace(
+            ready=True,
+            data_source=SimpleNamespace(_ws_assistant=SimpleNamespace(last_recv_time=124.0)),
+        ))
+        account = {
+            "accounts": [{
+                "account_index": self.ACCOUNT_INDEX,
+                "available_balance": "80",
+                "assets": [{
+                    "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"
+                }],
+                "positions": [{
+                    "market_id": 1, "position": "12", "sign": -1,
+                    "initial_margin_fraction": "20.00",
+                }],
+            }]
+        }
+        active = {"orders": [{
+            "client_order_id": "11", "order_id": "21", "status": "open", "filled_base_amount": "2"
+        }]}
+        inactive = {"orders": []}
+        trade = {
+            "trade_id": "t1", "market_id": 1, "size": "2", "price": "1",
+            "ask_account_id": self.ACCOUNT_INDEX, "bid_account_id": 999,
+            "ask_client_id_str": "11", "ask_id_str": "21", "is_maker_ask": True,
+        }
+        trades = {"trades": {"1": [trade, dict(trade)]}}
+        trade_request_params = []
+
+        async def api_get(path_url, **kwargs):
+            if path_url == CONSTANTS.TRADES_PATH_URL:
+                trade_request_params.append(kwargs.get("params"))
+            return {
+                CONSTANTS.BALANCE_PATH_URL: account,
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: active,
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: inactive,
+                CONSTANTS.TRADES_PATH_URL: trades,
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        snapshot = asyncio.run(
+            self.exchange.get_grid_account_snapshot(self.trading_pair, client_order_ids=["11"])
+        )
+
+        self.assertEqual(Decimal("-12"), snapshot["net_position"])
+        self.assertTrue(snapshot["net_position_known"])
+        self.assertEqual(Decimal("80"), snapshot["available_margin"])
+        self.assertEqual("USDG", snapshot["collateral_token"])
+        self.assertEqual(Decimal("5"), snapshot["leverage"])
+        self.assertTrue(snapshot["private_stream_connected"])
+        self.assertEqual(124.0, snapshot["public_data_last_recv_time"])
+        self.assertEqual(Decimal("2"), snapshot["orders_by_client_id"]["11"]["cumulative_fill_base"])
+        self.assertEqual(["t1"], snapshot["orders_by_client_id"]["11"]["trade_ids"])
+        self.assertFalse(snapshot["orders_by_client_id"]["11"]["terminal"])
+        self.assertTrue(snapshot["orders_by_client_id"]["11"]["cumulative_fill_known"])
+        self.assertTrue(snapshot["market_state_known"])
+        self.assertTrue(snapshot["market_tradable"])
+        self.assertFalse(snapshot["force_reduce_only"])
+        self.assertLessEqual(snapshot["request_started_at"], snapshot["fetched_at"])
+        self.assertEqual(
+            [{
+                "account_index": self.ACCOUNT_INDEX,
+                "market_id": 1,
+                "sort_by": "trade_id",
+                "sort_dir": "desc",
+                "limit": 100,
+            }],
+            trade_request_params,
+        )
+
+    def test_grid_snapshot_fails_closed_on_malformed_terminal_fill_and_missing_positions(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        account = {
+            "accounts": [{
+                "account_index": self.ACCOUNT_INDEX,
+                "available_balance": "80",
+                "assets": [{
+                    "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"
+                }],
+            }]
+        }
+        inactive = {"orders": [{
+            "client_order_id": 11,
+            "order_id": 21,
+            "status": "filled",
+            "filled_base_amount": "not-a-number",
+        }]}
+
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: account,
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: inactive,
+                CONSTANTS.TRADES_PATH_URL: {"trades": []},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        snapshot = asyncio.run(
+            self.exchange.get_grid_account_snapshot(self.trading_pair, client_order_ids=["11"])
+        )
+
+        order = snapshot["orders_by_client_id"]["11"]
+        self.assertTrue(order["terminal"])
+        self.assertFalse(order["cumulative_fill_known"])
+        self.assertIsNone(order["cumulative_fill_base"])
+        self.assertFalse(snapshot["net_position_known"])
+        self.assertIsNone(snapshot["net_position"])
+        self.assertIsNone(snapshot["leverage"])
+        self.assertTrue(snapshot["pending_submissions_unknown"])
+
+    def test_grid_snapshot_rejects_missing_order_schema(self):
+        account = {
+            "accounts": [{
+                "account_index": self.ACCOUNT_INDEX,
+                "available_balance": "80",
+                "assets": [{
+                    "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"
+                }],
+                "positions": [],
+            }]
+        }
+
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: account,
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"code": 200},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.TRADES_PATH_URL: {"trades": []},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        with self.assertRaisesRegex(IOError, "orders"):
+            asyncio.run(self.exchange.get_grid_account_snapshot(self.trading_pair))
+
+    def test_grid_snapshot_rejects_non_object_account_response(self):
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: [],
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.TRADES_PATH_URL: {"trades": []},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        with self.assertRaisesRegex(IOError, "account"):
+            asyncio.run(self.exchange.get_grid_account_snapshot(self.trading_pair))
+
+    def test_grid_snapshot_rejects_fractional_integer_identity_fields(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+
+        def responses():
+            return {
+                CONSTANTS.BALANCE_PATH_URL: {
+                    "code": 200,
+                    "accounts": [{
+                        "account_index": self.ACCOUNT_INDEX,
+                        "available_balance": "80",
+                        "assets": [{
+                            "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"
+                        }],
+                        "positions": [{"market_id": 1, "position": "0", "sign": 0}],
+                    }],
+                },
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"code": 200, "orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: {"code": 200, "orders": []},
+                CONSTANTS.TRADES_PATH_URL: {"code": 200, "trades": []},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "code": 200,
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }],
+                },
+            }
+
+        cases = {
+            "fractional success code": lambda values: values[CONSTANTS.TRADES_PATH_URL].update(code=200.5),
+            "fractional account index": lambda values: values[CONSTANTS.BALANCE_PATH_URL]["accounts"][0].update(
+                account_index=self.ACCOUNT_INDEX + 0.5
+            ),
+            "fractional position market": lambda values: values[CONSTANTS.BALANCE_PATH_URL]["accounts"][0][
+                "positions"
+            ][0].update(market_id=1.5),
+            "fractional collateral id": lambda values: values[CONSTANTS.BALANCE_PATH_URL]["accounts"][0][
+                "assets"
+            ][0].update(asset_id=3.0),
+            "fractional metadata market": lambda values: values[CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL][
+                "order_book_details"
+            ][0].update(market_id=1.5),
+        }
+        for case, mutate in cases.items():
+            with self.subTest(case=case):
+                values = responses()
+                mutate(values)
+
+                async def api_get(path_url, **kwargs):
+                    return values[path_url]
+
+                self.exchange._api_get = AsyncMock(side_effect=api_get)
+                with self.assertRaises(IOError):
+                    asyncio.run(self.exchange.get_grid_account_snapshot(self.trading_pair))
+
+    def test_grid_snapshot_caps_available_margin_by_exact_usdg_and_accepts_flat_sign_zero(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        account = {
+            "accounts": [{
+                "account_index": self.ACCOUNT_INDEX,
+                "available_balance": "90",
+                "assets": [{
+                    "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "30"
+                }],
+                "positions": [{
+                    "market_id": 1, "position": "0", "sign": 0, "initial_margin_fraction": "20.00"
+                }],
+            }]
+        }
+
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: account,
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.TRADES_PATH_URL: {"trades": []},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": True},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        snapshot = asyncio.run(self.exchange.get_grid_account_snapshot(self.trading_pair))
+
+        self.assertEqual(Decimal("0"), snapshot["net_position"])
+        self.assertTrue(snapshot["net_position_known"])
+        self.assertEqual(Decimal("70"), snapshot["available_margin"])
+        self.assertTrue(snapshot["available_margin_known"])
+        self.assertEqual(Decimal("5"), snapshot["leverage"])
+        self.assertTrue(snapshot["leverage_confirmed"])
+        self.assertFalse(snapshot["market_tradable"])
+        self.assertTrue(snapshot["force_reduce_only"])
+        account_call = next(
+            call for call in self.exchange._api_get.await_args_list
+            if call.kwargs["path_url"] == CONSTANTS.BALANCE_PATH_URL
+        )
+        self.assertEqual("false", account_call.kwargs["params"]["active_only"])
+
+    def test_grid_snapshot_rejects_collateral_row_without_asset_id_three(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        account = {
+            "accounts": [{
+                "account_index": self.ACCOUNT_INDEX,
+                "available_balance": "80",
+                "assets": [{"symbol": "USDG", "margin_balance": "100", "locked_balance": "20"}],
+                "positions": [],
+            }]
+        }
+
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: account,
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.TRADES_PATH_URL: {"trades": []},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        with self.assertRaisesRegex(IOError, "USDG"):
+            asyncio.run(self.exchange.get_grid_account_snapshot(self.trading_pair))
+
+    def test_grid_snapshot_does_not_invent_final_fill_when_trades_exceed_terminal_order(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        account = {
+            "accounts": [{
+                "account_index": self.ACCOUNT_INDEX,
+                "available_balance": "80",
+                "assets": [{
+                    "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"
+                }],
+                "positions": [],
+            }]
+        }
+        inactive = {"orders": [{
+            "client_order_id": 11, "order_id": 21, "status": "filled", "filled_base_amount": "3"
+        }]}
+        trade = {
+            "trade_id": "t1", "market_id": 1, "size": "5", "price": "1",
+            "ask_account_id": self.ACCOUNT_INDEX, "bid_account_id": 999,
+            "ask_client_id_str": "11", "ask_id_str": "21", "is_maker_ask": True,
+        }
+
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: account,
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: inactive,
+                CONSTANTS.TRADES_PATH_URL: {"trades": [trade]},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        snapshot = asyncio.run(
+            self.exchange.get_grid_account_snapshot(self.trading_pair, client_order_ids=["11"])
+        )
+
+        detail = snapshot["orders_by_client_id"]["11"]
+        self.assertTrue(detail["terminal"])
+        self.assertIsNone(detail["cumulative_fill_base"])
+        self.assertFalse(detail["cumulative_fill_known"])
+        self.assertTrue(snapshot["pending_submissions_unknown"])
+
+    def test_grid_snapshot_rejects_conflicting_duplicate_trade_id_as_final_evidence(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        account = {
+            "accounts": [{
+                "account_index": self.ACCOUNT_INDEX,
+                "available_balance": "80",
+                "assets": [{
+                    "asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"
+                }],
+                "positions": [],
+            }]
+        }
+        inactive = {"orders": [{
+            "client_order_id": 11, "order_id": 21, "status": "filled", "filled_base_amount": "3"
+        }]}
+
+        def trade(size):
+            return {
+                "trade_id": "same", "market_id": 1, "size": size, "price": "1",
+                "ask_account_id": self.ACCOUNT_INDEX, "bid_account_id": 999,
+                "ask_client_id_str": "11", "ask_id_str": "21", "is_maker_ask": True,
+            }
+
+        trade_rows = [trade("3"), trade("5")]
+
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: account,
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: inactive,
+                CONSTANTS.TRADES_PATH_URL: {"trades": trade_rows},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        self.exchange._api_get = AsyncMock(side_effect=api_get)
+        snapshot = asyncio.run(
+            self.exchange.get_grid_account_snapshot(self.trading_pair, client_order_ids=["11"])
+        )
+
+        detail = snapshot["orders_by_client_id"]["11"]
+        self.assertIsNone(detail["cumulative_fill_base"])
+        self.assertFalse(detail["cumulative_fill_known"])
+        self.assertTrue(snapshot["pending_submissions_unknown"])
+
+        malformed_trade = trade("3")
+        del malformed_trade["trade_id"]
+        trade_rows[:] = [malformed_trade]
+        snapshot = asyncio.run(
+            self.exchange.get_grid_account_snapshot(self.trading_pair, client_order_ids=["11"])
+        )
+        self.assertFalse(snapshot["orders_by_client_id"]["11"]["cumulative_fill_known"])
+        self.assertTrue(snapshot["pending_submissions_unknown"])
+
+    def test_grid_snapshot_blocks_on_restored_unresolved_connector_order(self):
+        self.exchange.start_tracking_order(
+            order_id="991",
+            exchange_order_id=None,
+            trading_pair=self.trading_pair,
+            trade_type=TradeType.BUY,
+            price=Decimal("100"),
+            amount=Decimal("1"),
+            order_type=OrderType.LIMIT,
+        )
+        saved_states = self.exchange.tracking_states
+        restarted = self.create_exchange_instance()
+        restarted._account_index = self.ACCOUNT_INDEX
+        restarted._ensure_account_ready = AsyncMock()
+        restarted._markets_by_trading_pair = self.exchange._markets_by_trading_pair
+        restarted._markets_by_id = self.exchange._markets_by_id
+        restarted._markets_by_exchange_symbol = self.exchange._markets_by_exchange_symbol
+        restarted.restore_tracking_states(saved_states)
+
+        async def api_get(path_url, **kwargs):
+            return {
+                CONSTANTS.BALANCE_PATH_URL: {
+                    "accounts": [{
+                        "account_index": self.ACCOUNT_INDEX,
+                        "available_balance": "80",
+                        "assets": [{"symbol": "USDC", "margin_balance": "100", "locked_balance": "20"}],
+                        "positions": [],
+                    }]
+                },
+                CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL: {"orders": []},
+                CONSTANTS.TRADES_PATH_URL: {"trades": []},
+                CONSTANTS.ORDER_BOOK_DETAILS_PATH_URL: {
+                    "order_book_details": [{
+                        "market_id": 1,
+                        "status": "active",
+                        "market_config": {"hidden": False, "force_reduce_only": False},
+                    }]
+                },
+            }[path_url]
+
+        restarted._api_get = AsyncMock(side_effect=api_get)
+        snapshot = asyncio.run(restarted.get_grid_account_snapshot(self.trading_pair))
+
+        self.assertIn("991", restarted.in_flight_orders)
+        self.assertEqual("unknown", snapshot["orders_by_client_id"]["991"]["status"])
+        self.assertTrue(snapshot["pending_submissions_unknown"])
+
+    def test_robinhood_position_parses_percentage_margin_fraction_as_leverage(self):
+        position = self.exchange._parse_position(
+            {
+                "market_id": 1,
+                "position": "12",
+                "sign": 1,
+                "unrealized_pnl": "3.5",
+                "avg_entry_price": "0.50",
+                "initial_margin_fraction": "20.00",
+            }
+        )
+
+        self.assertEqual(Decimal("5"), position.leverage)
+
+    def test_robinhood_balance_uses_usdg_available_margin(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        self.exchange._api_get = AsyncMock(
+            return_value={
+                "accounts": [{
+                    "account_index": self.ACCOUNT_INDEX,
+                    "available_balance": "80",
+                    "assets": [
+                        {"asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"},
+                        {"symbol": "AAPL", "margin_balance": "4", "locked_balance": "1"},
+                    ],
+                }]
+            }
+        )
+
+        asyncio.run(self.exchange._update_balances())
+
+        self.assertEqual(Decimal("80"), self.exchange._account_available_balances["USDG"])
+        self.assertEqual(Decimal("3"), self.exchange._account_available_balances["AAPL"])
+
+    def test_robinhood_balance_rejects_usdg_row_without_asset_id_three(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        self.exchange._api_get = AsyncMock(
+            return_value={
+                "accounts": [{
+                    "account_index": self.ACCOUNT_INDEX,
+                    "available_balance": "80",
+                    "assets": [{"symbol": "USDG", "margin_balance": "100", "locked_balance": "20"}],
+                }]
+            }
+        )
+
+        with self.assertRaisesRegex(IOError, "USDG"):
+            asyncio.run(self.exchange._update_balances())
+
+    def test_robinhood_balance_rejects_duplicate_usdg_identity_rows(self):
+        self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN
+        self.exchange._domain_settings = CONSTANTS.get_domain_settings(CONSTANTS.ROBINHOOD_DOMAIN)
+        self.exchange._api_get = AsyncMock(
+            return_value={
+                "accounts": [{
+                    "account_index": self.ACCOUNT_INDEX,
+                    "available_balance": "80",
+                    "assets": [
+                        {"asset_id": 3, "symbol": "USDG", "margin_balance": "100", "locked_balance": "20"},
+                        {"asset_id": 4, "symbol": "USDG", "margin_balance": "1", "locked_balance": "0"},
+                    ],
+                }]
+            }
+        )
+
+        with self.assertRaisesRegex(IOError, "USDG"):
+            asyncio.run(self.exchange._update_balances())
 
     def exchange_symbol_for_tokens(self, base_token: str, quote_token: str) -> str:
         return base_token
@@ -428,7 +1015,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
                     "position": str(order.amount),
                     "avg_entry_price": str(order.price),
                     "unrealized_pnl": str(unrealized_pnl),
-                    "initial_margin_fraction": str(Decimal("1") / lev),
+                    "initial_margin_fraction": str(Decimal("100") / lev),
                 }
             },
         }
@@ -1184,6 +1771,24 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
         ok, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 5)
         self.assertTrue(ok)
         self.exchange._signer_client.update_leverage.assert_awaited_once()
+        self.assertIsNone(self.exchange.confirmed_leverage(self.trading_pair))
+
+    async def test_lighter_set_leverage_rejects_response_without_explicit_success_code(self):
+        self.exchange._signer_client.update_leverage.return_value = (None, {}, None)
+
+        ok, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 5)
+
+        self.assertFalse(ok)
+        self.assertIn("Unexpected leverage response", msg)
+        self.assertIsNone(self.exchange.confirmed_leverage(self.trading_pair))
+
+    async def test_lighter_set_leverage_rejects_fractional_success_code(self):
+        self.exchange._signer_client.update_leverage.return_value = (None, {"code": 200.5}, None)
+
+        ok, msg = await self.exchange._set_trading_pair_leverage(self.trading_pair, 5)
+
+        self.assertFalse(ok)
+        self.assertIn("Unexpected leverage response", msg)
 
     async def test_lighter_set_leverage_no_signer(self):
         self.exchange._signer_client = None
@@ -1267,7 +1872,7 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
             "position": "2",
             "avg_entry_price": "2500",
             "unrealized_pnl": "12.5",
-            "initial_margin_fraction": "0.1",
+            "initial_margin_fraction": "10.00",
         }
         position = self.exchange._parse_position(raw)
         self.assertIsNotNone(position)
