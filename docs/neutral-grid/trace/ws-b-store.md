@@ -137,6 +137,26 @@ v1 -> v2 upgrade with backfill.
 - `order_dedupe_key` = `["ORDER", domain, account, market, exchange order id]` (same identity as WS-C's 4-tuple, which
   `apply_history_batch(dedupe_keys=...)` accepts); an order row without `order_index`/`order_id` raises `ValueError`.
 
+## Aggregate TP: store model = WS-A `CellLedger` model (codex/ng-core @ 79f9e2f71)
+
+| WS-A (`cells.py`) | Store | Mapping |
+|---|---|---|
+| `Leg.allocation: Dict[int, Decimal]` (generation -> share), `to_record()` `{"1": "2", ...}`, `TpDispatchItem.allocation` `((gen, share), ...)` | `allocations` rows `(cid, grid_id, cell_id, generation, amount)`; `record_intent(..., allocations=)` accepts the dict, string-keyed record, pairs, or explicit `(grid, cell, gen, share)` | identical; `LegRecord.allocation` / `leg_allocation(cid)` return `{gen: Decimal}`; grid/cell are always the leg's own cell |
+| same cell, shares > 0, sum == `qty`, no duplicate gen | same, validated before any write | identical (a foreign cell is refused, review item 7) |
+| host = newest allocated generation (`generation` must equal it) | leg identity `generation` must equal `max(gens)` | identical |
+| share <= cycle `unassigned_total()` (E - X - reserved) | per generation `X + reserved TP + share <= E` | identical |
+| `allocated_filled()`: water-fill of the leg's cumulative `filled`, oldest generation first | `_apply_trade` credits each cycle's `exit_filled` with the water-fill delta of every new fill and stores it in `fill_allocations` | identical per-cycle X, idempotent (dedupe) and order independent (depends only on the cumulative) |
+| `tp_parts()` / reserved: `share - filled share` of non-final legs | `_tp_reserved`: non-final aggregate legs `share - water-filled share`; final legs contribute any unallocated quantity (always 0 now) | identical |
+| `open_cycles()`: current + released cycles reopened by late evidence | `_cycle_accepts`: OPEN cycles, or a COMPLETE cycle with E > X **after** the late evidence is acknowledged (`late_evidence == 2`) | store is stricter: an unaudited reopened cycle gets no TP (market frozen until audit); engine calls `record_manual_reconciliation(resolved_conflict_ids=...)` in the same tx as `CellLedger.acknowledge_late_evidence` |
+| no explicit per-fill split step | `allocate_fill` / `FillAllocation` kept for API compatibility: identical split -> no-op, anything else -> `InvalidTransitionError` | engine does not need to call it |
+
+Test: `test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_review_fixes.py::test_ws_a_aggregate_tp_water_fills_generations_like_cell_ledger`
+(parametrized fill orders 5+7 / 7+5: gen1 late obligation 2 + gen2 obligation 10 in one TP of 12; X1/X2 after the
+first fill follow the water-fill, final X identical for both orders, replay idempotent, host/headroom guards, WS-A
+string/pair shapes). `test_review3_*` and `test_review6_caught_guard_error_*` were adapted from the manual-split model
+(their red evidence at `78d780164` stays valid for that model); `test_ng_store_history.py::test_aggregated_tp_fill_allocation_is_exact_and_idempotent`
+now asserts the automatic split.
+
 ## Handoff to WS-D (engine)
 
 1. Open once per process (lock + host marker live in `default_host_dir()`, see Review fixes): `NeutralGridStore.open(None or path, EngineIdentity(connector_name, connector_domain,
