@@ -438,3 +438,89 @@ def test_e03_health_sidecar_heartbeat_even_when_healthy(tmp_path):
         assert float(later["at"]) >= h.clock() - 1.0 - h.engine.options.health_heartbeat_s
     finally:
         h.close()
+
+
+# ------------------------------------------------------------------------------------------ web contract (D2-17)
+# Fixture copies of what web/neutral_grid/commands.py normalizes for the extended audits (acknowledge + typed phrase).
+def _web_retire(cid):
+    return {"action": "retire_colliding_cid", "note": "foreign order owns it", "acknowledge": True, "cid": str(cid),
+            "confirmation": f"СПИСАТЬ CID {cid}"}
+
+
+def _web_migrate(grid_id):
+    return {"action": "migrate_grid", "note": "next grid", "acknowledge": True,
+            "confirmation": f"МИГРАЦИЯ СЕТКИ {grid_id}"}
+
+
+def _collision(h):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import CID_EPOCH_SHIFT
+    epoch = h.engine.b_engine.cid_epoch
+    colliding = (epoch << CID_EPOCH_SHIFT) | (len(h.fx.submits()) + 1)
+    h.fx.place_manual_order(Side.BUY, D("4.5"), D("1"), client_order_id=colliding)
+    h.tick(6)
+    cell = h.buy_cells()[-1]
+    h.fx.fill(h.live_order(cell, ENTRY).cid, D("10"))
+    h.tick(6)
+    return cell, colliding
+
+
+def test_web_retire_payload_is_accepted_only_for_the_recorded_colliding_cid(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.commands import validate_kind
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        cell, colliding = _collision(h)
+        summary = h.engine.last_snapshot["summary"]
+        assert summary["colliding_cid"] == str(colliding) and "CID_ALLOCATION" in summary["freezes"]
+        assert validate_kind("baseline_audit", _web_retire(colliding)) is None
+        h.command(CommandKind.BASELINE_AUDIT, _web_retire(colliding + 1), key="web-retire-wrong")
+        h.tick()
+        assert _cmd(h, "web-retire-wrong").status == CommandStatus.REJECTED       # never an arbitrary CID
+        h.command(CommandKind.BASELINE_AUDIT, _web_retire(colliding), key="web-retire")
+        h.tick(6)
+        assert _cmd(h, "web-retire").status == CommandStatus.APPLIED, _cmd(h, "web-retire").result
+        assert h.live_order(cell, TP) is not None
+        assert h.engine.last_snapshot["summary"]["colliding_cid"] is None
+    finally:
+        h.close()
+
+
+def test_web_migrate_payload_and_published_grid_mutation_blockers(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.commands import validate_kind
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.engine import open_engine
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        assert h.engine.last_snapshot["summary"]["grid_mutation_blockers"]           # running: not quiescent
+        h.command(CommandKind.STOP, key="stop-web-migrate")
+        h.run_until(lambda: h.engine.is_stopped, max_ticks=40)
+        h.tick()
+        assert h.engine.last_snapshot["summary"]["grid_mutation_blockers"] == []     # quiescent: allowed
+        h.fx.remove_ws_listener(h.engine.wake)
+        h.engine.store.close()
+        new = make_config(grid_id="grid-web", lower_price=D("5.1"), upper_price=D("6.1"))
+        h.engine = open_engine(new, str(h.db_path), h.fx, clock=h.clock, options=h.options,
+                               lock_dir=str(h.lock_dir), allow_grid_migration=True, offline_demo=True)
+        h.config = new
+        h.fx.add_ws_listener(h.engine.wake)
+        h.tick(6)
+        assert validate_kind("baseline_audit", _web_migrate("grid-web")) is None
+        h.command(CommandKind.BASELINE_AUDIT, _web_migrate("grid-web"), key="web-migrate")
+        h.tick(2)
+        assert _cmd(h, "web-migrate").status == CommandStatus.APPLIED, _cmd(h, "web-migrate").result
+        assert h.engine.grid_id == "grid-web"
+    finally:
+        h.close()
+
+
+def test_web_start_material_id_is_persisted_with_the_start_binding(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        h.command(CommandKind.START, dict(start_payload(), material_id="a" * 32), key="start-material")
+        h.tick()
+        assert _cmd(h, "start-material").status == CommandStatus.APPLIED
+        assert h.engine.meta.start_material_id == "a" * 32
+        start_audit = [e for e in h.engine.store.audit_events() if e.kind == "start"][0]
+        assert start_audit.payload.get("material_id") == "a" * 32
+    finally:
+        h.close()
