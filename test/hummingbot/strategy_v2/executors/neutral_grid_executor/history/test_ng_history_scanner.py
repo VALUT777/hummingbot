@@ -32,6 +32,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.history import (
     ScanRecord,
     attribute_trades_to_order,
     evaluate_terminal_release,
+    order_dedupe_key,
 )
 
 DOMAIN = "lighter_perpetual_robinhood"
@@ -253,6 +254,10 @@ class HistoryScannerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.incomplete_reason.startswith(reason), result.incomplete_reason)
                 self.assertIsNone(result.trades_high_water)
                 self.assertIsNone(result.orders_high_water)
+                if name == "conflicting_duplicate":
+                    conflicted = port.rows[STREAM_TRADES][0].dedupe_key(DOMAIN)
+                    self.assertNotIn(conflicted, {row.dedupe_key(DOMAIN) for row in result.new_trades})
+                    self.assertEqual(249, len(result.new_trades))
 
     async def test_ac12_break_before_boundary_is_incomplete_and_resumes(self):
         port = FakeHistoryPort(trades=newest_first_trades(250), orders=newest_first_orders(250))
@@ -283,6 +288,11 @@ class HistoryScannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.complete)
         self.assertEqual(REASON_CONFLICT, result.incomplete_reason)
         self.assertTrue(any("trades_exceed_order_cumulative" in c for c in result.conflicts), result.conflicts)
+        # the contradicted order and every execution attributed to it are withheld (audit only)
+        self.assertEqual([], result.new_orders)
+        self.assertEqual([], result.new_trades)
+        self.assertEqual({STREAM_ORDERS: 1, STREAM_TRADES: 2},
+                         {k: len(v) for k, v in scanner.last_conflicted_rows.items()})
 
     async def test_ac40_same_key_different_payload_across_scans_is_conflict(self):
         trades = newest_first_trades(5)
@@ -472,6 +482,94 @@ class HistoryScannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, port.pages_requested(STREAM_TRADES))
         self.assertEqual(1, port.pages_requested(STREAM_ORDERS))
         self.assertEqual(700, result.weight_used)
+
+
+class ConflictWithholdingTest(unittest.IsolatedAsyncioTestCase):
+    """Review findings 1 and 2: a contradicted key is never offered for commit; orders key by exchange id."""
+
+    def make(self, port, **kwargs):
+        view = InMemoryHistoryCursorView(DOMAIN)
+        return HistoryScanner(port, view, Decimal("60"), 100_000, clock=FakeClock(), **kwargs), view
+
+    async def test_ac40_in_scan_conflicting_trade_duplicate_is_withheld_and_never_committed(self):
+        trades = newest_first_trades(5, size="1")
+        bad = replace(trades[0], size=Decimal("7"))
+        port = FakeHistoryPort(trades=[trades[0], bad] + trades[1:])
+        scanner, view = self.make(port)
+        result = (await scan_until_done(scanner))[-1]
+        key = trades[0].dedupe_key(DOMAIN)
+        self.assertFalse(result.complete)
+        self.assertEqual(REASON_CONFLICT, result.incomplete_reason)
+        self.assertNotIn(key, {row.dedupe_key(DOMAIN) for row in result.new_trades})
+        self.assertEqual(4, len(result.new_trades))
+        self.assertEqual({Decimal("1"), Decimal("7")},
+                         {row.size for row in scanner.last_conflicted_rows[STREAM_TRADES]})
+        view.commit(result)
+        self.assertIsNone(view.committed_payload(STREAM_TRADES, key))
+
+    async def test_conflict_on_a_later_page_of_a_multi_call_walk_is_never_pre_committed(self):
+        trades = newest_first_trades(150, size="1")
+        # the last row of page 1 is served again at the top of page 2 with a different size
+        contradicting = replace(trades[99], size=Decimal("2"))
+        port = FakeHistoryPort(trades=trades[:100] + [contradicting] + trades[100:])
+        scanner = HistoryScanner(port, InMemoryHistoryCursorView(DOMAIN), Decimal("60"), 700, clock=FakeClock())
+        view = scanner._view
+        first = await scanner.scan()  # one inactive-orders page + one trades page
+        self.assertEqual(REASON_IN_PROGRESS, first.incomplete_reason)
+        self.assertEqual(1, port.pages_requested(STREAM_TRADES))
+        self.assertEqual([], first.new_trades)  # nothing is offered before the walk has finished
+        view.commit(first)
+        final = (await scan_until_done(scanner))[-1]
+        self.assertFalse(final.complete)
+        key = trades[99].dedupe_key(DOMAIN)
+        self.assertNotIn(key, {row.dedupe_key(DOMAIN) for row in final.new_trades})
+        self.assertEqual(149, len(final.new_trades))
+        view.commit(final)
+        self.assertIsNone(view.committed_payload(STREAM_TRADES, key))
+
+    async def test_ac40_inactive_order_with_contradicting_filled_is_withheld(self):
+        orders = newest_first_orders(3, filled="3")
+        port = FakeHistoryPort(orders=[orders[0], replace(orders[0], filled_base_amount=Decimal("5"))] + orders[1:])
+        scanner, _ = self.make(port)
+        result = (await scan_until_done(scanner))[-1]
+        self.assertFalse(result.complete)
+        self.assertNotIn(orders[0].order_index, {row.order_index for row in result.new_orders})
+        self.assertEqual(2, len(result.new_orders))
+
+    async def test_non_terminal_inactive_row_is_withheld(self):
+        orders = newest_first_orders(2)
+        port = FakeHistoryPort(orders=[replace(orders[0], status="open"), orders[1]])
+        scanner, _ = self.make(port)
+        result = (await scan_until_done(scanner))[-1]
+        self.assertFalse(result.complete)
+        self.assertEqual([orders[1].order_index], [row.order_index for row in result.new_orders])
+
+    async def test_ac40_same_exchange_order_with_different_client_id_is_conflict(self):
+        """Finding 2: orders key by exact exchange id; a client-id disagreement is a payload conflict."""
+        order_a = order(1, BASE_TS, filled="3")
+        order_b = replace(order_a, client_order_id=999, client_order_id_str="999", filled_base_amount=Decimal("5"))
+        self.assertEqual(order_dedupe_key(DOMAIN, order_a), order_dedupe_key(DOMAIN, order_b))
+        port = FakeHistoryPort(orders=[order_a, order_b])
+        scanner, view = self.make(port)
+        result = (await scan_until_done(scanner))[-1]
+        self.assertFalse(result.complete)
+        self.assertEqual([], result.new_orders)
+
+        port.rows[STREAM_ORDERS] = [order_a]
+        clean = (await scan_until_done(scanner))[-1]
+        self.assertTrue(clean.complete, clean.incomplete_reason)
+        view.commit(clean)
+        port.rows[STREAM_ORDERS] = [replace(order_a, client_order_id=999, client_order_id_str="999")]
+        later = (await scan_until_done(scanner))[-1]
+        self.assertFalse(later.complete)
+        self.assertTrue(any("committed_payload_mismatch" in c for c in later.conflicts), later.conflicts)
+
+    async def test_order_row_without_exchange_id_is_schema_error(self):
+        port = FakeHistoryPort(orders=[replace(order(1, BASE_TS), order_id=None, order_index=None)])
+        scanner, _ = self.make(port)
+        result = (await scan_until_done(scanner))[-1]
+        self.assertFalse(result.complete)
+        self.assertTrue(result.incomplete_reason.startswith(REASON_SCHEMA_ERROR), result.incomplete_reason)
 
 
 class SettlementTest(unittest.TestCase):
