@@ -20,12 +20,7 @@ from decimal import Decimal
 from typing import Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import Side, TradingRules
-from hummingbot.strategy_v2.executors.neutral_grid_executor.grid import (
-    min_valid_order_qty,
-    order_qty_blocker,
-    quantize_down,
-    require_decimal,
-)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.grid import partition_valid, require_decimal
 
 ZERO = Decimal("0")
 
@@ -62,7 +57,7 @@ class AggregatePlan:
     target: Decimal
     qty: Decimal                               # valid order quantity (step multiple, >= min)
     allocation: Tuple[Tuple[LotKey, Decimal], ...]   # exact per-lot allocation, sums to qty
-    residual: Tuple[Tuple[LotKey, Decimal], ...]     # what stays DUST per lot
+    residual: Tuple[Tuple[LotKey, Decimal], ...]     # what stays DUST per lot (on the group's last plan)
 
 
 def collect(ledgers: Iterable) -> List[DustLot]:
@@ -101,24 +96,34 @@ def group(lots: Sequence[DustLot]) -> List[DustGroup]:
 
 
 def aggregate(lots: Sequence[DustLot], rules: TradingRules) -> List[AggregatePlan]:
-    """Aggregate orders that are valid under ``rules``; groups that still cannot form one stay DUST."""
+    """Aggregate orders that are valid under ``rules``; what still cannot form one stays DUST.
+
+    A group above ``max_base`` becomes several balanced valid orders (``grid.partition_valid``); lots are
+    consumed in ``(cell_id, generation)`` order and each order carries its exact per-lot allocation.
+    """
     plans = []
     for g in group(lots):
-        qty = quantize_down(g.total, rules.size_step)
-        if qty <= 0 or qty < min_valid_order_qty(rules, g.target) or order_qty_blocker(qty, g.target, rules):
+        chunks = partition_valid(g.total, g.target, rules)
+        if not chunks:
             continue
-        remaining = qty
-        allocation: List[Tuple[LotKey, Decimal]] = []
-        residual: List[Tuple[LotKey, Decimal]] = []
-        for lot in g.lots:
-            take = min(lot.qty, remaining)
-            remaining -= take
-            if take > 0:
-                allocation.append((lot.key, take))
-            if lot.qty - take > 0:
-                residual.append((lot.key, lot.qty - take))
-        plans.append(AggregatePlan(side=g.side, target=g.target, qty=qty, allocation=tuple(allocation),
-                                   residual=tuple(residual)))
+        left = {lot.key: lot.qty for lot in g.lots}
+        order = [lot.key for lot in g.lots]
+        for chunk in chunks:
+            need = chunk
+            allocation: List[Tuple[LotKey, Decimal]] = []
+            for key in order:
+                take = min(left[key], need)
+                if take > 0:
+                    allocation.append((key, take))
+                    left[key] -= take
+                    need -= take
+                if need == 0:
+                    break
+            plans.append(AggregatePlan(side=g.side, target=g.target, qty=chunk, allocation=tuple(allocation),
+                                       residual=()))
+        residual = tuple((key, left[key]) for key in order if left[key] > 0)
+        plans[-1] = AggregatePlan(side=plans[-1].side, target=plans[-1].target, qty=plans[-1].qty,
+                                  allocation=plans[-1].allocation, residual=residual)
     return plans
 
 

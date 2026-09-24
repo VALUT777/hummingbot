@@ -1,7 +1,8 @@
-"""NG-CELL-001..004, NG-GRID-003 quantities; AC-01/02 (core part), AC-05, AC-06, AC-07, AC-08, AC-23, AC-33."""
+"""NG-CELL-001..004, NG-GRID-003 quantities; AC-01/02 (core part), AC-05..08, AC-23, AC-33, AC-42 (ledger)."""
 import json
 import unittest
 
+from hummingbot.strategy_v2.executors.neutral_grid_executor import grid
 from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import (
     CellLedger,
     FillOutcome,
@@ -220,6 +221,72 @@ class TestTerminalPartialEntryAndLateFills(unittest.TestCase):
         self.assertTrue(any("terminal cumulative" in v for v in h2.ledger.check_invariants()))
 
 
+class TestLateEvidenceResolution(unittest.TestCase):
+    """AC-08/AC-42 resolution: late evidence -> audit -> ordinary TP closes it -> the cell keeps cycling."""
+
+    def test_resolution_tp_fills_do_not_relatch_and_later_cycles_release(self):
+        h = Harness(BUY_CELL, r=rules(min_base="1", min_notional="0"))
+        e0 = h.entry()
+        h.fill(e0, "4")
+        h.ledger.set_state(e0, OrderState.CANCEL_PENDING)
+        h.ledger.set_state(e0, OrderState.TERMINAL_UNKNOWN)
+        h.ledger.confirm_terminal(e0, D("4"))
+        _, (tp0,) = h.dispatch_tps()
+        h.fill(tp0, "4")
+        h.ledger.confirm_terminal(tp0, D("4"))
+        h.ledger.release(True)
+        e1 = h.entry()                                              # healthy, independent cycle 1
+        h.fill(e1, "6")
+        _, (tp1,) = h.dispatch_tps()
+        # Late execution of the cycle-0 entry surfaces after reuse.
+        outcome, _ = h.fill(e0, "1")
+        self.assertEqual(FillOutcome.LATE_EVIDENCE, outcome)
+        self.assertTrue(h.ledger.check_invariants())                # proven cumulative contradicted -> visible
+        self.assertIn("LATE_EVIDENCE_AUDIT", h.ledger.can_release(True).reasons)
+        # Operator audit: the executed quantity becomes the proven cumulative; the obligation stays.
+        self.assertEqual([e0], h.ledger.acknowledge_late_evidence(0))
+        self.assertEqual([], h.ledger.check_invariants())
+        self.assertEqual(D("5"), h.leg(e0).terminal_cumulative)
+        plan, legs = h.dispatch_tps()
+        self.assertEqual(((0, D("1")),), tuple((i.generation, i.qty) for i in plan.items))
+        (resolution,) = legs
+        self.assertEqual(FillOutcome.APPLIED, h.fill(resolution, "1")[0])   # ordinary fill, no re-latch
+        h.ledger.confirm_terminal(resolution, D("1"))
+        self.assertFalse(any(c.late_evidence for c in h.ledger.cycles))
+        self.assertEqual((D("5"), D("5")), (h.ledger.cycles[0].E, h.ledger.cycles[0].X))
+        # Cycle 1 completes and releases; cycle 2 starts with full Q on the fixed side.
+        h.fill(e1, "4")
+        h.ledger.confirm_terminal(e1, D("10"))
+        _, (tp1b,) = h.dispatch_tps()
+        for leg, q in ((tp1, "6"), (tp1b, "4")):
+            h.fill(leg, q)
+            h.ledger.confirm_terminal(leg, D(q))
+        self.assertTrue(h.ledger.can_release(True).ok)
+        self.assertEqual([], h.ledger.check_invariants())
+        h.ledger.release(True)
+        e2 = h.entry()
+        self.assertEqual((2, Side.BUY, D("10")), (e2.generation, h.leg(e2).side, h.leg(e2).requested))
+        self.assertEqual([], h.ledger.check_invariants())
+        self.assertEqual(frozenset({CellState.ENTRY_LIVE}), h.ledger.state_flags())
+
+    def test_audited_execution_of_a_rejected_leg_becomes_terminal(self):
+        h = Harness(BUY_CELL, r=rules(min_base="1", min_notional="0"))
+        e = h.entry(accept=False)
+        h.ledger.record_transport(e, TransportResult(TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL))
+        self.assertEqual(FillOutcome.LATE_EVIDENCE, h.fill(e, "2")[0])   # venue contract broken -> audit
+        self.assertTrue(any("rejected leg has fills" in v for v in h.ledger.check_invariants()))
+        with self.assertRaises(LedgerError):
+            h.ledger.next_entry_identity()
+        h.ledger.acknowledge_late_evidence(0)
+        self.assertEqual((OrderState.TERMINAL, D("2")), (h.leg(e).state, h.leg(e).terminal_cumulative))
+        self.assertEqual([], h.ledger.check_invariants())
+        plan, (tp,) = h.dispatch_tps()
+        self.assertEqual((D("2"),), plan.quantities)
+        h.fill(tp, "2")
+        h.ledger.confirm_terminal(tp, D("2"))
+        self.assertTrue(h.ledger.can_release(True).ok)
+
+
 class TestIdempotencyAndConflicts(unittest.TestCase):
     def test_fill_idempotent_by_canonical_key(self):
         h = Harness()
@@ -378,6 +445,21 @@ class TestReleaseAndDust(unittest.TestCase):
         self.assertEqual((D("5"),), plan.quantities)
         self.assertEqual(D("0"), h.ledger.buckets().dust)              # dust consumed by the merged TP
         self.assertEqual({}, h.ledger.refresh_dust(h.rules))
+
+    def test_max_base_split_is_balanced_so_no_avoidable_dust(self):
+        # Review #4: Q=10 accepted, then runtime max_base=6 (min 5, step 1): 5+5 is valid, 6+DUST 4 is not.
+        h = Harness(r=rules(step="1", min_base="5", min_notional="0"))
+        e = h.entry()
+        h.fill(e, "10")
+        h.ledger.confirm_terminal(e, D("10"))
+        tighter = rules(step="1", min_base="5", min_notional="0", max_base="6")
+        plan = h.ledger.tp_obligation_to_dispatch(tighter)
+        self.assertEqual(((D("5"), D("5")), D("0")), (plan.quantities, plan.dust))
+        self.assertEqual({}, h.ledger.refresh_dust(tighter))
+        # No exact partition: 13 with chunks in [5, 6] -> dispatch 6+6, only 1 remains (the maximum possible).
+        self.assertEqual([D("6"), D("6")], grid.partition_valid(D("13"), D("5.0727"), tighter))
+        self.assertEqual([D("5"), D("5"), D("5")], grid.partition_valid(D("15"), D("5.0727"), tighter))
+        self.assertEqual([], grid.partition_valid(D("4"), D("5.0727"), tighter))
 
     def test_full_q_below_runtime_minimum_is_not_armed(self):
         h = Harness(r=rules(min_base="11"))

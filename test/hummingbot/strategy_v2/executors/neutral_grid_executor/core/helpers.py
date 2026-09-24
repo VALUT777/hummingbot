@@ -113,6 +113,7 @@ class CoreSim:
         self.history = []                     # every applied fill: (key, identity, qty, price, side)
         self.last_admission = None
         self.last_router = None
+        self.aggregates = 0                   # aggregate TP legs dispatched (AC-39 path coverage)
 
     # ---------------------------------------------------------------- views
     def legs(self):
@@ -138,9 +139,11 @@ class CoreSim:
         views = []
         for cid, L in sorted(self.ledgers.items()):
             open_ = bool(L.open_cycles())
+            entry_live = any(not e.is_final for c in L.open_cycles() for e in c.entries)
             views.append(CellAdmission(cell=L.spec, open_cycle=open_, actual_orders=len(L.non_final_legs()),
                                        reserved_slots=self.reservations.get(cid, 0),
-                                       slot_need=slot_need_from_ledger(L, self.rules) if open_ else None))
+                                       slot_need=slot_need_from_ledger(L, self.rules) if open_ else None,
+                                       entry_live=entry_live))
         return views
 
     # ---------------------------------------------------------------- one tick
@@ -183,7 +186,10 @@ class CoreSim:
                 else:
                     ident = L.next_tp_identity(item.generation)
                     leg = L.add_tp_intent(item.qty, self.alloc.allocate(ident), self.rules, generation=item.generation,
-                                          order_type=OrderTypePolicy.LIMIT, seq=next(self._seq))
+                                          order_type=OrderTypePolicy.LIMIT, seq=next(self._seq),
+                                          allocation=item.allocation)
+                    if item.allocation is not None:
+                        self.aggregates += 1
                 self.by_cid[leg.cid] = (cid, leg.identity)
                 outcome = TransportOutcome.ACCEPTED if self.transport == "ACCEPTED" else TransportOutcome.UNKNOWN
                 L.record_transport(leg.identity, TransportResult(outcome, exchange_order_id=f"x{leg.cid}"

@@ -41,7 +41,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
 from hummingbot.strategy_v2.executors.neutral_grid_executor.grid import (
     min_valid_order_qty,
     order_qty_blocker,
-    quantize_down,
+    partition_valid,
     require_decimal,
     rules_blockers,
 )
@@ -135,6 +135,9 @@ class Leg:
     expiry_ms: Optional[int] = None
     seq: int = 0                       # engine-provided global FIFO sequence (outbox order)
     late_evidence: bool = False
+    # Aggregate TP only: generation -> exact share of ``requested`` (same cell, same side+target). The leg lives
+    # in its newest cycle; fills are split over the allocation by water-filling in generation order.
+    allocation: Optional[Dict[int, Decimal]] = None
 
     @property
     def role(self) -> LegRole:
@@ -153,6 +156,16 @@ class Leg:
     def possibly_executable(self) -> bool:
         return not self.is_final and self.remaining > 0
 
+    def allocated_filled(self) -> Dict[int, Decimal]:
+        """Per-generation share of ``filled`` for an aggregate TP (depends only on the cumulative fill)."""
+        left = self.filled
+        out: Dict[int, Decimal] = {}
+        for gen in sorted(self.allocation or {}):
+            take = min(self.allocation[gen], left)
+            out[gen] = take
+            left -= take
+        return out
+
     def to_record(self) -> Dict[str, Any]:
         return {
             "identity": _identity_to_record(self.identity),
@@ -168,6 +181,7 @@ class Leg:
             "expiry_ms": self.expiry_ms,
             "seq": self.seq,
             "late_evidence": self.late_evidence,
+            "allocation": None if self.allocation is None else {str(g): str(q) for g, q in sorted(self.allocation.items())},
         }
 
     @classmethod
@@ -186,6 +200,7 @@ class Leg:
             expiry_ms=_opt_int(rec.get("expiry_ms")),
             seq=int(rec.get("seq", 0)),
             late_evidence=bool(rec.get("late_evidence", False)),
+            allocation=_allocation_from_record(rec.get("allocation")),
         )
 
 
@@ -219,8 +234,9 @@ EMPTY_BUCKETS = Buckets(ZERO, ZERO, ZERO, ZERO, ZERO, ZERO)
 
 @dataclass(frozen=True)
 class TpDispatchItem:
-    generation: int
+    generation: int                     # cycle hosting the new TP leg (the newest one for an aggregate)
     qty: Decimal
+    allocation: Optional[Tuple[Tuple[int, Decimal], ...]] = None   # aggregate TP: (generation, share) pairs
 
 
 @dataclass(frozen=True)
@@ -253,10 +269,24 @@ class Cycle:
     dust: Decimal = ZERO            # durable, operator-visible DUST classification (<= unassigned)
     closed: bool = False
     late_evidence: bool = False
+    # All cycles of the owning cell (set by CellLedger): needed to see aggregate TP legs hosted in a newer cycle.
+    peers: Optional[List["Cycle"]] = field(default=None, repr=False, compare=False)
 
     @property
     def legs(self) -> List[Leg]:
         return self.entries + self.tps
+
+    def tp_parts(self) -> List[Tuple[Leg, Decimal, Decimal]]:
+        """``(leg, requested share, filled share)`` of every TP leg that serves this cycle's obligation."""
+        parts = []
+        for c in (self.peers if self.peers is not None else [self]):
+            for t in c.tps:
+                if t.allocation is None:
+                    if c is self:
+                        parts.append((t, t.requested, t.filled))
+                elif self.generation in t.allocation:
+                    parts.append((t, t.allocation[self.generation], t.allocated_filled()[self.generation]))
+        return parts
 
     @property
     def E(self) -> Decimal:
@@ -264,7 +294,7 @@ class Cycle:
 
     @property
     def X(self) -> Decimal:
-        return sum((t.filled for t in self.tps), ZERO)
+        return sum((filled for _, _, filled in self.tp_parts()), ZERO)
 
     @property
     def entry_final(self) -> bool:
@@ -279,19 +309,21 @@ class Cycle:
 
     def unassigned_total(self) -> Decimal:
         """``E - X - (remainder of non-final TP legs)``; includes dust. Negative means invariant violation."""
-        reserved = sum((t.remaining for t in self.tps if not t.is_final), ZERO)
+        reserved = sum((req - filled for t, req, filled in self.tp_parts() if not t.is_final), ZERO)
         return self.E - self.X - reserved
 
     def buckets(self) -> Buckets:
-        live = sum((t.remaining for t in self.tps if t.state in LIVE_STATES), ZERO)
-        unknown = sum((t.remaining for t in self.tps if t.state in UNKNOWN_STATES), ZERO)
+        parts = self.tp_parts()
+        live = sum((req - filled for t, req, filled in parts if t.state in LIVE_STATES), ZERO)
+        unknown = sum((req - filled for t, req, filled in parts if t.state in UNKNOWN_STATES), ZERO)
         total_unassigned = self.E - self.X - live - unknown
         dust = min(self.dust, max(total_unassigned, ZERO))
         return Buckets(E=self.E, X=self.X, live_tp_remainder=live, reserved_tp_unassigned=unknown,
                        unassigned=total_unassigned - dust, dust=dust)
 
     def has_open_obligation_or_orders(self) -> bool:
-        return self.E != self.X or any(not leg.is_final for leg in self.legs) or self.dust > 0
+        return (self.E != self.X or any(not leg.is_final for leg in self.legs) or self.dust > 0
+                or any(not t.is_final for t, _, _ in self.tp_parts()))
 
     def to_record(self) -> Dict[str, Any]:
         return {
@@ -412,6 +444,7 @@ class CellLedger:
         identity = self.next_entry_identity()
         if self.current is None:
             self.cycles.append(Cycle(generation=identity.generation, entry_side=self.spec.entry_side, planned_qty=q))
+            self._link()
         cycle = self.current
         assert cycle is not None
         leg = Leg(identity=identity, side=self.spec.entry_side, price=self.spec.entry_price, requested=q,
@@ -420,18 +453,19 @@ class CellLedger:
         return leg
 
     # ------------------------------------------------------------------ TP obligations
-    def tp_obligation_to_dispatch(self, rules: Optional[TradingRules]) -> TpDispatchPlan:
-        """Exact TP quantities dispatchable now for every open cycle (no mutation).
+    def _link(self) -> None:
+        for c in self.cycles:
+            c.peers = self.cycles
 
-        * never rounds up; each item is a size-step multiple satisfying min base/notional (and max base);
-        * below-minimum obligation stays undispatched while the entry may still fill (AC-05);
-        * once the entry is final, what cannot form a valid order is DUST (AC-33);
-        * unknown TP outcomes keep their reservation, so their quantity is never re-dispatched.
+    def _dispatch_analysis(self, rules: Optional[TradingRules]):
+        """Per-cycle split, then same side+target aggregation of what no single cycle can dispatch.
+
+        Returns ``(items, total_unassigned, pending, dust_by_generation, blocker)``.
         """
         items: List[TpDispatchItem] = []
         total_unassigned = ZERO
         pending = ZERO
-        dust = ZERO
+        leftovers: Dict[int, Decimal] = {}
         blocker: Optional[str] = None
         rule_errors = rules_blockers(rules)
         for cycle in self.open_cycles():
@@ -451,14 +485,42 @@ class CellLedger:
             leftover = unassigned - sum(quantities, ZERO)
             if leftover > 0:
                 if cycle.entry_final:
-                    dust += leftover
+                    leftovers[cycle.generation] = leftover
                 else:
                     pending += leftover
                 if not quantities:
                     min_valid = min_valid_order_qty(rules, self.spec.tp_price)
                     blocker = blocker or f"BELOW_MIN:{leftover}<{min_valid}@{self.spec.tp_price}"
+        dust_by_gen = dict(leftovers)
+        if len(leftovers) >= 2 and not rule_errors:
+            # Several cycles of this cell owe the same side at the same fixed target: one aggregate TP with an
+            # exact per-generation allocation (AC-39); what still cannot form a valid order stays DUST.
+            from hummingbot.strategy_v2.executors.neutral_grid_executor.dust import DustLot, aggregate
+            lots = [DustLot(self.cell_id, gen, self.spec.tp_side, self.spec.tp_price, q)
+                    for gen, q in sorted(leftovers.items())]
+            for plan in aggregate(lots, rules):
+                allocation = tuple((gen, q) for (_, gen), q in plan.allocation)
+                items.append(TpDispatchItem(max(g for g, _ in allocation), plan.qty, allocation))
+                for gen, q in allocation:
+                    dust_by_gen[gen] -= q
+        dust_by_gen = {g: q for g, q in dust_by_gen.items() if q > 0}
+        return items, total_unassigned, pending, dust_by_gen, blocker
+
+    def tp_obligation_to_dispatch(self, rules: Optional[TradingRules]) -> TpDispatchPlan:
+        """Exact TP quantities dispatchable now for every open cycle (no mutation).
+
+        * never rounds up; each item is a size-step multiple satisfying min base/notional (and max base, split
+          into balanced chunks so no avoidable DUST is created);
+        * below-minimum obligation stays undispatched while the entry may still fill (AC-05);
+        * once the entry is final, what cannot form a valid order is DUST (AC-33), unless several cycles of the
+          cell together form one: then an aggregate item carries the exact per-generation ``allocation`` (AC-39);
+        * unknown TP outcomes keep their reservation, so their quantity is never re-dispatched.
+        """
+        items, total_unassigned, pending, dust_by_gen, blocker = self._dispatch_analysis(rules)
+        if blocker is not None and blocker.startswith("BELOW_MIN") and not dust_by_gen and not pending:
+            blocker = None      # every per-cycle leftover went into an aggregate item: nothing is stuck
         return TpDispatchPlan(items=tuple(items), unassigned=total_unassigned, pending_below_min=pending,
-                              dust=dust, blocker=blocker)
+                              dust=sum(dust_by_gen.values(), ZERO), blocker=blocker)
 
     def next_tp_identity(self, generation: Optional[int] = None) -> LegIdentity:
         cycle = self._cycle_for_tp(generation)
@@ -477,36 +539,67 @@ class CellLedger:
 
     def add_tp_intent(self, qty: Decimal, cid: int, rules: TradingRules, *, generation: Optional[int] = None,
                       order_type: Optional[OrderTypePolicy] = None, expiry_ms: Optional[int] = None,
-                      seq: int = 0) -> Leg:
-        """Create a TP child intent of exactly ``qty`` at the fixed TP target (reduce_only is never used)."""
+                      seq: int = 0, allocation: Optional[Any] = None) -> Leg:
+        """Create a TP child intent of exactly ``qty`` at the fixed TP target (reduce_only is never used).
+
+        ``allocation`` (mapping or ``(generation, share)`` pairs) makes it an aggregate TP over several open
+        cycles of this cell: every share must fit that cycle's unassigned obligation, shares sum to ``qty``,
+        and the leg is hosted by the newest allocated cycle (``generation``, if given, must be that one).
+        """
         _require_cid(cid)
         require_decimal(qty, "qty")
-        cycle = self._cycle_for_tp(generation)
         blocker = order_qty_blocker(qty, self.spec.tp_price, rules)
         if blocker is not None:
             raise LedgerError(f"TP qty {qty} invalid: {blocker}")
-        unassigned = cycle.unassigned_total()
-        if qty > unassigned:
-            raise LedgerError(f"TP qty {qty} exceeds unassigned obligation {unassigned} (X + reserved <= E)")
+        shares: Optional[Dict[int, Decimal]] = None
+        if allocation is not None:
+            pairs = allocation.items() if isinstance(allocation, dict) else allocation
+            shares = {}
+            for gen, share in pairs:
+                if isinstance(gen, bool) or not isinstance(gen, int) or gen in shares:
+                    raise LedgerError(f"invalid allocation generation {gen!r}")
+                require_decimal(share, "allocation share")
+                if share <= 0:
+                    raise LedgerError(f"allocation share for generation {gen} must be positive")
+                shares[gen] = share
+            if not shares or sum(shares.values(), ZERO) != qty:
+                raise LedgerError(f"allocation {shares} does not sum to qty {qty}")
+            open_gens = {c.generation: c for c in self.open_cycles()}
+            for gen, share in shares.items():
+                if gen not in open_gens:
+                    raise LedgerError(f"allocation generation {gen} is not an open cycle of cell {self.cell_id}")
+                if share > open_gens[gen].unassigned_total():
+                    raise LedgerError(f"allocation {share} exceeds gen{gen} unassigned "
+                                      f"{open_gens[gen].unassigned_total()} (X + reserved <= E)")
+            host = max(shares)
+            if generation is not None and generation != host:
+                raise LedgerError(f"aggregate TP must be hosted by newest allocated generation {host}")
+            cycle = open_gens[host]
+        else:
+            cycle = self._cycle_for_tp(generation)
+            unassigned = cycle.unassigned_total()
+            if qty > unassigned:
+                raise LedgerError(f"TP qty {qty} exceeds unassigned obligation {unassigned} (X + reserved <= E)")
         identity = LegIdentity(self.grid_id, self.cell_id, cycle.generation, LegRole.TP, len(cycle.tps))
         leg = Leg(identity=identity, side=self.spec.tp_side, price=self.spec.tp_price, requested=qty, cid=cid,
-                  order_type=order_type, expiry_ms=expiry_ms, seq=seq)
+                  order_type=order_type, expiry_ms=expiry_ms, seq=seq,
+                  allocation=None if shares is None else dict(sorted(shares.items())))
         cycle.tps.append(leg)
-        cycle.dust = min(cycle.dust, max(cycle.unassigned_total(), ZERO))
+        for c in self.cycles:
+            c.dust = min(c.dust, max(c.unassigned_total(), ZERO))
         return leg
 
     def refresh_dust(self, rules: Optional[TradingRules]) -> Dict[int, Decimal]:
-        """Persistable DUST classification per open cycle (generation -> dust). Visible, exact, never resized."""
+        """Persistable DUST classification per open cycle (generation -> dust). Visible, exact, never resized.
+
+        What a same side+target aggregate can dispatch is not DUST.
+        """
         changes: Dict[int, Decimal] = {}
         if rules_blockers(rules):
             return changes
+        _, _, _, dust_by_gen, _ = self._dispatch_analysis(rules)
         for cycle in self.open_cycles():
-            unassigned = max(cycle.unassigned_total(), ZERO)
-            if cycle.entry_final and unassigned > 0:
-                dispatchable = sum(_split_valid(unassigned, self.spec.tp_price, rules), ZERO)
-                new_dust = unassigned - dispatchable
-            else:
-                new_dust = ZERO
+            new_dust = dust_by_gen.get(cycle.generation, ZERO)
             if new_dust != cycle.dust:
                 cycle.dust = new_dust
                 changes[cycle.generation] = new_dust
@@ -583,7 +676,10 @@ class CellLedger:
             return FillOutcome.CONFLICT_SIDE
         if leg.filled + qty > leg.requested:
             return FillOutcome.CONFLICT_OVERFILL
-        late = leg.is_final or cycle.closed
+        # Late evidence == an execution for a leg already proven final. A released cycle only ever holds final
+        # legs, so a non-final leg in a closed cycle is a resolution TP created after the late evidence: its
+        # fills are ordinary and must not re-latch the audit flag.
+        late = leg.is_final
         self.fills[key] = record
         leg.filled += qty
         if late:
@@ -618,21 +714,41 @@ class CellLedger:
         leg.terminal_cumulative = cumulative_filled
         return TerminalOutcome.TERMINAL
 
-    def acknowledge_late_evidence(self, generation: int) -> None:
-        """Operator audit acknowledged late evidence for ``generation`` (the obligation itself stays)."""
+    def acknowledge_late_evidence(self, generation: int) -> List[LegIdentity]:
+        """Operator audit acknowledged late evidence for ``generation``; returns the corrected legs.
+
+        The audited executions become the leg's proven cumulative (a "rejected" leg that did execute becomes
+        TERMINAL with that cumulative). The resulting obligation stays and is closed by ordinary TP legs;
+        the engine must record the audit event durably together with this transition.
+        """
         for c in self.cycles:
-            if c.generation == generation:
-                c.late_evidence = False
-                for leg in c.legs:
-                    leg.late_evidence = False
-                return
+            if c.generation != generation:
+                continue
+            corrected = []
+            for leg in c.legs:
+                if leg.late_evidence:
+                    if leg.state in REJECTED_STATES or leg.state == OrderState.TERMINAL:
+                        leg.state = OrderState.TERMINAL
+                        leg.terminal_cumulative = leg.filled
+                    corrected.append(leg.identity)
+                leg.late_evidence = False
+            c.late_evidence = False
+            return corrected
         raise LedgerError(f"no cycle {generation}")
 
     # ------------------------------------------------------------------ release (NG-CELL-001)
     def can_release(self, position_reconciled: bool) -> ReleaseCheck:
         cur = self.current
         if cur is None:
-            return ReleaseCheck(False, ("NO_OPEN_CYCLE",))
+            # Nothing to release, but still report what keeps the cell from a new cycle (operator visibility).
+            reasons = ["NO_OPEN_CYCLE"]
+            if any(c.dust > 0 or c.buckets().dust > 0 for c in self.open_cycles()):
+                reasons.append("DUST")
+            if any(c.late_evidence for c in self.cycles):
+                reasons.append("LATE_EVIDENCE_AUDIT")
+            if any(c.has_open_obligation_or_orders() for c in self.cycles):
+                reasons.append("OLD_CYCLE_OBLIGATION")
+            return ReleaseCheck(False, tuple(reasons))
         reasons: List[str] = []
         if not cur.entry_final:
             reasons.append("ENTRY_NOT_TERMINAL")
@@ -643,7 +759,7 @@ class CellLedger:
             reasons.append(f"OBLIGATION_OPEN:E={cur.E},X={cur.X}")
         if any(not leg.is_final for leg in cur.legs):
             reasons.append("ORDERS_NOT_TERMINAL")
-        if cur.dust > 0 or cur.buckets().dust > 0:
+        if any(c.dust > 0 or c.buckets().dust > 0 for c in self.open_cycles()):
             reasons.append("DUST")
         if cur.late_evidence or any(c.late_evidence for c in self.cycles):
             reasons.append("LATE_EVIDENCE_AUDIT")
@@ -683,9 +799,17 @@ class CellLedger:
                                   f"filled {leg.filled} != terminal cumulative {leg.terminal_cumulative}")
                 if leg.state in REJECTED_STATES and leg.filled != 0:
                     errors.append(f"gen{c.generation}: rejected leg has fills {leg.filled}")
-            reserved = sum((t.remaining for t in c.tps if not t.is_final), ZERO)
+            reserved = sum((req - filled for t, req, filled in c.tp_parts() if not t.is_final), ZERO)
             if c.X + reserved > c.E:
                 errors.append(f"gen{c.generation}: X {c.X} + reserved TP {reserved} > E {c.E}")
+            for t in c.tps:
+                if t.allocation is None:
+                    continue
+                gens = {x.generation for x in self.cycles}
+                if (sum(t.allocation.values(), ZERO) != t.requested or max(t.allocation) != c.generation
+                        or not set(t.allocation) <= gens or any(q <= 0 for q in t.allocation.values())):
+                    errors.append(f"gen{c.generation} TP#{t.identity.revision}: allocation {t.allocation} "
+                                  f"inconsistent with requested {t.requested} / host gen{c.generation}")
             if c.E > c.planned_qty:
                 errors.append(f"gen{c.generation}: E {c.E} > planned {c.planned_qty}")
             if c.dust < 0 or c.dust > max(c.unassigned_total(), ZERO):
@@ -797,6 +921,7 @@ class CellLedger:
                         high_price=Decimal(cell["high_price"]), entry_side=Side(cell["entry_side"]))
         ledger = cls(rec["grid_id"], spec, Decimal(rec["order_amount_base"]))
         ledger.cycles = [Cycle.from_record(c) for c in rec["cycles"]]
+        ledger._link()
         for f in rec["fills"]:
             ledger.fills[_key_from_record(f["key"])] = FillRecord(
                 identity=_identity_from_record(f["identity"]), qty=Decimal(f["qty"]), price=Decimal(f["price"]),
@@ -809,18 +934,8 @@ class CellLedger:
 # ---------------------------------------------------------------------------------------------------------------------
 
 def _split_valid(qty: Decimal, price: Decimal, rules: TradingRules) -> List[Decimal]:
-    """Split an exact obligation into valid order quantities without rounding up (remainder is returned implicitly)."""
-    min_valid = min_valid_order_qty(rules, price)
-    remaining = quantize_down(qty, rules.size_step)
-    chunk_cap = quantize_down(rules.max_base, rules.size_step) if rules.max_base is not None else None
-    out: List[Decimal] = []
-    while remaining >= min_valid:
-        chunk = remaining if chunk_cap is None else min(remaining, chunk_cap)
-        if chunk < min_valid or order_qty_blocker(chunk, price, rules) is not None:
-            break
-        out.append(chunk)
-        remaining -= chunk
-    return out
+    """Split an exact obligation into valid order quantities without rounding up (see ``grid.partition_valid``)."""
+    return partition_valid(qty, price, rules)
 
 
 def _require_cid(cid: Any) -> None:
@@ -848,7 +963,14 @@ def _leg_view(leg: Leg) -> Dict[str, Any]:
         "remaining": str(leg.remaining),
         "state": leg.state.value,
         "expiry": None if leg.expiry_ms is None else str(leg.expiry_ms),
+        "allocation": None if leg.allocation is None else {str(g): str(q) for g, q in sorted(leg.allocation.items())},
     }
+
+
+def _allocation_from_record(rec: Optional[Dict[str, str]]) -> Optional[Dict[int, Decimal]]:
+    if rec is None:
+        return None
+    return {int(g): Decimal(q) for g, q in rec.items()}
 
 
 def _identity_to_record(identity: LegIdentity) -> Dict[str, Any]:

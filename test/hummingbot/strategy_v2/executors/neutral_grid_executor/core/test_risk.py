@@ -170,6 +170,25 @@ class TestTpHeadroom(unittest.TestCase):
         d = risk.plan_tp_headroom(ep, Side.BUY, D("10"), self.entries(), limits, D("5.4"))
         self.assertEqual(((), True), (d.cancel, d.wait))
 
+    def test_submit_unknown_same_side_entry_is_pending_not_risk_blocked(self):
+        # Review #3: an entry in SUBMIT_UNKNOWN may still resolve to LIVE (then cancellable) or a zero-fill
+        # reject, so the TP waits instead of escalating to operator-required RISK_BLOCKED.
+        limits = RiskLimits(max_abs_net_position=D("20"), max_gross_position=D("1000"))
+        ep = risk.RiskEndpoints(P=D("0"), P_min=D("0"), P_max=D("20"), gross_worst=D("20"))
+        unknown = [OpenLeg(Side.BUY, D("20"), LegRole.ENTRY, OrderState.SUBMIT_UNKNOWN, key="u", cell_id=3,
+                           price=D("5.05"))]
+        d = risk.plan_tp_headroom(ep, Side.BUY, D("10"), unknown, limits, D("5.4"))
+        self.assertEqual((False, False, True, ()), (d.ok, d.risk_blocked, d.wait, d.cancel))
+        # LIVE entries are still cancelled first; the unknown one is only waited for.
+        mixed = unknown + [OpenLeg(Side.BUY, D("5"), LegRole.ENTRY, OrderState.LIVE, key="l", cell_id=4,
+                                   price=D("5.07"))]
+        d = risk.plan_tp_headroom(ep, Side.BUY, D("10"), mixed, limits, D("5.4"))
+        self.assertEqual((False, ("l",), True), (d.risk_blocked, d.cancel, d.wait))
+        # Confirmed position + non-entry orders alone above the cap -> RISK_BLOCKED.
+        tp_only = [OpenLeg(Side.BUY, D("20"), LegRole.TP, OrderState.LIVE, key="t")]
+        d = risk.plan_tp_headroom(ep, Side.BUY, D("10"), tp_only, limits, D("5.4"))
+        self.assertTrue(d.risk_blocked)
+
     def test_confirmed_position_cannot_be_freed_risk_blocked(self):
         limits = RiskLimits(max_abs_net_position=D("20"), max_gross_position=D("1000"))
         ep = risk.RiskEndpoints(P=D("30"), P_min=D("20"), P_max=D("60"), gross_worst=D("40"))

@@ -235,6 +235,21 @@ class TestTpCapacity(unittest.TestCase):
         self.assertEqual(("a", "b"), plan.submits)                      # a: own slot, b: last global slot
         self.assertEqual("WAIT_SLOT:NO_CANCELLABLE_ENTRY", plan.action_for("c").reason)
 
+    def test_slot_starved_tp_does_not_hold_fifo_head_over_a_tp_with_its_own_slot(self):
+        # Found by the cap-drop property sweep: cap 1, the only reserved slot belongs to cell 6. The FIFO head
+        # (cell 4) has no slot and nothing to cancel; cell 6's crossing TP must not wait behind it forever.
+        cands = [tp("head", Side.SELL, "5.5", cell=4, seq=1), tp("own", Side.BUY, "5.55", cell=6, seq=2)]
+        plan = plan_submits(cands, [], slots=SlotBudget(free=0, cell_unused={6: 1}, headroom=1))
+        self.assertEqual(("own",), plan.submits)
+        self.assertEqual("WAIT_SLOT:NO_CANCELLABLE_ENTRY", plan.action_for("head").reason)
+        # Next tick the head sees the now-live TP and waits for it (no self-match), entries never cross it.
+        owned = [order("own", Side.BUY, "5.55", role=LegRole.TP, cell=6)]
+        plan = plan_submits([tp("head", Side.SELL, "5.5", cell=4, seq=1),
+                             entry("e", Side.BUY, "5.52", cell=5, seq=3)], owned,
+                            slots=SlotBudget(free=1, cell_unused={5: 3}, headroom=4))
+        self.assertEqual(((), "SELF_TRADE:WAIT_TP_FIFO"), (plan.submits, plan.action_for("head").reason))
+        self.assertEqual("SELF_TRADE:ENTRY_WAITS", plan.action_for("e").reason)
+
     def test_entry_needs_its_own_reserved_slot(self):
         plan = plan_submits([entry("e", Side.BUY, "5.0", cell=0)], [], slots=SlotBudget(free=10, cell_unused={}))
         self.assertEqual("NOT_ARMED:NO_RESERVED_SLOT", plan.action_for("e").reason)
