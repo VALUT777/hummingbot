@@ -192,8 +192,8 @@ async def cells(request: web.Request) -> web.Response:
                                 only_active=request.query.get("active") == "1")
     except ValueError:
         return json_error(400, "bad_cursor", "Некорректный курсор страницы.")
-    page["snapshot"] = {k: (snapshot or {}).get(k) for k in ("snapshot_version", "config_revision",
-                                                              "engine_revision", "committed_at")}
+    header = ("snapshot_version", "config_revision", "engine_revision", "committed_at")
+    page["snapshot"] = {k: (snapshot or {}).get(k) for k in header}
     return _json(page)
 
 

@@ -73,7 +73,7 @@ class WebHarness:
 
     async def command(self, kind: str, key: str, payload: Optional[Dict[str, Any]] = None,
                       cfg: Optional[int] = None, eng: Optional[int] = None):
-        snap = self.gateway.snapshot or {}
+        snap = (self.gateway.latest_snapshot() if cfg is None or eng is None else None) or {}
         body = {"kind": kind, "idempotency_key": key,
                 "expected_config_revision": snap.get("config_revision", 0) if cfg is None else cfg,
                 "expected_engine_revision": snap.get("engine_revision", 0) if eng is None else eng,

@@ -105,6 +105,11 @@ class CommandService:
         payload = body.get("payload") or {}
         if not isinstance(payload, dict):
             return self._error(400, "bad_payload", "payload должен быть объектом.")
+        supported = getattr(self._gateway, "supported_kinds", None)
+        if supported is not None and kind_raw not in supported:
+            return self._error(422, "unsupported_kind",
+                               "Хранилище движка не принимает эту команду (см. trace: manual_reconcile).",
+                               allowed=sorted(supported))
 
         async with self._lock:
             existing = self._gateway.get_command_by_key(key)
@@ -123,6 +128,19 @@ class CommandService:
             if blocked is not None:
                 return blocked
             row = self._gateway.enqueue_command(key, kind_raw, exp_cfg, exp_eng, normalized)
+            if row.get("duplicate"):  # another process enqueued the same key first
+                return self._replay(row, kind_raw, exp_cfg, exp_eng, payload)
+            if row.get("status") == "CONFLICT":  # the store re-checked revisions/queued Start atomically
+                result = row.get("result") or {}
+                code = "start_already_queued" if result.get("reason") == "start_already_queued" else "stale_revision"
+                fresh = self._gateway.latest_snapshot()
+                cfg_now, eng_now = snapshot_revisions(fresh)
+                outcome = await self._stale(cfg_now, eng_now, fresh,
+                                            "Хранилище движка отклонило команду как конфликт; она не будет "
+                                            "применена.", code=code)
+                outcome.body["command"] = row
+                outcome.body["engine_identity"] = self.engine_identity
+                return outcome
         return CommandOutcome(202, {"command": row, "replay": False, "engine_identity": self.engine_identity,
                                     "note": "Команда записана в очередь движка; результат появится после её "
                                             "применения движком."})

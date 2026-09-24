@@ -347,8 +347,8 @@ async def test_manual_reconcile_commands(make_web):
     ok = await web.command("manual_reconcile", "reconcile-late-0001",
                            {"action": "ack_late_evidence", "note": "проверено по истории", "acknowledge": True})
     assert ok.status == 202
-    assert (await ok.json())["command"]["payload"] == {"action": "ack_late_evidence", "note": "проверено по истории",
-                                                      "acknowledge": True}
+    expected = {"action": "ack_late_evidence", "note": "проверено по истории", "acknowledge": True}
+    assert (await ok.json())["command"]["payload"] == expected
     cid = await web.command("manual_reconcile", "reconcile-cid-00001",
                             {"action": "resolve_unknown_submit", "note": "нет в истории", "acknowledge": True,
                              "cid": "281474976710600"})
