@@ -379,6 +379,53 @@ async def test_browser_external_close_flow_and_stopped_start_wording(make_web, t
 
 
 @pytest.mark.asyncio
+async def test_browser_external_close_renders_every_cycle_and_exact_total(make_web, tmp_path):
+    snap = _snapshot_with_engine_fields("STOPPED_WITH_INVENTORY")
+    snap["summary"]["authoritative_net"] = "0"
+    cycles = [{
+        "grid_id": "ng-test", "cell_id": str(cell_id), "generation": "2", "entry_side": "BUY",
+        "E": "20", "X": "0", "external_settled": "0", "proposed_settlement": "20", "open_after": "0",
+    } for cell_id in ("101", "102", "103", "104")]
+    snap["summary"]["external_close_candidate"] = {
+        "proof_id": "c" * 64, "blockers": [], "observed_position": "0", "cycle": None,
+        "cycles": cycles, "total_quantity": "80", "settlement_side": "SELL",
+        "trades": [{"inbox_id": "200", "side": "SELL", "quantity": "80", "price": "1.23456789"}],
+        "terminal_order": {"inbox_id": "201", "side": "SELL", "reduce_only": True, "final": True,
+                           "filled": "80"},
+    }
+    web = await make_web(snap)
+    web.gateway.live_clock = True
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'STOPPED_WITH_INVENTORY'")
+        await page.eval("document.getElementById('external-close-open').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        evidence = await page.eval("document.getElementById('f-external-close').textContent")
+        assert "Общий объём ручного закрытия: 80 LIT" in evidence
+        assert "c" * 64 in evidence
+        assert all(f"Цикл {cell_id} / поколение 2" in evidence for cell_id in ("101", "102", "103", "104"))
+        assert evidence.count("сетка ng-test") == 4
+        assert evidence.count("распределить=20") == 4
+        assert evidence.count("остаток=0") == 4
+        assert "SELL 80 LIT @ 1.23456789" in evidence
+
+        await page.eval("document.getElementById('f-note').value='четыре цикла сверены';"
+                        "document.getElementById('f-ack').checked=true;"
+                        "document.getElementById('f-confirmation').value="
+                        "'SETTLE EXTERNAL CLOSE ng-test AT FLAT 0';"
+                        "document.getElementById('cmd-submit').click()")
+        await page.wait_for("!document.getElementById('cmd-dialog').open")
+        [row] = web.gateway.commands
+        assert row["payload"] == {
+            "action": "settle_external_close", "proof_id": "c" * 64,
+            "confirmation": "SETTLE EXTERNAL CLOSE ng-test AT FLAT 0",
+            "note": "четыре цикла сверены", "acknowledge": True,
+        }
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
 async def test_browser_external_close_dialog_never_submits_an_unseen_replacement_proof(make_web, tmp_path):
     snap = _snapshot_with_engine_fields("STOPPED")
     candidate = {

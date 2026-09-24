@@ -40,6 +40,76 @@ def _exact_manual_close(h: Harness):
     return cell_id, manual
 
 
+def _exact_multi_cycle_manual_close(h: Harness, count: int = 4):
+    h.bootstrap()
+    cell_ids = h.sell_cells()[:count]
+    for cell_id in cell_ids:
+        entry = h.live_order(cell_id, LegRole.ENTRY)
+        h.fx.fill(entry.cid, D("10"))
+    h.run_until(lambda: all(h.live_order(cell_id, LegRole.TP) is not None for cell_id in cell_ids), max_ticks=40)
+    for cell_id in cell_ids:
+        h.fx.venue_cancel(h.live_order(cell_id, LegRole.TP).cid)
+    h.settle()
+
+    manual = h.fx.place_manual_order(Side.BUY, D("5.3"), D(str(10 * count)))
+    manual.reduce_only = True
+    h.fx.fill(manual.client_order_id, D(str(10 * count)))
+    h.tick(20)
+    h.command(CommandKind.STOP, key="stop-before-multi-settlement")
+    h.run_until(lambda: h.engine.is_stopped, max_ticks=80)
+    h.run_until(lambda: h.engine.external_close_candidate()["blockers"] in ([],), max_ticks=80)
+    return cell_ids, manual
+
+
+def test_one_manual_order_settles_multiple_cycles_and_clears_migration_blockers(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        cell_ids, _ = _exact_multi_cycle_manual_close(h)
+        candidate = h.engine.last_snapshot["summary"]["external_close_candidate"]
+        assert candidate["blockers"] == []
+        assert candidate["cycle"] is None
+        assert candidate["total_quantity"] == "40"
+        assert [(int(c["cell_id"]), c["proposed_settlement"], c["open_after"])
+                for c in candidate["cycles"]] == [(cell_id, "10", "0") for cell_id in sorted(cell_ids)]
+
+        payload = {
+            "action": "settle_external_close", "proof_id": candidate["proof_id"],
+            "confirmation": "SETTLE EXTERNAL CLOSE grid-t AT FLAT 0",
+            "note": "one manual reduce-only order closed four cycles", "acknowledge": True,
+        }
+        h.command(CommandKind.BASELINE_AUDIT, dict(payload, proof_id="0" * 64), key="settle-external-stale-proof")
+        h.tick()
+        stale = _command(h, "settle-external-stale-proof")
+        assert stale.status == CommandStatus.REJECTED
+        assert stale.result["error"] == "EXTERNAL_CLOSE_PROOF_CHANGED"
+
+        h.command(CommandKind.BASELINE_AUDIT, payload, key="settle-external-multi")
+        h.tick()
+        record = _command(h, "settle-external-multi")
+        assert record.status == CommandStatus.APPLIED, record.result
+        assert record.result["total_quantity"] == "40"
+        assert [int(c["cell_id"]) for c in record.result["cycles"]] == sorted(cell_ids)
+        assert h.engine.is_stopped and h.engine.meta.stop_requested_ms is not None
+        h.tick(3)
+        assert h.engine.meta.stop_outcome == "STOPPED"
+        assert h.engine.store.grid_mutation_blockers() == []
+        assert h.engine.store._x("SELECT count(*) FROM external_settlements").fetchone()[0] == 1
+        assert h.engine.store._x("SELECT count(*) FROM external_settlement_cycles").fetchone()[0] == 4
+        h.command(CommandKind.BASELINE_AUDIT, payload, key="settle-external-multi")
+        h.tick()
+        assert h.engine.store._x("SELECT count(*) FROM external_settlements").fetchone()[0] == 1
+        assert h.engine.store._x("SELECT count(*) FROM external_settlement_evidence").fetchone()[0] == 2
+
+        h.restart()
+        h.tick(20)
+        assert h.engine.is_stopped and h.engine.meta.stop_requested_ms is not None
+        for cycle_view in candidate["cycles"]:
+            cycle = h.engine.store.cycle("grid-t", int(cycle_view["cell_id"]), int(cycle_view["generation"]))
+            assert cycle.external_settled == D("10") and cycle.open_obligation == 0
+    finally:
+        h.close()
+
+
 def test_exact_manual_close_publishes_stable_candidate_and_applies_without_transport(tmp_path):
     h = Harness(tmp_path)
     try:

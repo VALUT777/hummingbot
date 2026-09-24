@@ -1266,14 +1266,20 @@ class NeutralGridEngine:
         if any(c.late_evidence for ledger in self.cells.values() for c in ledger.cycles):
             blockers.append("LATE_EVIDENCE")
 
-        cycles = [(ledger, cycle) for ledger in self.cells.values() for cycle in ledger.cycles
-                  if cycle.generation > 0 and cycle.open_obligation > ZERO]
-        if len(cycles) != 1:
-            blockers.append(f"EXACTLY_ONE_CYCLE_REQUIRED:{len(cycles)}")
-        ledger, cycle = cycles[0] if len(cycles) == 1 else (None, None)
-        if cycle is not None and self.store is not None and not self.store.closed:
-            blockers.extend("CYCLE:" + b for b in self.store.cycle_release_blockers(
-                self.grid_id, ledger.cell_id, cycle.generation) if not b.startswith("obligation open:"))
+        cycles = sorted(((ledger, cycle) for ledger in self.cells.values() for cycle in ledger.cycles
+                         if cycle.generation > 0 and cycle.open_obligation > ZERO),
+                        key=lambda item: (self.grid_id, item[0].cell_id, item[1].generation))
+        if not cycles:
+            blockers.append("OPEN_CYCLES_REQUIRED:0")
+        expected_sides = {Side.SELL if cycle.entry_side == Side.BUY else Side.BUY for _, cycle in cycles}
+        if len(expected_sides) > 1:
+            blockers.append("MIXED_CYCLE_CLOSE_SIDES")
+        if self.store is not None and not self.store.closed:
+            for ledger, cycle in cycles:
+                blockers.extend(f"CYCLE:{ledger.cell_id}/{cycle.generation}:" + b
+                                for b in self.store.cycle_release_blockers(
+                                    self.grid_id, ledger.cell_id, cycle.generation)
+                                if not b.startswith("obligation open:"))
 
         trades = [r for r in self.unmatched if r.stream == B_TRADES]
         orders = [r for r in self.unmatched if r.stream == B_ORDERS]
@@ -1285,8 +1291,7 @@ class NeutralGridEngine:
         if len(side_values) != 1:
             blockers.append("MIXED_TRADE_SIDES")
         settlement_side = next(iter(side_values), "")
-        expected_side = (Side.SELL if cycle.entry_side == Side.BUY else Side.BUY).value \
-            if cycle is not None else None
+        expected_side = next(iter(expected_sides)).value if len(expected_sides) == 1 else None
         if expected_side is not None and settlement_side != expected_side:
             blockers.append(f"WRONG_SETTLEMENT_SIDE:{settlement_side}")
 
@@ -1309,8 +1314,9 @@ class NeutralGridEngine:
                 blockers.append("ORDER_SIDE_MISMATCH")
             if Decimal(str(p.get("filled_base_amount", "-1"))) != quantity:
                 blockers.append("ORDER_TRADE_QUANTITY_MISMATCH")
-        if cycle is not None and quantity != cycle.open_obligation:
-            blockers.append(f"SETTLEMENT_QUANTITY_MISMATCH:{quantity}:{cycle.open_obligation}")
+        total_obligation = sum((cycle.open_obligation for _, cycle in cycles), ZERO)
+        if quantity != total_obligation:
+            blockers.append(f"SETTLEMENT_QUANTITY_MISMATCH:{quantity}:{total_obligation}")
 
         trade_view = [{"inbox_id": str(r.id), "payload_hash": r.payload_hash,
                        "trade_id": str(r.payload.get("trade_id_str")), "side": str(r.payload.get("own_side")),
@@ -1318,13 +1324,13 @@ class NeutralGridEngine:
                        "exchange_order_id": None if r.payload.get("own_exchange_order_id") is None
                        else str(r.payload.get("own_exchange_order_id"))}
                       for r in sorted(trades, key=lambda x: x.id)]
-        cycle_view = None if cycle is None else {
+        cycle_views = [{
             "grid_id": self.grid_id, "cell_id": str(ledger.cell_id), "generation": str(cycle.generation),
             "entry_side": cycle.entry_side.value, "E": str(cycle.E), "X": str(cycle.X),
             "external_settled": canonical_decimal(cycle.external_settled),
-            "proposed_settlement": canonical_decimal(quantity),
-            "open_after": canonical_decimal(cycle.open_obligation - quantity),
-        }
+            "proposed_settlement": canonical_decimal(cycle.open_obligation), "open_after": "0",
+        } for ledger, cycle in cycles]
+        cycle_view = cycle_views[0] if len(cycle_views) == 1 else None
         order_view = None if terminal is None else {
             "inbox_id": str(terminal.id), "payload_hash": terminal.payload_hash,
             "exchange_order_id": str(terminal.payload.get("order_index") or terminal.payload.get("order_id")),
@@ -1338,7 +1344,8 @@ class NeutralGridEngine:
             "domain": self.port.domain, "market_id": str(self.port.market_id),
             "config_revision": self.b_engine.config_revision if self.b_engine else 0,
             "engine_revision": self.b_engine.engine_revision if self.b_engine else 0,
-            "cycle": cycle_view, "trades": trade_view, "terminal_order": order_view,
+            "cycles": cycle_views, "total_quantity": canonical_decimal(total_obligation),
+            "trades": trade_view, "terminal_order": order_view,
             "observed_position": None if self.position is None else str(self.position.net_base),
             "active_order_fingerprint": [],
         }
@@ -1346,6 +1353,7 @@ class NeutralGridEngine:
         scan = self.complete_scans[-1] if self.complete_scans else None
         return {
             "proof_id": proof_id, "blockers": sorted(set(blockers)), "cycle": cycle_view,
+            "cycles": cycle_views, "total_quantity": canonical_decimal(total_obligation),
             "settlement_side": settlement_side or None, "trades": trade_view, "terminal_order": order_view,
             "observed_position": None if self.position is None else str(self.position.net_base),
             "position_observed_at_ms": None if self.position_at is None else _ms(self.position_at),
@@ -1635,10 +1643,10 @@ class NeutralGridEngine:
             if payload.get("proof_id") != candidate["proof_id"]:
                 return CommandOutcome(CommandStatus.REJECTED, {
                     "error": "EXTERNAL_CLOSE_PROOF_CHANGED", "proof_id": candidate["proof_id"]})
-            cycle = candidate["cycle"]
+            cycles = candidate["cycles"]
             terminal = candidate["terminal_order"]
             request = ExternalSettlementRequest(
-                proof_id=candidate["proof_id"], grid_id=cycle["grid_id"],
+                proof_id=candidate["proof_id"], grid_id=self.grid_id,
                 settlement_side=Side(candidate["settlement_side"]), observed_position=ZERO,
                 actor=actor, reason=note,
                 expected_config_revision=self.b_engine.config_revision,
@@ -1649,9 +1657,11 @@ class NeutralGridEngine:
                 history_scan_completed_at_ms=int(candidate["history_scan_completed_at_ms"]),
                 trades_high_water=candidate["trades_high_water"],
                 orders_high_water=candidate["orders_high_water"],
-                cycles=(ExternalSettlementCycle(
-                    grid_id=cycle["grid_id"], cell_id=int(cycle["cell_id"]),
-                    generation=int(cycle["generation"]), quantity=Decimal(cycle["proposed_settlement"])),),
+                cycles=tuple(
+                    ExternalSettlementCycle(
+                        grid_id=cycle["grid_id"], cell_id=int(cycle["cell_id"]),
+                        generation=int(cycle["generation"]), quantity=Decimal(cycle["proposed_settlement"]))
+                    for cycle in cycles),
                 evidence=tuple(ExternalSettlementEvidence(
                     inbox_id=int(t["inbox_id"]), evidence_role="TRADE",
                     allocated_quantity=Decimal(t["quantity"])) for t in candidate["trades"])
@@ -1660,13 +1670,17 @@ class NeutralGridEngine:
             )
             settlement_id = s.record_external_settlement(tx, request)
             self.position_gap_since = None
-            return CommandOutcome(CommandStatus.APPLIED, {
+            result = {
                 "settlement_id": str(settlement_id), "proof_id": candidate["proof_id"],
-                "grid_id": cycle["grid_id"], "cell_id": cycle["cell_id"],
-                "generation": cycle["generation"], "E": cycle["E"], "X": cycle["X"],
-                "external_settled": cycle["proposed_settlement"], "open": cycle["open_after"],
-                "stopped": True,
-            }, reload=True)
+                "grid_id": self.grid_id, "cycles": cycles,
+                "total_quantity": candidate["total_quantity"], "stopped": True,
+            }
+            if len(cycles) == 1:
+                cycle = cycles[0]
+                result.update({"cell_id": cycle["cell_id"], "generation": cycle["generation"],
+                               "E": cycle["E"], "X": cycle["X"],
+                               "external_settled": cycle["proposed_settlement"], "open": cycle["open_after"]})
+            return CommandOutcome(CommandStatus.APPLIED, result, reload=True)
         if action == "ack_risk_blocked":
             detail = self.meta.freezes.pop(FREEZE_RISK_BLOCKED, None)
             self.meta.risk_blocked = {}

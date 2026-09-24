@@ -65,6 +65,131 @@ def _prepared(store, *, trade_client_ids=(700_000_000_001, 700_000_000_001),
     return request, entry.cid
 
 
+def _prepared_multi(store, *, include_opposite=False):
+    store.set_engine_state(None, EngineState.STOPPED, "synthetic multi-cycle external-settlement fixture")
+    transport = FakeTransport()
+    cycles = []
+    cell_ids = (3, 4, 30) if include_opposite else (3, 4)
+    for cell_id in cell_ids:
+        entry = record_entry_intent(store, cell_id)
+        submit_via_protocol(store, transport, entry)
+        fill_and_terminate(store, entry.cid, f"owned-entry-{cell_id}")
+        cycle = store.cycle(GRID_ID, cell_id, store.leg(entry.cid).generation)
+        cycles.append(ExternalSettlementCycle(GRID_ID, cell_id, cycle.generation, cycle.open_obligation))
+
+    manual_client_id = 700_000_000_010
+    manual_order_id = "manual-order-multi"
+    total = sum((cycle.quantity for cycle in cycles), Decimal("0"))
+    with store.transaction() as tx:
+        result = store.apply_history_batch(tx, [
+            trade_row("manual-multi", manual_client_id, Side.SELL, str(total), exchange_order_id=manual_order_id),
+            replace(order_row(manual_client_id, Side.SELL, Decimal("5.1"), total, total,
+                              order_id=manual_order_id), reduce_only=True),
+        ])
+    trade = next(row for row in result.unmatched if row.stream == "TRADES")
+    terminal = next(row for row in result.unmatched if row.stream == "INACTIVE_ORDERS")
+    engine = store.engine()
+    request = ExternalSettlementRequest(
+        proof_id="proof-multi", grid_id=GRID_ID, settlement_side=Side.SELL, observed_position=Decimal("0"),
+        actor="operator", reason="one manual order closed two cycles",
+        expected_config_revision=engine.config_revision, expected_engine_revision=engine.engine_revision,
+        position_observed_at_ms=BOOT_CUT_MS + 30_000, active_observed_at_ms=BOOT_CUT_MS + 30_001,
+        history_scan_started_at_ms=BOOT_CUT_MS + 30_002,
+        history_scan_completed_at_ms=BOOT_CUT_MS + 30_003, trades_high_water="trade-high-multi",
+        orders_high_water="order-high-multi", cycles=tuple(cycles),
+        evidence=(ExternalSettlementEvidence(trade.id, "TRADE", total),
+                  ExternalSettlementEvidence(terminal.id, "TERMINAL_ORDER")),
+    )
+    return request
+
+
+def test_one_manual_order_atomically_settles_multiple_exact_cycles(tmp_path):
+    env = Env(tmp_path)
+    store = env.open()
+    env.bootstrap(store)
+    request = _prepared_multi(store)
+
+    with store.transaction() as tx:
+        settlement_id = store.record_external_settlement(tx, request)
+
+    settled = store._conn.raw.execute(
+        "SELECT cell_id, generation, quantity FROM external_settlement_cycles "
+        "WHERE settlement_id = ? ORDER BY cell_id, generation", (settlement_id,)).fetchall()
+    assert [tuple(row) for row in settled] == [(3, 1, "10"), (4, 1, "10")]
+    assert store.external_position_totals() == (Decimal("0"), Decimal("20"))
+    assert store.position_ledger().net == Decimal("0")
+    assert store.engine().engine_state == EngineState.STOPPED
+    for cycle_request in request.cycles:
+        cycle = store.cycle(cycle_request.grid_id, cycle_request.cell_id, cycle_request.generation)
+        assert (cycle.external_settled, cycle.open_obligation, cycle.state) == (
+            Decimal("10"), Decimal("0"), "COMPLETE")
+    evidence = store._conn.raw.execute(
+        "SELECT inbox_id FROM external_settlement_evidence WHERE settlement_id = ? ORDER BY inbox_id",
+        (settlement_id,)).fetchall()
+    assert len(evidence) == 2
+    assert store.grid_mutation_blockers() == []
+    assert store.verify_ledger() == []
+    store.close()
+    reopened = env.open()
+    assert reopened.verify_ledger() == []
+
+
+@pytest.mark.parametrize("change", ["bad_total", "reallocated", "mixed_side", "blocked_cycle", "stale_revision"])
+def test_multi_cycle_refusal_is_atomic(tmp_path, change):
+    env = Env(tmp_path)
+    hooks = FaultHooks()
+    store = env.open(fault_hooks=hooks)
+    env.bootstrap(store)
+    request = _prepared_multi(store, include_opposite=change == "mixed_side")
+    if change == "bad_total":
+        request = replace(request, cycles=request.cycles[:-1])
+    elif change == "reallocated":
+        first, second = request.cycles
+        request = replace(request, cycles=(replace(first, quantity=Decimal("5")),
+                                           replace(second, quantity=Decimal("15"))))
+    elif change == "blocked_cycle":
+        cycle = request.cycles[-1]
+        with store.transaction() as tx:
+            store.prepare_submit(tx, tp_leg(cycle.cell_id, cycle.generation), side=Side.SELL,
+                                 price=store.cycle(GRID_ID, cycle.cell_id, cycle.generation).tp_price,
+                                 amount=Decimal("10"), order_type=OrderTypePolicy.LIMIT)
+        request = replace(request, expected_engine_revision=store.engine().engine_revision)
+    elif change == "stale_revision":
+        store.set_engine_state(None, EngineState.PAUSED, "advance revision")
+        store.set_engine_state(None, EngineState.STOPPED, "restore stopped state")
+
+    with pytest.raises((ValueError, InvalidTransitionError)):
+        with store.transaction() as tx:
+            store.record_external_settlement(tx, request)
+
+    assert store._conn.raw.execute("SELECT count(*) FROM external_settlements").fetchone()[0] == 0
+    assert store._conn.raw.execute("SELECT count(*) FROM external_settlement_cycles").fetchone()[0] == 0
+    assert store._conn.raw.execute("SELECT count(*) FROM external_settlement_evidence").fetchone()[0] == 0
+    assert all(store.cycle(c.grid_id, c.cell_id, c.generation).external_settled == 0 for c in request.cycles[:2])
+
+
+def test_multi_cycle_crash_rolls_back_cycles_and_evidence_together(tmp_path):
+    env = Env(tmp_path)
+    hooks = FaultHooks()
+    store = env.open(fault_hooks=hooks)
+    env.bootstrap(store)
+    request = _prepared_multi(store)
+    hooks.arm("before_command_commit")
+
+    with pytest.raises(SimulatedCrash):
+        with store.transaction() as tx:
+            store.record_external_settlement(tx, request)
+
+    reopened = env.open()
+    assert reopened._conn.raw.execute("SELECT count(*) FROM external_settlements").fetchone()[0] == 0
+    assert reopened._conn.raw.execute("SELECT count(*) FROM external_settlement_cycles").fetchone()[0] == 0
+    assert reopened._conn.raw.execute("SELECT count(*) FROM external_settlement_evidence").fetchone()[0] == 0
+    assert len(reopened.unmatched_evidence()) == 2
+    for cycle_request in request.cycles:
+        cycle = reopened.cycle(cycle_request.grid_id, cycle_request.cell_id, cycle_request.generation)
+        assert cycle.state == "OPEN" and cycle.external_settled == 0 and cycle.open_obligation == 10
+
+
 def test_exact_manual_close_is_atomic_audited_and_append_only(tmp_path):
     env = Env(tmp_path)
     store = env.open()

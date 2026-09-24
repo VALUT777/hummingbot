@@ -679,14 +679,30 @@
       // Pin the exact proof/evidence rendered in this dialog. Background state polling may replace S.state while
       // the operator is reading; submission must name what was actually shown, then let the server return 409 if
       // that proof is no longer current.
+      var externalCycles = Array.isArray(external.cycles) && external.cycles.length
+        ? external.cycles.slice() : (external.cycle ? [external.cycle] : []);
       S.dialogExternal = { proof_id: external.proof_id || null,
-        grid_id: (external.cycle || {}).grid_id || (S.state && S.state.engine_identity && S.state.engine_identity.grid_id) };
+        grid_id: (externalCycles[0] || {}).grid_id ||
+          (S.state && S.state.engine_identity && S.state.engine_identity.grid_id) };
       var externalBox = el("div", { id: "f-external-close", cls: "stack" });
       externalBox.appendChild(el("h3", { text: "Проверяемое ручное закрытие" }));
-      var cy = external.cycle || {};
-      externalBox.appendChild(el("p", { text: "Цикл " + txt(cy.cell_id) + " / поколение " + txt(cy.generation) +
-        ": E=" + txt(cy.E) + " · X биржа=" + txt(cy.X) + " · S вручную=" + txt(cy.proposed_settlement) +
-        " · остаток=" + txt(cy.open_after) }));
+      var externalTotal = external.total_quantity;
+      if ((externalTotal === null || externalTotal === undefined || externalTotal === "") && externalCycles.length === 1) {
+        externalTotal = externalCycles[0].proposed_settlement;
+      }
+      if (externalTotal !== null && externalTotal !== undefined && externalTotal !== "") {
+        externalBox.appendChild(el("p", { text: "Общий объём ручного закрытия: " + txt(externalTotal) + " LIT" }));
+      }
+      externalBox.appendChild(el("p", { cls: "mono", text: "Набор доказательств: " + txt(external.proof_id) }));
+      externalCycles.forEach(function (cy) {
+        externalBox.appendChild(el("p", { text: "Цикл " + txt(cy.cell_id) + " / поколение " + txt(cy.generation) +
+          " · сетка " + txt(cy.grid_id) + " (" + txt(cy.entry_side) + "): E=" + txt(cy.E) + " · X биржа=" + txt(cy.X) +
+          " · зачтено ранее=" + txt(cy.external_settled) + " · S вручную=" + txt(cy.proposed_settlement) +
+          " (распределить=" + txt(cy.proposed_settlement) + ") · остаток=" + txt(cy.open_after) }));
+      });
+      if (!externalCycles.length) {
+        externalBox.appendChild(el("p", { cls: "form-error", text: "Нет циклов для проверяемого зачёта." }));
+      }
       (external.trades || []).forEach(function (t) {
         externalBox.appendChild(el("p", { cls: "mono", text: txt(t.side) + " " + txt(t.quantity) +
           " LIT @ " + txt(t.price) + " · inbox " + txt(t.inbox_id) }));

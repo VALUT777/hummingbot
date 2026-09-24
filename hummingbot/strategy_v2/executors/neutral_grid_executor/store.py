@@ -2360,7 +2360,7 @@ class NeutralGridStore:
         return buys, sells
 
     def record_external_settlement(self, tx: Transaction, request: ExternalSettlementRequest) -> int:
-        """Atomically bind one full manual reduce-only terminal order to one exact cycle obligation.
+        """Atomically bind one full manual reduce-only terminal order to exact cycle obligations.
 
         The evidence is resolved, but owned fills, leg cumulative quantities, CIDs, baseline and STOP metadata are
         never changed. All request-shape validation precedes the first SQL write; state is re-read in the caller's
@@ -2390,16 +2390,25 @@ class NeutralGridStore:
             _require_text(request.trades_high_water, "trades_high_water", 4096)
         orders_high_water = None if request.orders_high_water is None else \
             _require_text(request.orders_high_water, "orders_high_water", 4096)
-        if len(request.cycles) != 1:
-            raise ValueError("external settlement v1 requires exactly one cycle")
-        cycle_request = request.cycles[0]
-        if not isinstance(cycle_request, ExternalSettlementCycle):
-            raise TypeError("cycles must contain ExternalSettlementCycle records")
-        if cycle_request.grid_id != grid_id:
-            raise ValueError("settlement cycle grid differs from request grid")
-        _require_int(cycle_request.cell_id, "cycle.cell_id", 0)
-        _require_int(cycle_request.generation, "cycle.generation", 1)
-        quantity = _require_positive(cycle_request.quantity, "cycle.quantity")
+        if not request.cycles:
+            raise ValueError("external settlement requires at least one cycle")
+        normalized_cycles = []
+        cycle_keys = set()
+        for cycle_request in request.cycles:
+            if not isinstance(cycle_request, ExternalSettlementCycle):
+                raise TypeError("cycles must contain ExternalSettlementCycle records")
+            if cycle_request.grid_id != grid_id:
+                raise ValueError("settlement cycle grid differs from request grid")
+            cell_id = _require_int(cycle_request.cell_id, "cycle.cell_id", 0)
+            generation = _require_int(cycle_request.generation, "cycle.generation", 1)
+            quantity = _require_positive(cycle_request.quantity, "cycle.quantity")
+            key = (grid_id, cell_id, generation)
+            if key in cycle_keys:
+                raise ValueError(f"duplicate settlement cycle {grid_id}/{cell_id}/{generation}")
+            cycle_keys.add(key)
+            normalized_cycles.append((grid_id, cell_id, generation, quantity))
+        normalized_cycles.sort(key=lambda item: item[:3])
+        quantity = sum((item[3] for item in normalized_cycles), Decimal(0))
         evidence = tuple(request.evidence)
         if len(evidence) < 2 or len({item.inbox_id for item in evidence}) != len(evidence):
             raise ValueError("settlement evidence must contain distinct trade fragments and one terminal order")
@@ -2434,17 +2443,32 @@ class NeutralGridStore:
                 raise InvalidTransitionError("external settlement revisions are stale")
             if engine.engine_state not in (EngineState.STOPPED, EngineState.STOPPED_WITH_INVENTORY):
                 raise InvalidTransitionError("external settlement requires a cleanly stopped engine")
-            cycle = self.cycle(grid_id, cycle_request.cell_id, cycle_request.generation)
-            if cycle.open_obligation != quantity:
+            outstanding_keys = {(cycle.grid_id, cycle.cell_id, cycle.generation)
+                                for cycle in self._cycles("grid_id = ?", (grid_id,))
+                                if cycle.open_obligation > 0}
+            if cycle_keys != outstanding_keys:
+                missing = sorted(outstanding_keys - cycle_keys)
+                extra = sorted(cycle_keys - outstanding_keys)
                 raise InvalidTransitionError(
-                    f"settlement quantity {quantity} != open obligation {cycle.open_obligation}")
-            if side != cycle.tp_side:
-                raise InvalidTransitionError(
-                    f"settlement side {side.value} does not close {cycle.entry_side.value} entry")
-            blockers = [blocker for blocker in self.cycle_release_blockers(
-                grid_id, cycle.cell_id, cycle.generation) if not blocker.startswith("obligation open:")]
-            if blockers:
-                raise InvalidTransitionError("cycle is not externally settleable: " + "; ".join(blockers))
+                    f"external settlement must cover every open cycle; missing={missing}, extra={extra}")
+            cycles = []
+            for cycle_grid_id, cell_id, generation, cycle_quantity in normalized_cycles:
+                cycle = self.cycle(cycle_grid_id, cell_id, generation)
+                if cycle.open_obligation != cycle_quantity:
+                    raise InvalidTransitionError(
+                        f"settlement quantity {cycle_quantity} != open obligation {cycle.open_obligation} "
+                        f"for {cycle_grid_id}/{cell_id}/{generation}")
+                if side != cycle.tp_side:
+                    raise InvalidTransitionError(
+                        f"settlement side {side.value} does not close {cycle.entry_side.value} entry "
+                        f"for {cycle_grid_id}/{cell_id}/{generation}")
+                blockers = [blocker for blocker in self.cycle_release_blockers(
+                    cycle_grid_id, cell_id, generation) if not blocker.startswith("obligation open:")]
+                if blockers:
+                    raise InvalidTransitionError(
+                        f"cycle {cycle_grid_id}/{cell_id}/{generation} is not externally settleable: "
+                        + "; ".join(blockers))
+                cycles.append(cycle)
             if self.open_conflicts():
                 raise InvalidTransitionError("external settlement refused with unresolved history conflicts")
             if any(cursor.retention_gap_open for cursor in self.cursors().values()):
@@ -2560,12 +2584,18 @@ class NeutralGridStore:
                 raise InvalidTransitionError(
                     f"external settlement evidence is ambiguous across manual orders {sorted(viable_order_ids)}")
 
-            audit_id = self._audit("external_settlement", actor, {
-                "proof_id": proof_id, "grid_id": grid_id, "cell_id": cycle.cell_id,
-                "generation": cycle.generation, "settlement_side": side.value, "quantity": str(quantity),
+            cycle_payload = [{"grid_id": cycle.grid_id, "cell_id": cycle.cell_id,
+                              "generation": cycle.generation, "quantity": str(cycle_quantity)}
+                             for cycle, (_, _, _, cycle_quantity) in zip(cycles, normalized_cycles)]
+            audit_payload = {
+                "proof_id": proof_id, "grid_id": grid_id, "cycles": cycle_payload,
+                "settlement_side": side.value, "quantity": str(quantity),
                 "observed_position": str(observed_position), "reason": reason,
                 "evidence_inbox_ids": [item[0] for item in normalized_evidence],
-            })
+            }
+            if len(cycles) == 1:
+                audit_payload.update({"cell_id": cycles[0].cell_id, "generation": cycles[0].generation})
+            audit_id = self._audit("external_settlement", actor, audit_payload)
             settlement_id = self._x(
                 "INSERT INTO external_settlements(proof_id, grid_id, settlement_side, observed_position, actor, "
                 "reason, expected_config_revision, expected_engine_revision, position_observed_at_ms, "
@@ -2575,9 +2605,11 @@ class NeutralGridStore:
                 (proof_id, grid_id, side.value, canonical_decimal(observed_position), actor, reason,
                  expected_config_revision, expected_engine_revision, *timestamps, trades_high_water,
                  orders_high_water, audit_id, self._clock_ms())).lastrowid
-            cycle_values = (settlement_id, grid_id, cycle.cell_id, cycle.generation, canonical_decimal(quantity))
-            self._x("INSERT INTO external_settlement_cycles(settlement_id, grid_id, cell_id, generation, quantity) "
-                    "VALUES (?, ?, ?, ?, ?)", cycle_values)
+            for cycle_grid_id, cell_id, generation, cycle_quantity in normalized_cycles:
+                cycle_values = (settlement_id, cycle_grid_id, cell_id, generation,
+                                canonical_decimal(cycle_quantity))
+                self._x("INSERT INTO external_settlement_cycles(settlement_id, grid_id, cell_id, generation, "
+                        "quantity) VALUES (?, ?, ?, ?, ?)", cycle_values)
             for inbox_id, role, allocated in normalized_evidence:
                 self._x("INSERT INTO external_settlement_evidence(settlement_id, inbox_id, evidence_role, "
                         "allocated_quantity) VALUES (?, ?, ?, ?)",
@@ -2585,9 +2617,10 @@ class NeutralGridStore:
                          None if allocated is None else canonical_decimal(allocated)))
                 self._x("UPDATE history_inbox SET resolved_at_ms = ?, resolution = ? WHERE id = ?",
                         (self._clock_ms(), f"external_settlement:{settlement_id}", inbox_id))
-            self.close_cycle(tx, grid_id, cycle.cell_id, cycle.generation, "externally settled manual close")
-            self.set_cell_state(tx, grid_id, cycle.cell_id, CellState.IDLE, blocker=None, reserved_slots=0,
-                                queued_at_ms=None, reason="externally settled manual close")
+            for cycle in cycles:
+                self.close_cycle(tx, grid_id, cycle.cell_id, cycle.generation, "externally settled manual close")
+                self.set_cell_state(tx, grid_id, cycle.cell_id, CellState.IDLE, blocker=None, reserved_slots=0,
+                                    queued_at_ms=None, reason="externally settled manual close")
             self._x("UPDATE engine SET manual_reconcile_required = 0, manual_reconcile_reason = NULL, "
                     "reconciliation_revision = reconciliation_revision + 1, updated_at_ms = ? WHERE id = 1",
                     (self._clock_ms(),))
@@ -4077,7 +4110,7 @@ class NeutralGridStore:
             cycle_total = sum((parse_decimal(row[0]) for row in cycle_rows), Decimal(0))
             trade_total = sum((parse_decimal(row["allocated_quantity"]) for row in evidence_rows
                                if row["evidence_role"] == "TRADE"), Decimal(0))
-            if len(cycle_rows) != 1 or cycle_total <= 0 or cycle_total != trade_total:
+            if not cycle_rows or cycle_total <= 0 or cycle_total != trade_total:
                 problems.append(f"external settlement {settlement['id']}: cycle/trade totals differ "
                                 f"{cycle_total}/{trade_total}")
             if sum(row["evidence_role"] == "TERMINAL_ORDER" for row in evidence_rows) != 1:
