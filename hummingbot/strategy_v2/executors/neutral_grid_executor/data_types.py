@@ -47,6 +47,9 @@ class EngineOptions:
     reject_backoff_max_s: float = 3600.0         # ... doubling up to this
     normal_hysteresis_ticks: int = 3             # back to NORMAL after DEGRADED only after this many clean ticks
     health_heartbeat_s: float = 10.0             # health sidecar rewritten at least this often (older = unknown)
+    # An unknown submit may be audited as 'never landed' only with evidence taken this long after its dispatch
+    # (never less than settlement_delay_s): a venue active list lagging longer is undetectable (operator risk).
+    unknown_resolution_delay_s: float = 120.0
 
     @property
     def rules_max_age_published_s(self) -> float:
@@ -143,6 +146,9 @@ class EngineMeta:
     start_config_fingerprint: Optional[str] = None                # full config the applied START acknowledged
     start_material_id: Optional[str] = None                       # web preview config+rules digest (informational)
     audited_payloads: Dict[str, Dict[str, str]] = field(default_factory=dict)   # stream -> key -> accepted fp
+    last_stop_applied_ms: Optional[int] = None                    # latest APPLIED STOP (a resume must name it)
+    # unaudited payload contradictions seen by any walk (stream|key -> versions), kept until ack_history_conflict
+    history_conflicts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -191,6 +197,7 @@ class NeutralGridExecutorConfig(ExecutorConfigBase):
     tp_gtt_seconds: int = 28 * 24 * 3600
     enabled: bool = False
     db_path: Optional[str] = None                       # None = the store's default per account/market
+    unknown_resolution_delay_s: Decimal = Decimal("120")   # see EngineOptions.unknown_resolution_delay_s
     # Explicit operator confirmations collected by the launcher (never implied by enabled=true).
     operator_confirmed_start: bool = False
     operator_confirmed_baseline: bool = False

@@ -105,6 +105,7 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
     dust_total = sum((ledger.buckets().dust for ledger in engine.cells.values()), ZERO)
     latencies = [lat for _, lat in engine.tp_latencies]
     boot_ready = engine.bootstrap_ready(now) if not engine.bootstrapped else (None, None)
+    conflicts, conflict_set_id = engine.history_conflict_set()
     return {
         "grid_id": engine.grid_id,
         "connector": engine.config.connector_name,
@@ -177,6 +178,9 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
         "store_blockers": list(engine.store_entry_blockers),
         "open_conflicts": [{"id": c.id, "kind": c.kind, "cid": _s(c.cid), "detail": c.detail}
                            for c in engine.open_conflicts],
+        # M1: exactly what an ack_history_conflict audits; the ack must carry this conflict_set_id
+        "history_conflicts": conflicts,
+        "conflict_set_id": conflict_set_id,
         "entry_blockers": list(engine.entry_blockers),
         "tp_blockers": list(engine.tp_blockers),
         "persistence_error": engine.persistence_error,

@@ -136,7 +136,8 @@ def test_invariants_hold_under_random_fill_cancel_restart_orderings(tmp_path, se
         h.hooks.disarm()
         # Quiesce: stop and let every own order settle; the ledger then equals the venue exactly.
         h.command(CommandKind.STOP, key=f"stop-{seed}")
-        for attempt in range(4):
+        # 8 x 40 s: an unknown submit is auditable only unknown_resolution_delay_s (120 s) after its dispatch
+        for attempt in range(8):
             for _ in range(40):
                 h.tick()
                 checker.check()

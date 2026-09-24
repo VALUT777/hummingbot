@@ -72,6 +72,7 @@ def test_example_config_is_disabled_and_matches_the_spec_profile():
         (D("5"), D("1000"), D("1000"), 120)
     assert (cfg.history_freshness_s, cfg.settlement_delay_s, cfg.settlement_scans, cfg.history_overlap_s,
             cfg.poll_interval_s) == (D("10"), D("5"), 2, D("60"), D("5"))
+    assert cfg.unknown_resolution_delay_s == D("120")
     assert (cfg.entry_order_type.value, cfg.tp_order_type.value) == ("LIMIT_MAKER", "LIMIT")
     assert validate_profile(cfg) == []
     text = (EXAMPLE_CONTROLLER.read_text() + EXAMPLE_SCRIPT.read_text()).lower()
@@ -89,6 +90,7 @@ def test_example_config_is_disabled_and_matches_the_spec_profile():
     ({"lower_price": D("6"), "upper_price": D("5")}, "lower_price"),
     ({"order_amount_base": D("0")}, "order_amount_base"),
     ({"max_active_orders": 0}, "max_active_orders"),
+    ({"unknown_resolution_delay_s": D("4")}, "unknown_resolution_delay_s must be finite and >= settlement"),
 ])
 def test_config_rejects_unsafe_values(updates, message):
     with pytest.raises(ValidationError, match=message):
@@ -690,4 +692,87 @@ def test_d201_stop_whose_insert_failed_is_resent_until_applied(tmp_path):
     finally:
         if executor.engine.store is not None and not executor.engine.store.closed:
             executor.engine.store.close()
+        loop.close()
+
+
+# ------------------------------------------------------------------------------------------ round 4 (H2, L1)
+def _killed_while_stopping(tmp_path, clock, fx):
+    """A first process whose drain was killed: the durable stop S is STOPPING (outcome None)."""
+    first = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(first.on_start())
+        _run(loop, first, clock, 25)
+        first.early_stop()
+        _run(loop, first, clock, 1)
+        meta = first.engine.meta
+        assert meta.stop_requested_ms is not None and meta.stop_outcome is None
+        stop_ms = meta.stop_requested_ms
+        first.engine.store._die()
+        return stop_ms
+    finally:
+        loop.close()
+
+
+def test_h2_hummingbot_stop_at_launch_is_never_undone_by_a_resent_resume_start(tmp_path):
+    """Critic CR-4 variant (exact 3-tick race): a web PAUSE queued while Hummingbot was down makes the launcher resume
+    START and the executor STOP turn CONFLICT in tick 1; the STOP is re-sent and APPLIED in tick 2 (STOPPING keeps
+    S); a START re-sent after the stop request would apply in tick 3 and clear it."""
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, CommandStatus
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    stop_ms = _killed_while_stopping(tmp_path, clock, fx)
+    client = NeutralGridStore.open_command_client(str(tmp_path / "ng.sqlite3"))
+    try:
+        eng = client.engine()
+        client.enqueue_command("web-pause-while-down", CommandKind.PAUSE, eng.config_revision, eng.engine_revision,
+                               {"reason": "clicked while Hummingbot was down"})
+    finally:
+        client.close()
+    second = _executor(tmp_path, clock, fx, operator_resume_stop_ms=stop_ms)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(second.on_start())
+        second.early_stop()                                   # the operator stops Hummingbot right after launch
+        for _ in range(3):
+            _run(loop, second, clock, 1)
+            assert second.engine.meta.stop_requested_ms is not None
+        commands = second.engine.store.list_commands(limit=50)
+        pause = next(c.id for c in commands if c.idempotency_key == "web-pause-while-down")
+        first_stop = next(c.id for c in commands if c.idempotency_key == second._stop_keys[0])
+        assert [c.idempotency_key for c in commands if c.kind == "start" and c.id > first_stop] == []
+        assert not any(c.kind == "start" and c.status == CommandStatus.APPLIED for c in commands if c.id > pause)
+        for _ in range(200):
+            _run(loop, second, clock, 1)
+            if second.close_type is not None:
+                break
+        assert second.engine.meta.stop_requested_ms is not None
+        assert second.close_type == CloseType.EARLY_STOP, (second.engine.engine_state, second.engine.reasons)
+    finally:
+        if second.engine.store is not None and not second.engine.store.closed:
+            second.engine.store.close()
+        loop.close()
+
+
+def test_l1_start_config_changed_makes_the_launcher_rebind_and_retry_the_baseline(tmp_path):
+    """E-09 executor path: a CONFIRM_BASELINE refused with START_CONFIG_CHANGED (the START row applied before the
+    rebind, e.g. an older ledger) makes the launcher re-send its confirmed START and retry, never latch."""
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    executor = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(executor.on_start())
+        _run(loop, executor, clock, 1)
+        assert executor.engine.meta.started
+        executor.engine.meta.start_config_fingerprint = "0" * 32         # acknowledged under another config
+        for _ in range(80):
+            _run(loop, executor, clock, 1)
+            if executor.engine.bootstrapped:
+                break
+        assert executor.engine.bootstrapped, (executor.start_error, executor.engine.recent_commands)
+        assert executor.start_error is None
+    finally:
+        executor.engine.store.close()
         loop.close()
