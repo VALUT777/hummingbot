@@ -35,7 +35,8 @@ def engine_config_json(**overrides):
     return data
 
 
-def attach_snapshot(*, engine_config="default", rules_age_s=1.0, supports=(True, True), committed_age_s=0.0):
+def attach_snapshot(*, engine_config="default", rules_age_s=1.0, supports=(True, True), committed_age_s=0.0,
+                    max_age_s="180"):
     snap = sample_snapshot("BOOTSTRAPPING", committed_at=time.time() - committed_age_s)
     snap["reasons"] = ["AWAITING_START"]
     snap["summary"]["started"] = False
@@ -45,6 +46,8 @@ def attach_snapshot(*, engine_config="default", rules_age_s=1.0, supports=(True,
         "tick_size": "0.0001", "size_step": "0.1", "min_base": "5", "min_notional": "10", "max_base": "100000",
         "max_leverage": "10", "max_active_orders_venue": None, "fetched_at": str(time.time() - rules_age_s),
         "supports_limit": supports[0], "supports_post_only": supports[1]}
+    if max_age_s is not None:
+        snap["summary"]["runtime_rules"]["max_age_s"] = max_age_s
     if engine_config == "default":
         snap["summary"]["engine_config"] = engine_config_json()
     elif engine_config is not None:
@@ -151,7 +154,8 @@ def test_engine_config_parser_direct():
 @pytest.mark.parametrize("kwargs,needle", [
     ({"supports": (True, False)}, "post"),              # LIMIT_MAKER entry but the venue says no post-only
     ({"supports": (None, True)}, "supports_limit"),     # unknown support is not assumed
-    ({"rules_age_s": 60.0}, "устарел"),                 # rules older than history_freshness_s (10 s)
+    ({"rules_age_s": 200.0}, "устарел"),                # rules older than the engine's published max_age_s
+    ({"max_age_s": None}, "max_age_s"),                 # no published bound -> fail closed
     ({"committed_age_s": 120.0}, "Снимок"),            # stale committed snapshot
 ])
 async def test_attach_market_rules_flags_and_freshness(attach_web, kwargs, needle):
@@ -168,3 +172,12 @@ async def test_attach_rules_fetched_at_is_the_rules_time_not_snapshot_time(attac
     preview = await _preview(web)
     assert abs(preview["rules_fetched_at"] - float(snap["summary"]["runtime_rules"]["fetched_at"])) < 1e-6
     assert preview["runtime_rules"]["supports_post_only"] is True
+
+
+@pytest.mark.asyncio
+async def test_rules_freshness_uses_engine_max_age_not_history_freshness(attach_web):
+    """Rules refreshed every 60 s are fresh under the engine's own bound even though history_freshness_s is 10 s."""
+    web = await attach_web(attach_snapshot(rules_age_s=60.0, max_age_s="180"))
+    preview = await _preview(web)
+    assert preview["errors"] == [], preview["errors"]
+    assert preview["can_start"] is True

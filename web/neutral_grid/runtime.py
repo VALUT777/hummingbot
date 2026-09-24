@@ -160,8 +160,9 @@ def snapshot_market(gateway: Any, config_source: Callable[[], Tuple[Optional[Gri
                     ) -> Callable[[], Awaitable[MarketContext]]:
     """Preview market context from the committed snapshot (attach mode never calls the exchange).
 
-    Limit/post-only support and the rules fetch time come from ``summary.runtime_rules``; unknown support,
-    rules older than ``history_freshness_s`` or a stale snapshot are preview errors (Start disabled).
+    Limit/post-only support, the rules fetch time and the engine's own rules staleness bound (``max_age_s``)
+    come from ``summary.runtime_rules``; unknown support, a missing bound, rules older than it or a stale
+    snapshot are preview errors (Start disabled). History freshness is judged separately (snapshot age, lag).
     """
     async def source() -> MarketContext:
         snapshot = gateway.latest_snapshot() or {}
@@ -188,13 +189,15 @@ def snapshot_market(gateway: Any, config_source: Callable[[], Tuple[Optional[Gri
             except (KeyError, ValueError, ArithmeticError, TypeError):
                 rules = None
                 errors.append("Правила рынка в снимке движка неполные или повреждены.")
-        cfg, _ = config_source()
         if rules is not None:
+            max_age = _dec(rr.get("max_age_s"))
             if fetched_at is None:
                 errors.append("Правила рынка: время получения (fetched_at) неизвестно.")
-            elif cfg is not None and now - fetched_at > float(cfg.history_freshness_s):
+            elif max_age is None or max_age <= 0:
+                errors.append("Правила рынка: движок не опубликовал max_age_s — свежесть правил не проверить.")
+            elif Decimal(str(now)) - Decimal(str(fetched_at)) > max_age:
                 errors.append(f"Правила рынка устарели: получены {now - fetched_at:.0f} с назад "
-                              f"(допустимо {cfg.history_freshness_s} с).")
+                              f"(предел движка {max_age} с).")
         committed_at = snapshot.get("committed_at")
         if committed_at is None or now - float(committed_at) > stale_after_s:
             errors.append("Снимок движка устарел или отсутствует: превью по нему недостоверно.")
