@@ -10,9 +10,9 @@ from ngweb_fakes import sample_config, sample_rules
 STATIC = Path(__file__).resolve().parents[3] / "web" / "neutral_grid" / "static"
 
 
-async def _preview(web, query=""):
+async def _preview(web):
     await web.login()
-    resp = await web.get("/api/preview" + query)
+    resp = await web.get("/api/preview")
     assert resp.status == 200, await resp.text()
     return await resp.json()
 
@@ -20,7 +20,7 @@ async def _preview(web, query=""):
 @pytest.mark.asyncio
 async def test_sample_preview_counts_range_caps_floors(make_web):
     web = await make_web(None)
-    p = await _preview(web, "?baseline=0")
+    p = await _preview(web)
     assert p["grid"]["boundaries"] == 56 and p["grid"]["cells"] == 55
     assert p["grid"]["prices"][0] == "5.0000" and p["grid"]["prices"][-1] == "6.0000"
     assert all(isinstance(x, str) for x in p["grid"]["prices"])
@@ -31,7 +31,7 @@ async def test_sample_preview_counts_range_caps_floors(make_web):
     assert (adm["slots_per_cell_min"], adm["slots_per_cell_max"]) == (3, 3)
     assert (adm["armed"], adm["queued"]) == (40, 15)
     assert (adm["slots_actual"], adm["slots_reserved"], adm["slots_free"], adm["effective_cap"]) == (0, 120, 0, 120)
-    assert p["baseline"] == {"value": "0", "signed": "+0", "source": "operator_input", "confirmed_in_ledger": False}
+    assert p["baseline"] == {"value": "0", "signed": "+0", "source": "config", "confirmed_in_ledger": False}
     assert p["reachable"] == {"P_min": "-330", "P_max": "220", "net_cap": "1000", "within_cap": True,
                               "baseline_used": "0"}
     assert p["gross"] == {"worst": "550", "cap": "1000", "within_cap": True}
@@ -50,45 +50,54 @@ async def test_sample_preview_counts_range_caps_floors(make_web):
 
 
 @pytest.mark.asyncio
-async def test_baseline_330_shifts_reachable_range(make_web):
-    web = await make_web(None)
-    p = await _preview(web, "?baseline=330")
-    assert (p["reachable"]["P_min"], p["reachable"]["P_max"]) == ("0", "550")
-    assert p["baseline"]["signed"] == "+330"
-    short = await (await web.get("/api/preview?baseline=-120")).json()
-    assert (short["reachable"]["P_min"], short["reachable"]["P_max"]) == ("-450", "100")
-    assert short["baseline"]["signed"] == "-120"
+@pytest.mark.parametrize("baseline,expected", [("330", ("0", "550", "+330")), ("-120", ("-450", "100", "-120"))])
+async def test_signed_baseline_shifts_reachable_range(make_web, baseline, expected):
+    web = await make_web(None, config=sample_config(expected_initial_position=Decimal(baseline)))
+    p = await _preview(web)
+    assert (p["reachable"]["P_min"], p["reachable"]["P_max"], p["baseline"]["signed"]) == expected
+    assert p["errors"] == []
 
 
 @pytest.mark.asyncio
-async def test_missing_baseline_is_input_not_error(make_web):
-    web = await make_web(None)
+async def test_missing_baseline_blocks_first_start(make_web):
+    web = await make_web(None, config=sample_config(expected_initial_position=None))
     p = await _preview(web)
     assert p["baseline"]["source"] == "missing"
-    assert p["errors"] == [] and p["can_start"] is True
+    assert p["can_start"] is False
+    assert any(e.startswith("Baseline B") for e in p["errors"])
     assert p["reachable"]["baseline_used"] == "0"
-    assert any("expected_initial_position" in w for w in p["warnings"])
-    bad = await web.get("/api/preview?baseline=abc")
-    assert bad.status == 400
+
+
+@pytest.mark.asyncio
+async def test_baseline_beyond_cap_and_reachable_beyond_cap(make_web):
+    web = await make_web(None, config=sample_config(expected_initial_position=Decimal("-1100")))
+    p = await _preview(web)
+    assert p["can_start"] is False
+    assert any(e.startswith("Baseline B") and "max_abs_net_position" in e for e in p["errors"])
+    web2 = await make_web(None, config=sample_config(expected_initial_position=Decimal("900")))
+    p2 = await _preview(web2)
+    assert p2["reachable"] == {"P_min": "570", "P_max": "1120", "net_cap": "1000", "within_cap": False,
+                               "baseline_used": "900"}
+    assert p2["can_start"] is True and any("AC-24" in w for w in p2["warnings"])
 
 
 @pytest.mark.asyncio
 async def test_validation_errors_are_shown_and_block_start(make_web):
     web = await make_web(None, config=sample_config(lower_price=Decimal("5.00005")))
-    p = await _preview(web, "?baseline=0")
+    p = await _preview(web)
     assert p["can_start"] is False
     assert any(e.startswith("Сетка:") and "tick" in e for e in p["errors"])
 
     web2 = await make_web(None, config=sample_config(order_amount_base=Decimal("10.05")))
-    p2 = await _preview(web2, "?baseline=0")
+    p2 = await _preview(web2)
     assert any(e.startswith("Размер ордера Q") for e in p2["errors"])
 
     web3 = await make_web(None, config=sample_config(leverage=Decimal("20")))
-    p3 = await _preview(web3, "?baseline=0")
+    p3 = await _preview(web3)
     assert any(e.startswith("Плечо") for e in p3["errors"])
 
     web4 = await make_web(None, config=sample_config(order_amount_base=Decimal("4")))  # full Q below min 5
-    p4 = await _preview(web4, "?baseline=0")
+    p4 = await _preview(web4)
     assert p4["can_start"] is False and p4["errors"]
 
 
@@ -96,23 +105,23 @@ async def test_validation_errors_are_shown_and_block_start(make_web):
 async def test_unknown_rules_and_margin_block(make_web):
     web = await make_web(None)
     web.market["rules"] = None
-    p = await _preview(web, "?baseline=0")
+    p = await _preview(web)
     assert p["can_start"] is False
     assert any("RULES_UNKNOWN" in e for e in p["errors"])
     web.market["rules"] = sample_rules()
     web.market["available"] = None
-    p = await (await web.get("/api/preview?baseline=0")).json()
+    p = await (await web.get("/api/preview")).json()
     assert p["notional"]["blocks_exposure"] is True
     assert any("Маржа неизвестна" in w for w in p["warnings"])
     web.market["available"] = Decimal("100")
-    p = await (await web.get("/api/preview?baseline=0")).json()
+    p = await (await web.get("/api/preview")).json()
     assert p["notional"]["blocks_exposure"] is False and "MARGIN_SHORTFALL" in p["notional"]["warning"]
 
 
 @pytest.mark.asyncio
 async def test_live_mode_requires_enabled_config(make_web):
     web = await make_web(None, config=sample_config(enabled=False), mode="attach")
-    p = await _preview(web, "?baseline=0")
+    p = await _preview(web)
     assert p["can_start"] is False
     assert any(e.startswith("enabled=false") for e in p["errors"])
 
@@ -120,10 +129,10 @@ async def test_live_mode_requires_enabled_config(make_web):
 @pytest.mark.asyncio
 async def test_venue_cap_limits_admission(make_web):
     web = await make_web(None, config=sample_config(max_active_orders=60))
-    p = await _preview(web, "?baseline=0")
+    p = await _preview(web)
     assert (p["admission"]["armed"], p["admission"]["queued"]) == (20, 35)
     web.market["rules"] = sample_rules(max_active_orders_venue=30)
-    p = await (await web.get("/api/preview?baseline=0")).json()
+    p = await (await web.get("/api/preview")).json()
     assert p["admission"]["venue_cap"] == 30
     assert any(e.startswith("Лимит ордеров") for e in p["errors"])
 

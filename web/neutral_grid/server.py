@@ -20,7 +20,7 @@ from web.neutral_grid import jsonsafe, views
 from web.neutral_grid.commands import CommandService
 from web.neutral_grid.gateway import EngineGateway
 from web.neutral_grid.keystore import KeystoreError, KeystoreService
-from web.neutral_grid.preview import PreviewService, parse_signed_decimal
+from web.neutral_grid.preview import PreviewService
 from web.neutral_grid.security import (
     AccessGate,
     SecurityPolicy,
@@ -63,18 +63,24 @@ class WebContext:
 
     def __post_init__(self) -> None:
         if self.commands is None:
-            self.commands = CommandService(self.gateway, self.build_preview, self.engine_identity)
+            self.commands = CommandService(self.gateway, self.build_preview, self.engine_identity,
+                                           config_baseline=self.preview.config.expected_initial_position)
 
-    async def build_preview(self, *, config_revision: int, engine_revision: int,
-                            baseline_override: Optional[Decimal] = None) -> Dict[str, Any]:
+    async def build_preview(self, *, config_revision: int, engine_revision: int) -> Dict[str, Any]:
         snapshot = self.gateway.latest_snapshot()
         confirmed = bool(snapshot) and (snapshot.get("summary") or {}).get("baseline") not in (None, "")
         return await self.preview.build(config_revision=config_revision, engine_revision=engine_revision,
-                                        baseline_override=baseline_override, baseline_confirmed_in_ledger=confirmed)
+                                        baseline_confirmed_in_ledger=confirmed)
 
 
 def _ctx(request: web.Request) -> WebContext:
     return request.app[CTX_KEY]
+
+
+def _snapshot(ctx: WebContext) -> Optional[Dict[str, Any]]:
+    """Latest committed snapshot, time fields normalized for display (never mutated, never derived)."""
+    snapshot = ctx.gateway.latest_snapshot()
+    return views.for_display(snapshot) if snapshot else None
 
 
 def _json(data: Any, status: int = 200) -> web.Response:
@@ -146,7 +152,7 @@ async def session_info(request: web.Request) -> web.Response:
 # ---------------------------------------------------------------------------- read side
 async def state(request: web.Request) -> web.Response:
     ctx = _ctx(request)
-    snapshot = ctx.gateway.latest_snapshot()
+    snapshot = _snapshot(ctx)
     fresh = views.freshness(snapshot, ctx.clock(), ctx.stale_after_s)
     meta = None
     if snapshot:
@@ -163,7 +169,8 @@ async def state(request: web.Request) -> web.Response:
         "unmatched_evidence": (snapshot or {}).get("unmatched_evidence") or [],
         "errors": list((snapshot or {}).get("errors") or [])[-20:],
         "snapshot_commands": list((snapshot or {}).get("commands") or [])[-20:],
-        "recent_commands": ctx.gateway.list_commands(limit=10),
+        "recent_commands": views.for_display(ctx.gateway.list_commands(limit=10)),
+        "engine_started": views.engine_started(snapshot),
         "host": ctx.host_status(),
     })
 
@@ -172,19 +179,12 @@ async def preview(request: web.Request) -> web.Response:
     ctx = _ctx(request)
     snapshot = ctx.gateway.latest_snapshot()
     cfg_rev, eng_rev = views.snapshot_revisions(snapshot)
-    baseline = None
-    if "baseline" in request.query:
-        try:
-            baseline = parse_signed_decimal(request.query["baseline"])
-        except ValueError as exc:
-            return json_error(400, "bad_baseline", f"expected_initial_position: {exc}")
-    return _json(await ctx.build_preview(config_revision=cfg_rev, engine_revision=eng_rev,
-                                         baseline_override=baseline))
+    return _json(await ctx.build_preview(config_revision=cfg_rev, engine_revision=eng_rev))
 
 
 async def cells(request: web.Request) -> web.Response:
     ctx = _ctx(request)
-    snapshot = ctx.gateway.latest_snapshot()
+    snapshot = _snapshot(ctx)
     try:
         page = views.page_cells(snapshot, after=request.query.get("after"),
                                 limit=_int_param(request, "limit", 60, 1, views.MAX_PAGE),
@@ -224,7 +224,7 @@ async def lookup(request: web.Request) -> web.Response:
     wanted = (request.query.get("id") or "").strip()
     if not views.valid_lookup_id(wanted):
         return json_error(400, "bad_id", "ID: 1–96 символов [0-9A-Za-z_:.-]; сравнивается как строка.")
-    snapshot = ctx.gateway.latest_snapshot()
+    snapshot = _snapshot(ctx)
     return _json({
         "id": wanted,
         "snapshot_matches": views.lookup_in_snapshot(snapshot, wanted),

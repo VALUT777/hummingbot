@@ -7,9 +7,9 @@ one implementation. This module only adds presentation: exact strings, Russian l
 warnings and the ``preview_id``. Mid-dependent values (BUY/SELL split, reachable range, armed/queued)
 are advisory: the anchor is fixed by the engine after full reconciliation at bootstrap.
 
-``preview_id`` fingerprints what a Start confirmation is about: config, runtime rules and the
-committed revisions. It deliberately excludes the moving mid price and the operator's baseline input,
-so a Start is refused (409 + fresh preview) only when the grid/rules/revisions actually changed.
+``preview_id`` fingerprints what a Start confirmation is about: config (including the signed baseline
+``expected_initial_position``), runtime rules and the committed revisions. It deliberately excludes the
+moving mid price, so a Start is refused (409 + fresh preview) only when the grid/rules/revisions changed.
 """
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor import grid as core_
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import GridConfig, TradingRules
 from web.neutral_grid import jsonsafe
 
-_MISSING_BASELINE = "expected_initial_position: required"
 _ERROR_LABELS = (
     ("grid:", "Сетка"),
     ("leverage:", "Плечо"),
@@ -112,27 +111,20 @@ class PreviewService:
         return hashlib.sha256(material.encode()).hexdigest()[:24]
 
     async def build(self, *, config_revision: int, engine_revision: int,
-                    baseline_override: Optional[Decimal] = None,
                     baseline_confirmed_in_ledger: bool = False) -> Dict[str, Any]:
         cfg = self.config
         ctx = await self._market()
         rules, mid = ctx.rules, ctx.mid
         warnings: List[str] = []
         bootstrap = not baseline_confirmed_in_ledger
-        baseline = baseline_override if baseline_override is not None else cfg.expected_initial_position
-        effective_cfg = dataclasses.replace(cfg, expected_initial_position=baseline)
-        gp = core_grid.build_preview(effective_cfg, rules, mid, baseline, bootstrap=bootstrap)
+        baseline = cfg.expected_initial_position
+        gp = core_grid.build_preview(cfg, rules, mid, baseline, bootstrap=bootstrap)
 
-        errors: List[str] = []
-        for message in gp.errors:
-            if baseline is None and message.startswith(_MISSING_BASELINE):
-                continue  # collected in the Start dialog, not a config defect
-            errors.append(localize_error(message))
+        errors: List[str] = [localize_error(message) for message in gp.errors]
         if self.mode != "demo" and not cfg.enabled:
             errors.append("enabled=false: live-старт невозможен без изменения конфигурации и явного подтверждения.")
         if baseline is None:
-            warnings.append("expected_initial_position (B) не задан в конфигурации: его нужно ввести и подтвердить "
-                            "в диалоге старта. Диапазон ниже рассчитан для B=0.")
+            warnings.append("Диапазон позиции ниже рассчитан для B=0, потому что expected_initial_position не задан.")
 
         cells = gp.cells
         q = cfg.order_amount_base
@@ -179,8 +171,7 @@ class PreviewService:
             "live_confirmation_required": bootstrap,
             "baseline": {
                 "value": _s(baseline), "signed": signed(baseline) if baseline is not None else None,
-                "source": "operator_input" if baseline_override is not None else (
-                    "config" if cfg.expected_initial_position is not None else "missing"),
+                "source": "config" if baseline is not None else "missing",
                 "confirmed_in_ledger": baseline_confirmed_in_ledger,
             },
             "grid": {"boundaries": len(gp.prices), "cells": len(cells) if cells else max(len(gp.prices) - 1, 0),

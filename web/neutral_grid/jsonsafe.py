@@ -28,8 +28,8 @@ _ID_KEYS = frozenset({
 })
 _TIME_KEYS = frozenset({
     "committed_at", "at", "created_at", "applied_at", "fetched_at", "served_at", "lag_s", "age_s",
-    "queue_age_s", "last_full_scan_at", "stale_after_s", "timestamp", "updated_at", "expiry",
-    "started_at", "ts",
+    "queue_age_s", "last_full_scan_at", "stale_after_s", "timestamp", "updated_at", "expiry_at",
+    "started_at", "ts", "last_commit_at", "last_latency_s", "max_latency_s", "slo_s", "baseline_confirmed_at",
 })
 
 

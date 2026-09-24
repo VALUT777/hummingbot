@@ -71,6 +71,7 @@
           <button type="button" class="btn btn-danger" data-cmd="stop">Стоп</button>
           <button type="button" class="btn" data-cmd="confirm_baseline">Подтвердить baseline</button>
           <button type="button" class="btn" data-cmd="baseline_audit">Аудит baseline</button>
+          <button type="button" class="btn" data-cmd="manual_reconcile">Ручная сверка…</button>
         </div>
         <p class="hint">Команды записываются в очередь единственного движка. Статус «в очереди» не означает,
           что биржа что-то исполнила: результат появится после применения движком.</p>
@@ -86,6 +87,13 @@
         <dl class="kv" id="risk-kv"></dl>
       </article>
     </div>
+
+    <div class="banner banner-error" id="persistence-banner" role="alert" hidden></div>
+    <article class="card" aria-labelledby="h-blockers" id="blockers-card">
+      <h2 id="h-blockers">Блокеры, заморозки и bootstrap</h2>
+      <dl class="kv" id="blockers-kv"></dl>
+      <ul class="log" id="unknown-orders" hidden></ul>
+    </article>
 
     <div class="grid-3">
       <article class="card" aria-labelledby="h-orders"><h2 id="h-orders">Ордера и слоты</h2><dl class="kv" id="orders-kv"></dl></article>
@@ -242,12 +250,9 @@
     <h2 id="start-title">Подтверждение старта</h2>
     <p id="start-mode-note" class="banner banner-warn"></p>
     <dl class="kv" id="start-summary"></dl>
-    <label for="start-baseline">expected_initial_position (B), LIT, со знаком</label>
+    <label for="start-baseline">Введите expected_initial_position (B) ещё раз, LIT, со знаком</label>
     <input id="start-baseline" inputmode="decimal" spellcheck="false" required aria-describedby="start-baseline-help">
-    <p class="hint" id="start-baseline-help">Фактическая позиция на бирже до старта: «0», «330» или «-120». Бот не
-      покупает и не закрывает её, только учитывает. После сверки её нужно будет подтвердить ещё раз.</p>
-    <button type="button" class="btn" id="start-recalc">Пересчитать диапазон для B</button>
-    <p class="hint" id="start-range" aria-live="polite"></p>
+    <p class="hint" id="start-baseline-help"></p>
     <label class="check"><input type="checkbox" id="start-ack-baseline"> Подтверждаю, что позиция на бирже равна B.</label>
     <label class="check"><input type="checkbox" id="start-ack-risk"> Понимаю риск: движок будет выставлять ордера
       в пределах показанных лимитов, без стоп-лосса и без автоматического закрытия позиции.</label>

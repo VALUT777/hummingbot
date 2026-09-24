@@ -26,6 +26,32 @@ _ID_RE = re.compile(r"[0-9A-Za-z_:.\-]{1,96}\Z")
 MAX_PAGE = 200
 
 
+# Timestamps (unix s) and durations (s) the engine may serialize as strings; converted for display only.
+# They are never quantities or ids, so a float is harmless here (ids/decimals stay exact strings).
+DISPLAY_TIME_KEYS = frozenset({
+    "committed_at", "at", "last_full_scan_at", "last_commit_at", "lag_s", "queue_age_s", "fetched_at",
+    "created_at", "applied_at", "last_latency_s", "max_latency_s", "slo_s", "baseline_confirmed_at",
+})
+_NUMERIC_RE = re.compile(r"-?[0-9]+(\.[0-9]+)?\Z")
+
+
+def for_display(value: Any, key: str = "") -> Any:
+    """Deep copy of a snapshot fragment with time fields as numbers and GTT expiry (ms) as ``expiry_at``."""
+    if isinstance(value, dict):
+        out = {k: for_display(v, str(k)) for k, v in value.items()}
+        expiry = value.get("expiry")
+        if isinstance(expiry, str) and expiry.isdigit():
+            out["expiry_at"] = int(expiry) / 1000.0
+        elif isinstance(expiry, int) and not isinstance(expiry, bool):
+            out["expiry_at"] = expiry / 1000.0
+        return out
+    if isinstance(value, list):
+        return [for_display(v, key) for v in value]
+    if key in DISPLAY_TIME_KEYS and isinstance(value, str) and _NUMERIC_RE.fullmatch(value):
+        return float(value)
+    return value
+
+
 def snapshot_revisions(snapshot: Optional[Dict[str, Any]]) -> Tuple[int, int]:
     if not snapshot:
         return 0, 0
@@ -194,5 +220,25 @@ def lookup_in_snapshot(snapshot: Optional[Dict[str, Any]], wanted: str) -> List[
     return matches
 
 
+AWAITING_START = "AWAITING_START"
+
+
+def engine_started(snapshot: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Whether the committed engine has been started (None = unknown / no snapshot).
+
+    Prefers an explicit ``summary.started`` flag; the engine currently signals "not started yet" with the
+    ``AWAITING_START`` reason while its state is still BOOTSTRAPPING.
+    """
+    if not snapshot:
+        return None
+    explicit = (snapshot.get("summary") or {}).get("started")
+    if isinstance(explicit, bool):
+        return explicit
+    return AWAITING_START not in (snapshot.get("reasons") or [])
+
+
 def is_engine_active(snapshot: Optional[Dict[str, Any]]) -> bool:
-    return bool(snapshot) and str(snapshot.get("engine_state")) in ACTIVE_ENGINE_STATES
+    """An engine that is started and not cleanly stopped owns the identity: a new Start is a duplicate."""
+    if not snapshot or str(snapshot.get("engine_state")) not in ACTIVE_ENGINE_STATES:
+        return False
+    return engine_started(snapshot) is not False

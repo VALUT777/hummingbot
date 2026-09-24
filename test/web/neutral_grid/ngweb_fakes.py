@@ -28,7 +28,7 @@ def sample_rules(**overrides) -> TradingRules:
 def sample_config(**overrides) -> GridConfig:
     values = dict(grid_id="ng-test", connector_name="lighter_perpetual_robinhood", trading_pair="LIT-USDG",
                   account_index=7, lower_price=Decimal("5"), upper_price=Decimal("6"), cell_count=55,
-                  order_amount_base=Decimal("10"), leverage=Decimal("5"), expected_initial_position=None,
+                  order_amount_base=Decimal("10"), leverage=Decimal("5"), expected_initial_position=Decimal("0"),
                   max_abs_net_position=Decimal("1000"), max_gross_position=Decimal("1000"),
                   max_active_orders=120, enabled=True)
     values.update(overrides)

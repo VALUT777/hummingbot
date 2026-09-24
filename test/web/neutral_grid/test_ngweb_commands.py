@@ -11,15 +11,14 @@ from ngweb_fakes import sample_rules, sample_snapshot
 JS_SAFE = (1 << 53) - 1
 
 
-async def _preview(web, baseline=None):
-    path = "/api/preview" + (f"?baseline={baseline}" if baseline is not None else "")
-    resp = await web.get(path)
+async def _preview(web):
+    resp = await web.get("/api/preview")
     assert resp.status == 200, await resp.text()
     return await resp.json()
 
 
 async def _start_payload(web, baseline="0"):
-    preview = await _preview(web, baseline)
+    preview = await _preview(web)
     return preview, {"expected_initial_position": baseline, "baseline_acknowledged": True,
                      "risk_acknowledged": True, "preview_id": preview["preview_id"]}
 
@@ -144,22 +143,36 @@ async def test_start_requires_explicit_baseline_and_risk_confirmation(make_web):
 
 
 @pytest.mark.asyncio
-async def test_start_with_baseline_outside_cap_is_rejected(make_web):
-    web = await make_web(None)
+async def test_start_baseline_must_match_config(make_web):
+    web = await make_web(None)  # config B = 0
     await web.login()
-    _, payload = await _start_payload(web, "-1100")  # |B| above max_abs_net_position: core validation error
+    _, payload = await _start_payload(web, "330")
+    resp = await web.command("start", "start-b-mismatch-001", payload)
+    assert resp.status == 422
+    assert "не совпадает" in (await resp.json())["message"]
+    for typed in ("0", "+0", "0.000", "-0"):
+        _, same = await _start_payload(web, typed)
+        resp = await web.command("start", f"start-b-match-{typed}".replace("+", "p").replace(".", "d").ljust(20, "x"),
+                                 same)
+        assert resp.status in (202, 409), (typed, await resp.text())
+    assert len([c for c in web.gateway.commands if c["kind"] == "start"]) == 1
+    confirm = await web.command("confirm_baseline", "confirm-b-mismatch01", {"expected_initial_position": "5",
+                                                                             "confirm": True})
+    assert confirm.status == 422 and "не совпадает" in (await confirm.json())["message"]
+
+
+@pytest.mark.asyncio
+async def test_start_with_invalid_preview_is_rejected(make_web):
+    from ngweb_fakes import sample_config
+    web = await make_web(None, config=sample_config(expected_initial_position=Decimal("-1100")))
+    await web.login()
+    _, payload = await _start_payload(web, "-1100")
     resp = await web.command("start", "start-cap-000000001", payload)
     assert resp.status == 422
     body = await resp.json()
     assert body["error"] == "preview_invalid"
     assert any("max_abs_net_position" in e and e.startswith("Baseline B") for e in body["errors"])
     assert web.gateway.commands == []
-    # |B| within cap but reachable range beyond it: allowed, the engine blocks the unsafe entries (AC-24)
-    preview, payload = await _start_payload(web, "900")
-    assert preview["reachable"] == {"P_min": "570", "P_max": "1120", "net_cap": "1000", "within_cap": False,
-                                    "baseline_used": "900"}
-    assert any("AC-24" in w for w in preview["warnings"])
-    assert (await web.command("start", "start-cap-000000002", payload)).status == 202
 
 
 @pytest.mark.asyncio
@@ -193,6 +206,7 @@ async def test_preview_id_ignores_moving_mid_price(make_web):
                                    "FROZEN", "STOPPING"])
 async def test_start_while_engine_active_returns_engine_identity_not_second_engine(make_web, state):
     web = await make_web(sample_snapshot(state))
+    assert "AWAITING_START" not in web.gateway.snapshot["reasons"]
     await web.login()
     _, payload = await _start_payload(web)
     resp = await web.command("start", "start-dup-000000001", payload)
@@ -261,8 +275,8 @@ async def test_all_operator_commands_enqueue_normalized_payloads(make_web):
         "pause": ({}, {}),
         "resume": ({"reason": " после проверки "}, {"reason": "после проверки"}),
         "stop": ({}, {}),
-        "confirm_baseline": ({"expected_initial_position": "-120.50", "confirm": True},
-                             {"expected_initial_position": "-120.50", "confirm": True}),
+        "confirm_baseline": ({"expected_initial_position": "0.00", "confirm": True},
+                             {"expected_initial_position": "0.00", "confirm": True}),
         "baseline_audit": ({"observed_position": "+10", "note": "ручная сделка", "acknowledge": True},
                            {"observed_position": "10", "note": "ручная сделка", "acknowledge": True}),
     }
@@ -293,3 +307,67 @@ async def test_command_list_pagination_with_big_string_ids(make_web):
     assert len(seen) == 7 == len(set(seen))
     assert seen == sorted(seen, key=lambda s: (len(s), s), reverse=True)
     assert all(int(s) > JS_SAFE for s in seen)
+
+
+@pytest.mark.asyncio
+async def test_engine_awaiting_start_is_not_a_running_engine(make_web):
+    snap = sample_snapshot("BOOTSTRAPPING")
+    snap["reasons"] = ["AWAITING_START"]
+    web = await make_web(snap)
+    await web.login()
+    state = await (await web.get("/api/state")).json()
+    assert state["engine_started"] is False and state["engine"]["display_state"] == "BOOTSTRAPPING"
+    _, payload = await _start_payload(web)
+    resp = await web.command("start", "start-awaiting-00001", payload)
+    assert resp.status == 202, await resp.text()
+    # the engine applied it and now reports itself started: a second Start is a duplicate
+    web.gateway.apply(web.gateway.commands[0]["id"], "APPLIED", {"started": True})
+    snap["reasons"] = ["history cut incomplete"]
+    snap["engine_revision"] += 1
+    web.gateway.snapshot = snap
+    _, payload = await _start_payload(web)
+    dup = await web.command("start", "start-awaiting-00002", payload)
+    assert dup.status == 409 and (await dup.json())["error"] == "engine_already_running"
+
+
+@pytest.mark.asyncio
+async def test_explicit_started_flag_wins_over_reasons(make_web):
+    snap = sample_snapshot("RECONCILING")
+    snap["summary"]["started"] = False
+    web = await make_web(snap)
+    await web.login()
+    _, payload = await _start_payload(web)
+    assert (await web.command("start", "start-explicit-0001", payload)).status == 202
+
+
+@pytest.mark.asyncio
+async def test_manual_reconcile_commands(make_web):
+    web = await make_web(sample_snapshot("FROZEN"))
+    await web.login()
+    ok = await web.command("manual_reconcile", "reconcile-late-0001",
+                           {"action": "ack_late_evidence", "note": "проверено по истории", "acknowledge": True})
+    assert ok.status == 202
+    assert (await ok.json())["command"]["payload"] == {"action": "ack_late_evidence", "note": "проверено по истории",
+                                                      "acknowledge": True}
+    cid = await web.command("manual_reconcile", "reconcile-cid-00001",
+                            {"action": "resolve_unknown_submit", "note": "нет в истории", "acknowledge": True,
+                             "cid": "281474976710600"})
+    assert cid.status == 202
+    for bad in ({"action": "flatten", "note": "x", "acknowledge": True},
+                {"action": "ack_invariant", "acknowledge": True},
+                {"action": "ack_invariant", "note": "x"},
+                {"action": "resolve_unknown_submit", "note": "x", "acknowledge": True, "cid": str(1 << 48)},
+                {"action": "resolve_unknown_submit", "note": "x", "acknowledge": True, "cid": 5}):
+        resp = await web.command("manual_reconcile", "reconcile-bad-" + str(abs(hash(str(bad))))[:8].ljust(8, "0"),
+                                 bad)
+        assert resp.status == 422, bad
+
+
+def test_manual_reconcile_actions_match_engine_when_available():
+    try:
+        from hummingbot.strategy_v2.executors.neutral_grid_executor import commands as engine_commands
+    except ImportError:
+        pytest.skip("engine commands module not merged yet")
+    from web.neutral_grid.commands import MANUAL_RECONCILE, MANUAL_RECONCILE_ACTIONS
+    assert engine_commands.EXTRA_KIND_MANUAL_RECONCILE == MANUAL_RECONCILE
+    assert tuple(engine_commands.MANUAL_RECONCILE_ACTIONS) == MANUAL_RECONCILE_ACTIONS

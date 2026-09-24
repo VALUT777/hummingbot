@@ -25,13 +25,21 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind
 from web.neutral_grid import jsonsafe
-from web.neutral_grid.gateway import ACTIVE_ENGINE_STATES, EngineGateway
+from web.neutral_grid.gateway import EngineGateway
 from web.neutral_grid.preview import parse_signed_decimal
-from web.neutral_grid.views import snapshot_revisions
+from web.neutral_grid.views import is_engine_active, snapshot_revisions
 
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{16,128}\Z")
 MAX_NOTE = 500
-COMMAND_KINDS = {k.value: k for k in CommandKind}
+# Engine-level extra kind (engine ``commands.EXTRA_KIND_MANUAL_RECONCILE``; contracts.CommandKind is frozen).
+MANUAL_RECONCILE = "manual_reconcile"
+MANUAL_RECONCILE_ACTIONS = (
+    "ack_late_evidence", "ack_history_conflict", "ack_retention_gap", "ack_invariant", "ack_risk_blocked",
+    "resolve_unknown_submit",
+)
+COMMAND_KINDS = {k.value: k.value for k in CommandKind}
+COMMAND_KINDS[MANUAL_RECONCILE] = MANUAL_RECONCILE
+MAX_CID = (1 << 48) - 1
 
 
 @dataclass(frozen=True)
@@ -67,10 +75,12 @@ def _note(payload: Dict[str, Any], field: str = "note") -> Optional[str]:
 
 
 class CommandService:
-    def __init__(self, gateway: EngineGateway, preview: PreviewBuilder, engine_identity: Dict[str, Any]):
+    def __init__(self, gateway: EngineGateway, preview: PreviewBuilder, engine_identity: Dict[str, Any],
+                 config_baseline: Optional[Decimal] = None):
         self._gateway = gateway
         self._preview = preview
         self._identity = dict(engine_identity)
+        self._config_baseline = config_baseline
         self._lock = asyncio.Lock()
 
     @property
@@ -107,8 +117,7 @@ class CommandService:
                                          "Состояние изменилось с момента просмотра: проверьте свежие данные "
                                          "и подтвердите заново.")
             try:
-                normalized, blocked = await self._validate(COMMAND_KINDS[kind_raw], payload, snapshot,
-                                                           cur_cfg, cur_eng)
+                normalized, blocked = await self._validate(kind_raw, payload, snapshot, cur_cfg, cur_eng)
             except ValueError as exc:
                 return self._error(422, "invalid_payload", str(exc))
             if blocked is not None:
@@ -154,9 +163,18 @@ class CommandService:
         body.update(extra)
         return CommandOutcome(status, body)
 
-    def _normalize_only(self, kind: CommandKind, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if kind == CommandKind.START:
+    def _check_config_baseline(self, typed: Decimal) -> None:
+        """B is part of the config (NG-ARCH-003); the operator re-types it as the explicit confirmation."""
+        if self._config_baseline is None:
+            raise ValueError("expected_initial_position не задан в конфигурации: старт невозможен.")
+        if typed != self._config_baseline:
+            raise ValueError(f"Введённый B={typed} не совпадает с expected_initial_position={self._config_baseline} "
+                             "из конфигурации. Бот не принимает текущую позицию автоматически.")
+
+    def _normalize_only(self, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if kind == CommandKind.START.value:
             baseline = parse_signed_decimal(payload.get("expected_initial_position"))
+            self._check_config_baseline(baseline)
             if payload.get("risk_acknowledged") is not True:
                 raise ValueError("Нужно явно подтвердить риск (risk_acknowledged=true).")
             if payload.get("baseline_acknowledged") is not True:
@@ -166,12 +184,13 @@ class CommandService:
                 raise ValueError("preview_id отсутствует: старт возможен только из просмотренного превью.")
             return {"expected_initial_position": format(baseline, "f"), "risk_acknowledged": True,
                     "baseline_acknowledged": True, "preview_id": preview_id}
-        if kind == CommandKind.CONFIRM_BASELINE:
+        if kind == CommandKind.CONFIRM_BASELINE.value:
             baseline = parse_signed_decimal(payload.get("expected_initial_position"))
+            self._check_config_baseline(baseline)
             if payload.get("confirm") is not True:
                 raise ValueError("Нужно явное подтверждение (confirm=true).")
             return {"expected_initial_position": format(baseline, "f"), "confirm": True}
-        if kind == CommandKind.BASELINE_AUDIT:
+        if kind == CommandKind.BASELINE_AUDIT.value:
             observed = parse_signed_decimal(payload.get("observed_position"))
             note = _note(payload)
             if not note:
@@ -179,13 +198,29 @@ class CommandService:
             if payload.get("acknowledge") is not True:
                 raise ValueError("Нужно подтвердить, что аудит не меняет обязательства ячеек (acknowledge=true).")
             return {"observed_position": format(observed, "f"), "note": note, "acknowledge": True}
+        if kind == MANUAL_RECONCILE:
+            action = payload.get("action")
+            if action not in MANUAL_RECONCILE_ACTIONS:
+                raise ValueError("Недопустимое действие ручной сверки.")
+            note = _note(payload)
+            if not note:
+                raise ValueError("Для ручной сверки нужна причина (note) для журнала аудита.")
+            if payload.get("acknowledge") is not True:
+                raise ValueError("Нужно подтвердить проведённый аудит (acknowledge=true).")
+            normalized = {"action": action, "note": note, "acknowledge": True}
+            if action == "resolve_unknown_submit":
+                cid = payload.get("cid")
+                if not isinstance(cid, str) or not cid.isdigit() or int(cid) > MAX_CID:
+                    raise ValueError("cid: строка с 48-битным client order ID.")
+                normalized["cid"] = cid
+            return normalized
         reason = _note(payload, "reason")
         return {"reason": reason} if reason else {}
 
-    async def _validate(self, kind: CommandKind, payload: Dict[str, Any], snapshot: Optional[Dict[str, Any]],
+    async def _validate(self, kind: str, payload: Dict[str, Any], snapshot: Optional[Dict[str, Any]],
                         cur_cfg: int, cur_eng: int) -> Tuple[Dict[str, Any], Optional[CommandOutcome]]:
         normalized = self._normalize_only(kind, payload)
-        if kind != CommandKind.START:
+        if kind != CommandKind.START.value:
             if snapshot is None:
                 return normalized, self._error(409, "engine_not_started",
                                                "Движок ещё не опубликовал состояние; команда неприменима.")
@@ -195,14 +230,12 @@ class CommandService:
             return normalized, self._error(
                 409, "start_already_queued", "Команда старта для этого движка уже в очереди.",
                 command=pending[0], engine_identity=self.engine_identity)
-        state = str((snapshot or {}).get("engine_state") or "")
-        if state in ACTIVE_ENGINE_STATES:
+        if is_engine_active(snapshot):
             return normalized, self._error(
                 409, "engine_already_running",
                 "Движок с этой идентичностью уже работает; второй движок не создаётся.",
-                engine_identity=self.engine_identity, engine_state=state)
-        baseline = Decimal(normalized["expected_initial_position"])
-        preview = await self._preview(config_revision=cur_cfg, engine_revision=cur_eng, baseline_override=baseline)
+                engine_identity=self.engine_identity, engine_state=(snapshot or {}).get("engine_state"))
+        preview = await self._preview(config_revision=cur_cfg, engine_revision=cur_eng)
         if preview.get("preview_id") != normalized["preview_id"]:
             outcome = await self._stale(cur_cfg, cur_eng, snapshot,
                                         "Превью устарело (изменились правила рынка или конфигурация). "

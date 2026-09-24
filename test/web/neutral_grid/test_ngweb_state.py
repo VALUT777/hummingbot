@@ -188,3 +188,29 @@ def test_jsonsafe_rules():
     assert safe == {"cid": "5", "qty": "0.30", "big": str(1 << 60), "small": 7, "lag_s": 1.5, "price": "5.4",
                     "nested": [{"trade_id": "1"}], "flag": True, "none": None}
     assert jsonsafe.loads_exact('{"a": 0.1}')["a"] == Decimal("0.1")
+
+
+@pytest.mark.asyncio
+async def test_engine_shaped_snapshot_with_string_times_and_int_cell_ids(make_web):
+    """The engine serializes timestamps as strings and cell ids as ints; the API normalizes for display."""
+    now = time.time()
+    snap = sample_snapshot("NORMAL")
+    snap["committed_at"] = str(now)
+    snap["errors"] = [{"at": str(now - 3), "code": "X", "message": "m"}]
+    snap["summary"]["history"]["lag_s"] = "3.2"
+    snap["summary"]["history"]["last_full_scan_at"] = str(now - 1)
+    for cell in snap["cells"]:
+        cell["cell_id"] = int(cell["cell_id"])
+    snap["cells"][0]["queue_age_s"] = "12.5"
+    snap["cells"][0]["tp_children"][0]["expiry"] = "1790000000123"
+    web = await make_web(snap)
+    await web.login()
+    state = _strict_json(await (await web.get("/api/state")).text())
+    assert state["freshness"]["stale"] is False
+    assert isinstance(state["snapshot"]["committed_at"], Decimal)
+    assert isinstance(state["errors"][0]["at"], Decimal)
+    assert state["summary"]["history"]["lag_s"] == Decimal("3.2")
+    cells = _strict_json(await (await web.get("/api/cells?state=TP_LIVE")).text())["cells"]
+    assert cells[0]["cell_id"] == "21" and cells[0]["queue_age_s"] == Decimal("12.5")
+    assert cells[0]["tp_children"][0]["expiry"] == "1790000000123"
+    assert cells[0]["tp_children"][0]["expiry_at"] == Decimal("1790000000.123")

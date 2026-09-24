@@ -42,7 +42,15 @@
   var COMMAND_STATUS = { QUEUED: "в очереди", APPLIED: "применена", REJECTED: "отклонена", CONFLICT: "конфликт ревизий" };
   var COMMAND_NAMES = {
     start: "Старт", pause: "Пауза", resume: "Продолжить", stop: "Стоп",
-    confirm_baseline: "Подтверждение baseline", baseline_audit: "Аудит baseline"
+    confirm_baseline: "Подтверждение baseline", baseline_audit: "Аудит baseline", manual_reconcile: "Ручная сверка"
+  };
+  var RECONCILE_ACTIONS = {
+    ack_late_evidence: "Поздние исполнения проверены (снять заморозку LATE_EVIDENCE)",
+    ack_history_conflict: "Конфликт истории проверен (HISTORY_CONFLICT)",
+    ack_retention_gap: "Разрыв хранения истории: ручная сверка без сброса (RETENTION_GAP)",
+    ack_invariant: "Нарушение инварианта журнала проверено (LEDGER_INVARIANT)",
+    ack_risk_blocked: "Блокировка по риску проверена (RISK_BLOCKED)",
+    resolve_unknown_submit: "Ордер с неизвестным итогом не попал на биржу (по CID)"
   };
   var COMMAND_HELP = {
     pause: "Новые входы и новые циклы запрещаются. Сверка с историей биржи и поддержка уже подтверждённых TP продолжаются.",
@@ -53,7 +61,9 @@
     confirm_baseline: "Подтвердите, что фактическая позиция после стабильного снимка и полного среза истории равна B. " +
       "Это делается один раз при первом bootstrap.",
     baseline_audit: "Аудит после ручной сделки/дрейфа позиции. Он не меняет обязательства ячеек и не скрывает " +
-      "неизвестные исполнения."
+      "неизвестные исполнения.",
+    manual_reconcile: "Снимает заморозку только после вашего аудита; запись попадает в журнал. Позиция, обязательства " +
+      "и журнал не сбрасываются."
   };
 
   var S = {
@@ -327,15 +337,19 @@
     }
     var gross = s.gauges && s.gauges.gross;
     kv($("risk-kv"), [
-      ["Baseline B", s.baseline],
+      ["Baseline B", s.baseline === null && s.bootstrap ? "не подтверждён" : s.baseline],
+      ["Эффективный baseline", s.effective_baseline],
       ["Авторитетная позиция (биржа)", s.authoritative_net],
-      ["P по журналу", s.P],
+      ["Позиция по журналу", s.ledger_net],
+      ["P (журнал + baseline)", s.P],
       ["P_min … P_max", (s.P_min !== undefined || s.P_max !== undefined) ? txt(s.P_min) + " … " + txt(s.P_max) : null,
         net && net.breach === "yes" ? "bad" : ""],
       ["Лимит |net|", s.max_abs_net_position],
       ["Gross (худший)", s.gross_worst, gross && gross.breach === "yes" ? "bad" : ""],
-      ["Лимит gross", s.max_gross_position]
+      ["Лимит gross", s.max_gross_position],
+      ["Якорь / bid / ask", s.anchor !== undefined ? txt(s.anchor) + " / " + txt(s.bid) + " / " + txt(s.ask) : null]
     ]);
+    renderBlockers(s);
     var slots = s.slots || {};
     kv($("orders-kv"), [
       ["Свои активные ордера", s.owned_active],
@@ -368,6 +382,44 @@
       ["Мин. notional", rr.min_notional],
       ["Макс. плечо", rr.max_leverage]
     ]);
+  }
+
+  function list(values) {
+    if (!values) return null;
+    if (Array.isArray(values)) return values.length ? values.join("; ") : "нет";
+    var keys = Object.keys(values);
+    return keys.length ? keys.map(function (k) { return k + ": " + values[k]; }).join("; ") : "нет";
+  }
+  function renderBlockers(s) {
+    var banner = $("persistence-banner");
+    banner.hidden = !s.persistence_error;
+    banner.textContent = s.persistence_error ? "Сбой записи состояния (persistence): " + s.persistence_error +
+      ". Новые submit/cancel не отправляются без зафиксированного намерения." : "";
+    var boot = s.bootstrap || {};
+    var tp = s.tp_dispatch || {};
+    kv($("blockers-kv"), [
+      ["Блокеры входов", list(s.entry_blockers), s.entry_blockers && s.entry_blockers.length ? "warn" : ""],
+      ["Блокеры TP", list(s.tp_blockers), s.tp_blockers && s.tp_blockers.length ? "bad" : ""],
+      ["Заморозки (нужен аудит)", list(s.freezes), s.freezes && Object.keys(s.freezes).length ? "bad" : ""],
+      ["Блокер допуска ячеек", s.admission_blocker],
+      ["Пауза оператора", s.operator_paused],
+      ["Итог остановки", s.stop_outcome],
+      ["Bootstrap: готов к подтверждению", boot.ready === undefined || boot.ready === null ? (s.baseline ? "baseline подтверждён" : null) : boot.ready],
+      ["Bootstrap: детали", boot.detail],
+      ["Bootstrap: позиция на бирже / B из конфигурации", boot.observed_position !== undefined ?
+        txt(boot.observed_position) + " / " + txt(boot.expected_initial_position) : null],
+      ["TP dispatch: SLO / последняя / макс., с", s.tp_dispatch ? txt(tp.slo_s) + " / " + txt(tp.last_latency_s) + " / " + txt(tp.max_latency_s) : null],
+      ["Позиция сверена", s.position_reconciled]
+    ]);
+    var ul = $("unknown-orders");
+    clear(ul);
+    var unknown = s.unknown_active_orders || [];
+    ul.hidden = !unknown.length;
+    unknown.forEach(function (o) {
+      ul.appendChild(el("li", {}, [el("span", { cls: "meta", text: "чужой ордер" }),
+        "client " + txt(o.client_order_id) + " · index " + txt(o.order_index) + " · " + txt(o.side) + " " +
+        txt(o.remaining) + " @ " + txt(o.price) + " — бот его не отменяет и не присваивает"]));
+    });
   }
 
   function renderCellMap(cells) {
@@ -452,9 +504,11 @@
     if (kind === "confirm_baseline") {
       fields.appendChild(el("label", { for: "f-baseline", text: "expected_initial_position (B), со знаком" }));
       var inp = el("input", { id: "f-baseline", inputmode: "decimal", spellcheck: "false" });
-      var s = (S.state && S.state.summary) || {};
-      if (s.expected_initial_position) inp.value = s.expected_initial_position;
       fields.appendChild(inp);
+      var boot = ((S.state && S.state.summary) || {}).bootstrap || {};
+      fields.appendChild(el("p", { cls: "hint", text: "Из конфигурации: B = " + txt(boot.expected_initial_position) +
+        "; позиция на бирже по снимку: " + txt(boot.observed_position) + "; готовность: " +
+        (boot.ready === true ? "да" : txt(boot.detail)) + ". Введите B вручную." }));
       fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-confirm" }),
         "Подтверждаю: фактическая позиция равна B."]));
     } else if (kind === "baseline_audit") {
@@ -464,6 +518,17 @@
       fields.appendChild(el("input", { id: "f-note", maxlength: "500" }));
       fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-ack" }),
         "Понимаю: аудит не меняет обязательства ячеек и не скрывает неизвестные исполнения."]));
+    } else if (kind === "manual_reconcile") {
+      fields.appendChild(el("label", { for: "f-action", text: "Что проверено" }));
+      var sel = el("select", { id: "f-action" });
+      Object.keys(RECONCILE_ACTIONS).forEach(function (a) { sel.appendChild(el("option", { value: a, text: RECONCILE_ACTIONS[a] })); });
+      fields.appendChild(sel);
+      fields.appendChild(el("label", { for: "f-cid", text: "Client order ID (только для «не попал на биржу»)" }));
+      fields.appendChild(el("input", { id: "f-cid", inputmode: "numeric", spellcheck: "false", maxlength: "20" }));
+      fields.appendChild(el("label", { for: "f-note", text: "Что именно проверено (обязательно)" }));
+      fields.appendChild(el("input", { id: "f-note", maxlength: "500" }));
+      fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-ack" }),
+        "Подтверждаю, что аудит проведён по истории биржи."]));
     } else {
       fields.appendChild(el("label", { for: "f-reason", text: "Комментарий (необязательно)" }));
       fields.appendChild(el("input", { id: "f-reason", maxlength: "500" }));
@@ -477,6 +542,12 @@
     }
     if (kind === "baseline_audit") {
       return { observed_position: $("f-observed").value.trim(), note: $("f-note").value.trim(), acknowledge: $("f-ack").checked };
+    }
+    if (kind === "manual_reconcile") {
+      var payload = { action: $("f-action").value, note: $("f-note").value.trim(), acknowledge: $("f-ack").checked };
+      var cid = $("f-cid").value.trim();
+      if (cid) payload.cid = cid;
+      return payload;
     }
     var reason = $("f-reason") ? $("f-reason").value.trim() : "";
     return reason ? { reason: reason } : {};
@@ -656,11 +727,13 @@
       ["Ревизии превью", "config r" + p.config_revision + " · engine r" + p.engine_revision],
       ["preview_id", p.preview_id]
     ]);
-    $("start-baseline").value = (p.baseline && p.baseline.source !== "missing" && p.baseline.value) || "";
+    $("start-baseline").value = "";
+    $("start-baseline-help").textContent = "В конфигурации B = " + txt(p.baseline && p.baseline.signed) +
+      ". Введите то же значение вручную: это подтверждение, что фактическая позиция на бирже равна B. Бот не " +
+      "покупает и не закрывает её. После сверки движок попросит подтвердить B ещё раз по снимку биржи.";
     $("start-ack-baseline").checked = false;
     $("start-ack-risk").checked = false;
     $("start-error").textContent = "";
-    $("start-range").textContent = "";
     S.startKey = newKey();
     updateStartButton();
     $("start-dialog").showModal();
@@ -677,16 +750,6 @@
       $(id).addEventListener("change", updateStartButton);
     });
     $("start-baseline").addEventListener("input", function () { S.startKey = newKey(); });
-    $("start-recalc").addEventListener("click", async function () {
-      var b = $("start-baseline").value.trim();
-      if (!b) { $("start-error").textContent = "Введите B."; return; }
-      var p = await loadPreview(b);
-      if (p) {
-        $("start-error").textContent = (p.errors || []).join(" ");
-        $("start-range").textContent = "При B=" + txt(p.baseline && p.baseline.signed) + ": P_min … P_max = " +
-          txt(p.reachable.P_min) + " … " + txt(p.reachable.P_max) + (p.reachable.within_cap === false ? " — ВНЕ ЛИМИТА" : " — в пределах лимита");
-      }
-    });
     $("start-submit").addEventListener("click", async function () {
       var p = S.preview;
       var btn = $("start-submit");
@@ -746,7 +809,7 @@
     if (!tps.length) tpBox.appendChild(el("span", { text: "—" }));
     tps.forEach(function (t) {
       var line = legCell(t);
-      if (t.expiry) line.appendChild(el("span", { cls: "sub", text: " до " + (typeof t.expiry === "number" ? fmtTime(t.expiry) : t.expiry) }));
+      if (t.expiry_at) line.appendChild(el("span", { cls: "sub", text: " GTT до " + fmtTime(t.expiry_at) }));
       tpBox.appendChild(line);
     });
     var ob = c.obligation || {};
@@ -755,7 +818,11 @@
       td("Цены", [el("span", { cls: "mono", text: txt(c.low) + " – " + txt(c.high) })]),
       td("Вход", [el("span", { cls: "side-" + c.entry_side, text: txt(c.entry_side) })]),
       td("Поколение", [txt(c.generation)]),
-      td("Состояние", [statePill(c.state)]),
+      td("Состояние", [statePill(c.state),
+        c.state_flags && c.state_flags.length > 1 ? el("div", { cls: "sub", text: c.state_flags.join(" + ") }) : null,
+        c.late_evidence ? el("div", { cls: "sub", text: "поздние исполнения!" }) : null,
+        c.armed !== undefined ? el("div", { cls: "sub", text: (c.armed ? "вооружена" : (c.queued ? "в очереди" : "не вооружена")) +
+          (c.reserved_slots !== undefined ? " · слотов " + c.reserved_slots : "") }) : null]),
       td("Вход: запр./исп./ост.", [legCell(entry)]),
       td("TP: запр./исп./ост.", [tpBox]),
       td("Живые ноги", [txt(live) + (unknown ? " · неизв.: " + unknown : "")]),
