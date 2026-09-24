@@ -1,0 +1,105 @@
+"""In-process mutation probes for batch C (no worktree edits)."""
+import asyncio
+import sys
+import unittest
+
+sys.path.insert(0, ".")
+
+from hummingbot.connector.derivative.lighter_perpetual import lighter_perpetual_derivative as mod
+from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_derivative import (
+    LighterPerpetualDerivative,
+)
+from hummingbot.strategy_v2.executors.neutral_grid_executor import history as hist
+
+conn_tests = "test.hummingbot.connector.derivative.lighter_perpetual.test_lighter_perpetual_history_pagination"
+scan_tests = "test.hummingbot.strategy_v2.executors.neutral_grid_executor.history.test_ng_history_scanner"
+
+
+def run(names):
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for n in names:
+        suite.addTests(loader.loadTestsFromName(n))
+    res = unittest.TextTestRunner(verbosity=0, stream=open("/dev/null", "w")).run(suite)
+    return len(res.failures) + len(res.errors), res.testsRun
+
+
+# ---- C-06 mutant: retry with a new CID after a transport exception
+orig_submit = LighterPerpetualDerivative.submit_with_client_id
+
+
+async def mutant_submit(self, client_order_id, *a, **kw):
+    result = await orig_submit(self, client_order_id, *a, **kw)
+    if result.outcome == mod.LighterTransportOutcome.UNKNOWN and result.detail.startswith("transport_exception"):
+        try:
+            new_cid = int(self._new_client_order_id())
+            await self._signer_client.create_order(client_order_index=new_cid)
+        except Exception:
+            pass
+    return result
+
+LighterPerpetualDerivative.submit_with_client_id = mutant_submit
+print("C-06 mutant (retry new CID) failures/run:",
+      run([f"{conn_tests}.LighterHistoryPaginationTest.test_ac56_timeout_not_found_and_errors_are_unknown_and_never_retry_with_new_cid"]))
+LighterPerpetualDerivative.submit_with_client_id = orig_submit
+
+# ---- C-08 mutant: drop the _execute_cancel guard (cancel_all filter kept)
+orig_exec = LighterPerpetualDerivative._execute_cancel
+LighterPerpetualDerivative._execute_cancel = mod.PerpetualDerivativePyBase._execute_cancel
+print("C-08 mutant (no _execute_cancel guard) failures/run:",
+      run([f"{conn_tests}.LighterHistoryPaginationTest.test_cancel_all_and_generic_cancel_never_touch_cid_orders"]))
+LighterPerpetualDerivative._execute_cancel = orig_exec
+
+# ---- C-03/C-07 mutant: restore ignores the marker
+orig_restore = LighterPerpetualDerivative.restore_tracking_states
+LighterPerpetualDerivative.restore_tracking_states = mod.PerpetualDerivativePyBase.restore_tracking_states
+print("C-03 mutant (restore ignores marker) failures/run:",
+      run([f"{conn_tests}.LighterHistoryPaginationTest.test_restored_cid_orders_stay_excluded_from_polling_lost_orders_and_resend"]))
+LighterPerpetualDerivative.restore_tracking_states = orig_restore
+
+# ---- C-03 mutant: lost-order cancel not filtered
+orig_lost = LighterPerpetualDerivative._cancel_lost_orders
+LighterPerpetualDerivative._cancel_lost_orders = mod.PerpetualDerivativePyBase._cancel_lost_orders
+orig_exec2 = LighterPerpetualDerivative._execute_cancel
+print("C-03 mutant (lost-order cancel unfiltered) failures/run:",
+      run([f"{conn_tests}.LighterHistoryPaginationTest.test_restored_cid_orders_stay_excluded_from_polling_lost_orders_and_resend"]))
+LighterPerpetualDerivative._cancel_lost_orders = orig_lost
+
+# ---- C-04 mutant: release discards from the process set
+orig_release = LighterPerpetualDerivative.release_history_reconciled_order
+
+
+def mutant_release(self, cid):
+    self._order_tracker.stop_tracking_order(str(cid))
+    self._history_reconciled_client_order_ids.discard(str(cid))
+
+LighterPerpetualDerivative.release_history_reconciled_order = mutant_release
+print("C-04 mutant (release discards CID) failures/run:",
+      run([f"{conn_tests}.LighterHistoryPaginationTest.test_released_cid_is_refused_for_process_lifetime_and_stays_unpolled"]))
+LighterPerpetualDerivative.release_history_reconciled_order = orig_release
+
+# ---- C-01/C-05 mutant: _result ignores conflicted keys
+orig_result = hist.HistoryScanner._result
+
+
+def mutant_result(self, complete, reason, pages, weight, conflicts=None, high_water=None, emit_rows=False):
+    saved = {}
+    for p in (self._progress or {}).values():
+        saved[p.stream] = p.conflicted_keys
+        p.conflicted_keys = {}
+    try:
+        return orig_result(self, complete, reason, pages, weight, conflicts=conflicts, high_water=high_water,
+                           emit_rows=emit_rows)
+    finally:
+        for p in (self._progress or {}).values():
+            p.conflicted_keys = saved[p.stream]
+
+hist.HistoryScanner._result = mutant_result
+print("C-01/C-05 mutant (no withholding) failures/run:",
+      run([f"{scan_tests}.ConflictWithholdingTest",
+           f"{scan_tests}.HistoryScannerTest.test_ac12_bad_pagination_makes_history_incomplete",
+           f"{scan_tests}.HistoryScannerTest.test_ac40_trades_exceeding_terminal_order_cumulative_is_conflict"]))
+hist.HistoryScanner._result = orig_result
+
+# ---- C-01 mutant: emit rows for unfinished walks (in_progress)
+orig_step = hist.HistoryScanner._scan_step

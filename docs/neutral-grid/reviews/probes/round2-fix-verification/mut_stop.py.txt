@@ -1,0 +1,24 @@
+def pytest_configure(config):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import EngineState, OrderState
+    def _finish_stop(self, now):
+        if self.meta.stop_requested_ms is None:
+            return
+        open_legs = self.non_final_legs()
+        previous = self.meta.stop_outcome
+        if not open_legs and self.history_complete:
+            inventory = any(c.E != c.X or c.dust > 0 for ledger in self.cells.values() for c in ledger.cycles)
+            if self.position is not None and self.position.net_base != 0:
+                inventory = True
+            outcome = EngineState.STOPPED_WITH_INVENTORY if inventory else EngineState.STOPPED
+        elif any(leg.state in (OrderState.CANCEL_UNKNOWN, OrderState.SUBMIT_UNKNOWN) for leg in open_legs) or \
+                now - self.meta.stop_requested_ms / 1000 > self.options.stop_uncertain_after_s:
+            outcome = EngineState.STOP_UNCERTAIN
+        else:
+            outcome = None
+        new_value = outcome.value if outcome is not None else None
+        if new_value != previous:
+            self.meta.stop_outcome = new_value
+            with self.store.transaction() as tx:
+                self.store.kv_set(tx, "engine_meta", self.meta.to_json())
+    E.NeutralGridEngine._finish_stop = _finish_stop

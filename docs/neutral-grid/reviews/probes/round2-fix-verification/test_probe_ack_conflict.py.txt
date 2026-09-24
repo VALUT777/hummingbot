@@ -1,0 +1,186 @@
+"""Scratch probe: after an operator ack_history_conflict for a payload conflict, does the engine recover?"""
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+ENGINE_TESTS = Path("/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/"
+                    "executors/neutral_grid_executor/engine")
+sys.path.insert(0, str(ENGINE_TESTS))
+
+from ng_engine_harness import Harness  # noqa: E402
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (  # noqa: E402
+    CommandKind,
+    EngineState,
+    LegRole,
+)
+
+D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _host_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "ng-host"))
+
+
+def test_probe_payload_conflict_ack_recovers(tmp_path):
+    h = Harness(tmp_path, fx_kwargs={"min_base": D("0.1"), "min_notional": D("0.1")})
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, LegRole.ENTRY)
+        trade_id = h.fx.fill(entry.cid, D("2"))
+        h.tick(8)
+        h.fx.inject_conflicting_trade(trade_id, D("3"))
+        h.tick(12)
+        print("after conflict:", h.state, h.engine.history_complete, h.engine.history_incomplete_reason)
+        assert h.state == EngineState.FROZEN
+        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict", "note": "reviewed"}, key="ack1")
+        states = []
+        for i in range(400):
+            h.tick()
+            states.append((i, h.state.value, h.engine.history_complete, h.engine.history_incomplete_reason))
+        print("first:", states[:3])
+        print("last:", states[-3:])
+        print("reasons:", h.engine.reasons)
+        print("conflicts:", h.engine.scanner.last_result.conflicts if h.engine.scanner.last_result else None)
+        assert h.engine.history_complete, states[-1]
+    finally:
+        h.close()
+
+
+class _Sticky(dict):
+    def pop(self, key, default=None):
+        return self.get(key, default)
+
+
+def test_probe_persistent_payload_conflict_after_ack(tmp_path):
+    h = Harness(tmp_path, fx_kwargs={"min_base": D("0.1"), "min_notional": D("0.1")})
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, LegRole.ENTRY)
+        trade_id = h.fx.fill(entry.cid, D("2"))
+        h.tick(8)
+        h.fx._conflicting_trades = _Sticky({trade_id: D("3")})   # the venue keeps serving the other version
+        h.tick(12)
+        print("after conflict:", h.state, h.engine.history_complete, h.engine.history_incomplete_reason)
+        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict", "note": "reviewed"}, key="ack1")
+        states = []
+        for i in range(600):
+            h.tick()
+            states.append((i, h.state.value, h.engine.history_complete, h.engine.history_incomplete_reason))
+        print("first:", states[:3])
+        print("last:", states[-3:])
+        print("reasons:", h.engine.reasons)
+        print("walk conflicts:", h.engine.scanner.last_result.conflicts if h.engine.scanner.last_result else None)
+        print("acknowledged:", h.engine.meta.acknowledged_conflicts)
+        print("entry legs:", [(l.cid, l.state.value, str(l.filled)) for l in h.legs(cell, LegRole.ENTRY)])
+    finally:
+        h.close()
+
+
+def test_probe_committed_payload_mismatch_after_ack(tmp_path):
+    """The venue re-serves an already committed trade with a changed field (here: is_maker flips)."""
+    import dataclasses
+    h = Harness(tmp_path, fx_kwargs={"min_base": D("0.1"), "min_notional": D("0.1")})
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, LegRole.ENTRY)
+        trade_id = h.fx.fill(entry.cid, D("2"))
+        h.tick(8)
+        original = h.fx._trade_row
+
+        def changed(leg, size_override=None):
+            row = original(leg, size_override)
+            if leg.trade_id == trade_id:
+                row = dataclasses.replace(row, is_maker=not row.is_maker if row.is_maker is not None else True)
+            return row
+        h.fx._trade_row = changed
+        h.tick(12)
+        print("after conflict:", h.state, h.engine.history_complete, h.engine.history_incomplete_reason,
+              h.engine.scanner.last_result.conflicts)
+        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict", "note": "reviewed"}, key="ack1")
+        h.tick(5)
+        print("ack cmd:", h.engine.recent_commands[-1])
+        states = []
+        for i in range(600):
+            h.tick()
+            states.append((i, h.state.value, h.engine.history_complete, h.engine.history_incomplete_reason))
+        print("last:", states[-1])
+        print("walk conflicts:", h.engine.scanner.last_result.conflicts)
+        # the partially filled entry is now cancelled at the venue: can it ever settle?
+        h.fx.venue_cancel(entry.cid)
+        for i in range(300):
+            h.tick()
+        leg = h.legs(cell, LegRole.ENTRY)[0]
+        print("entry after venue cancel:", leg.state.value, str(leg.filled), "history_complete",
+              h.engine.history_complete)
+        h.command(CommandKind.STOP, {"reason": "operator"}, key="stop1")
+        for i in range(400):
+            h.tick()
+        print("stop outcome:", h.engine.meta.stop_outcome, h.state.value)
+    finally:
+        h.close()
+
+
+def test_probe_tp_dispatched_for_cell_with_contradicted_fill(tmp_path):
+    """A committed entry fill is later re-served with a different size (scanner conflict, withheld). Is the
+    affected cell's TP still dispatched from the contradicted quantity?"""
+    import dataclasses
+    h = Harness(tmp_path, fx_kwargs={"min_base": D("5"), "min_notional": D("0.1")})
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, LegRole.ENTRY)
+        t1 = h.fx.fill(entry.cid, D("3"))                 # below the 5 LIT floor: TP obligation held
+        h.tick(8)
+        assert h.cell(cell).cycles[-1].E == D("3") and not h.legs(cell, LegRole.TP)
+        original = h.fx._trade_row
+
+        def changed(leg, size_override=None):
+            row = original(leg, size_override)
+            if leg.trade_id == t1:
+                row = dataclasses.replace(row, size=D("1"))     # venue now says the first fill was 1, not 3
+            return row
+        h.fx._trade_row = changed
+        h.tick(6)
+        print("after conflict:", h.state, h.engine.reasons[:6])
+        print("tp_blocked_cells:", h.engine.tp_blocked_cells, "open store conflicts:", h.engine.open_conflicts)
+        h.fx.fill(entry.cid, D("2"))                      # second fill -> committed E = 5 from the contradicted 3
+        h.tick(10)
+        tps = [(t.cid, str(t.requested), t.state.value) for t in h.legs(cell, LegRole.TP)]
+        print("E:", h.cell(cell).cycles[-1].E, "TPs:", tps, "state:", h.state)
+        print("cell blocker:", h.engine.cell_blockers.get(cell))
+    finally:
+        h.close()
+
+
+def test_probe_foreign_ws_fill_blocks_baseline_audit_forever(tmp_path):
+    """The executor forwards every connector OrderFilledEvent (any market/order) as a WS trade hint."""
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandStatus
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0"))
+        h.tick(3)
+        # a fill of some other order on the same connector (other market / non-grid order): never in this
+        # market's history
+        h.engine.wake({"type": "trade", "status": "filled", "client_order_id": "HBOT-other-1",
+                       "trade_id": "777000111"})
+        h.tick(300)
+        print("lag:", h.engine.history_lag_s(), "ws_pending:", h.engine.ws_pending)
+        h.command(CommandKind.BASELINE_AUDIT, {"action": "baseline", "observed_position": str(h.fx.net_position),
+                                               "note": "audit"}, key="audit-1")
+        h.tick(2)
+        rec = h.engine.store.get_command(idempotency_key="audit-1")
+        print("audit:", rec.status.value, rec.result)
+        print("snapshot lag:", h.engine.last_snapshot["summary"]["history"]["lag_s"])
+    finally:
+        h.close()

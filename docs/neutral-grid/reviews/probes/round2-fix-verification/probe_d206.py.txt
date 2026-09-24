@@ -1,0 +1,52 @@
+import asyncio, os, sys, tempfile
+from decimal import Decimal as D
+from unittest.mock import MagicMock
+REPO = "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid"
+sys.path.insert(0, REPO)
+tmp = tempfile.mkdtemp()
+os.environ["HUMMINGBOT_NEUTRAL_GRID_HOST_DIR"] = tmp + "/host"
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import NeutralGridExecutorConfig
+from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import NeutralGridExecutor, engine_db_path, durable_stop_ms
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeClock, FakeExchange
+from controllers.generic.neutral_grid import NeutralGridConfig
+
+clock = FakeClock()
+fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+strategy = MagicMock(); strategy.connectors = {}
+type(strategy).current_timestamp = property(lambda self: clock())
+
+def ctl(grid_id, lo, hi):
+    return NeutralGridConfig(id="ctl", grid_id=grid_id, lower_price=D(lo), upper_price=D(hi), cell_count=10,
+                             expected_initial_position=D("0"), enabled=True)
+
+def mk(ccfg, **mark):
+    ccfg.mark_operator_confirmed(start=True, baseline=True, **mark)
+    cfg = ccfg.executor_config(clock())
+    # the controller leaves db_path None -> the executor resolves the store default per account/market
+    return NeutralGridExecutor(strategy, cfg, port=fx, clock=clock)
+
+loop = asyncio.new_event_loop()
+def run(ex, n):
+    for _ in range(n):
+        loop.run_until_complete(ex.control_task()); clock.advance(1.0)
+        if ex.close_type is not None:
+            break
+
+ex1 = mk(ctl("g1", "5", "6"))
+loop.run_until_complete(ex1.on_start()); run(ex1, 25)
+print("ex1", ex1.engine.engine_state, "db", ex1.engine.store.path if hasattr(ex1.engine.store, 'path') else None, "open", len(fx.open_orders(owned=True)))
+ex1.early_stop(); run(ex1, 80)
+print("ex1 closed", ex1.close_type, "outcome", ex1.engine.meta.stop_outcome, "open", len(fx.open_orders(owned=True)))
+if ex1.engine.store is not None and not ex1.engine.store.closed:
+    ex1.engine.store.close()
+db = engine_db_path(None, "lighter_perpetual_robinhood", "LIT-USDG", fx)
+stop_ms = durable_stop_ms(db)
+print("db", db, "durable stop", stop_ms)
+ex2 = mk(ctl("g2", "5.1", "6.1"), migration=True, resume_stop_ms=stop_ms)
+loop.run_until_complete(ex2.on_start())
+print("ex2 start_error", ex2.start_error, "fatal", ex2.engine.fatal_reason)
+run(ex2, 40)
+e = ex2.engine
+print("ex2", e.engine_state, "grid", e.grid_id, "reasons", e.reasons[:5], "start_error", ex2.start_error,
+      "open", len(fx.open_orders(owned=True)), "prices", sorted({o.price for o in fx.open_orders(owned=True)})[:3])
+e.store.close()

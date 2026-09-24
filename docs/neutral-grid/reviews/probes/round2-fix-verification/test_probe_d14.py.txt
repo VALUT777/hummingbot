@@ -1,0 +1,25 @@
+from decimal import Decimal as D
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import EngineState, LegRole, CommandKind
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+from hummingbot.strategy_v2.executors.neutral_grid_executor.snapshot import format_status
+
+
+def test_probe(tmp_path):
+    h = Harness(tmp_path, options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, max_scan_pages_per_tick=1))
+    try:
+        h.bootstrap(D("0")); h.tick(6)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, LegRole.ENTRY)
+        h.restart()
+        for _ in range(250):
+            h.fx.fill(entry.cid, D("0.01"))
+        states = []
+        for i in range(8):
+            h.tick()
+            states.append(h.state.value)
+            if i in (1, 3):
+                print(format_status(h.engine.last_snapshot, now=h.clock()).split("\n")[3:6])
+        print(states)
+    finally:
+        h.close()

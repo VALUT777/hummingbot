@@ -1,0 +1,31 @@
+import sys, tempfile, os
+from decimal import Decimal as D
+REPO = "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid"
+sys.path.insert(0, REPO)
+sys.path.insert(0, REPO + "/test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+os.environ["HUMMINGBOT_NEUTRAL_GRID_HOST_DIR"] = tempfile.mkdtemp()
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import StoreError
+from hummingbot.strategy_v2.executors.neutral_grid_executor.snapshot import format_status
+
+h = Harness(tempfile.mkdtemp())
+try:
+    h.bootstrap(D("0")); h.tick(6)
+    print("before: mem", h.engine.engine_state, "committed row", h.engine.store.engine().engine_state,
+          "snapshot", (h.engine.store.latest_snapshot().payload.get("summary") or {}).get("engine_state") if h.engine.store.latest_snapshot() else None)
+    def always(now):
+        raise StoreError("simulated recurring store refusal")
+    h.engine._reconcile_active = always
+    subs = len(h.fx.submits())
+    h.tick(10)
+    snap = h.engine.store.latest_snapshot()
+    payload = snap.payload
+    print("after 10 failing ticks: mem", h.engine.engine_state, "freezes", list(h.engine.meta.freezes),
+          "committed engine row state", h.engine.store.engine().engine_state,
+          "durable meta freezes", list((h.engine.store.kv_get('engine_meta') or {}).get('freezes', {})))
+    print("snapshot keys", list(payload)[:20])
+    print("committed snapshot state:", payload.get("engine_state") or (payload.get("summary") or {}).get("engine_state"))
+    print("new submits during failure", len(h.fx.submits()) - subs)
+    print("CLI status first lines:", format_status(h.engine.latest_committed_snapshot(), now=h.clock()).splitlines()[:3])
+finally:
+    h.close()

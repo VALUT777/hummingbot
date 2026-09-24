@@ -1,0 +1,38 @@
+from decimal import Decimal as D
+import pytest
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    LegRole, CommandKind, OrderState, CommandStatus)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import SubmitBehavior
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+@pytest.mark.parametrize("lag", [15.0])
+def test_probe(tmp_path, lag):
+    h = Harness(tmp_path, fx_kwargs={"active_lag_s": lag})
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        h.tick(8)
+        cell = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("10"))
+        h.fx.script_submit(SubmitBehavior.TIMEOUT_LANDED)
+        h.run_until(lambda: any(t.state == OrderState.SUBMIT_UNKNOWN for t in h.legs(cell, TP)), max_ticks=10)
+        tp = next(t for t in h.legs(cell, TP) if t.state == OrderState.SUBMIT_UNKNOWN)
+        t0 = h.clock()
+        for i in range(60):
+            key = f"res-{i}"
+            h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(tp.cid), "note": "x"}, key=key)
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=key)
+            if rec.status == CommandStatus.APPLIED:
+                break
+        print("\napplied at", h.clock() - t0, "fx order open", h.fx.order_by_cid(tp.cid).is_open)
+        for k in range(12):
+            h.tick()
+            legs = [(t.cid, t.state.value, str(t.requested)) for t in h.legs(cell, TP)]
+            venue = [(o.client_order_id, str(getattr(o, 'amount', '')), o.is_open) for o in h.fx.open_orders(owned=True)]
+            print(round(h.clock()-t0,1), h.state.value, legs, "venue open:", [v for v in venue if v[0] in [l[0] for l in legs]], h.engine.reasons[:2])
+        print("net position", h.fx.net_position)
+    finally:
+        h.close()

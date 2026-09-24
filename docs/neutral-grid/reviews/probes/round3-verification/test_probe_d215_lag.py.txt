@@ -1,0 +1,44 @@
+from decimal import Decimal as D
+import pytest
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    LegRole, CommandKind, OrderState, CommandStatus)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import SubmitBehavior
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+@pytest.mark.parametrize("lag", [7.0, 10.0, 15.0, 30.0])
+def test_probe(tmp_path, lag):
+    h = Harness(tmp_path, fx_kwargs={"active_lag_s": lag})
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        h.tick(8)
+        cell = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("10"))
+        h.fx.script_submit(SubmitBehavior.TIMEOUT_LANDED)
+        h.run_until(lambda: any(t.state == OrderState.SUBMIT_UNKNOWN for t in h.legs(cell, TP)), max_ticks=10)
+        tp = next(t for t in h.legs(cell, TP) if t.state == OrderState.SUBMIT_UNKNOWN)
+        t0 = h.clock()
+        results = []
+        applied = None
+        for i in range(60):
+            key = f"res-{i}"
+            h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(tp.cid), "note": "x"}, key=key)
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=key)
+            results.append((round(h.clock() - t0, 1), rec.status.value, (rec.result or {}).get("detail") or (rec.result or {}).get("error")))
+            if rec.status == CommandStatus.APPLIED:
+                applied = h.clock() - t0
+                break
+        seen = []
+        for r in results:
+            if not seen or seen[-1][1:] != r[1:]:
+                seen.append(r)
+        print(f"\nLAG {lag}: transitions", seen)
+        print("applied at", applied, "venue open:", h.fx.order_by_cid(tp.cid).is_open)
+        h.tick(6)
+        tps = [(t.cid, t.state.value) for t in h.legs(cell, TP)]
+        print("TP legs", tps, "state", h.state.value, h.engine.reasons[:3])
+    finally:
+        h.close()

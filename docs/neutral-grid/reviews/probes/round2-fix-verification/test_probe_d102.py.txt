@@ -1,0 +1,41 @@
+import dataclasses
+import sys
+from decimal import Decimal as D
+
+sys.path.insert(0, "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+from ng_engine_harness import Harness  # noqa: E402
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import EngineState, LegRole  # noqa: E402
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+def test_persistent_active_row_contradiction(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        a, b = h.buy_cells()[0], h.buy_cells()[-1]
+        ea, eb = h.live_order(a, ENTRY), h.live_order(b, ENTRY)
+        orig = h.fx.active_orders
+
+        async def contradicting():
+            rows = await orig()
+            return [dataclasses.replace(r, initial_base_amount=D("11")) if r.client_order_id == ea.cid else r
+                    for r in rows]
+
+        monkeypatch.setattr(h.fx, "active_orders", contradicting)
+        h.tick(6)
+        print("freezes", h.engine.meta.freezes, "state", h.state)
+        h.fx.fill(eb.cid, D("10"))
+        h.tick(15)
+        print("B fills committed:", [str(f.size) for f in h.engine.store.fills(eb.cid)]); print("B TP:", h.live_order(b, TP), "state", h.state, "reasons", h.engine.reasons[:6])
+        c0 = len(h.fx.cancels())
+        h.fx.set_book(D("6.2"), D("6.3"))
+        h.tick(8)
+        print("cancels after outside bounds:", len(h.fx.cancels()) - c0)
+        print("errors", [e["code"] for e in list(h.engine.errors)[-5:]])
+        assert h.live_order(b, TP) is not None
+        assert len(h.fx.cancels()) > c0
+    finally:
+        h.close()

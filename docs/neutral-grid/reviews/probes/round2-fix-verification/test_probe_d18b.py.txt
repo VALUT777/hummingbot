@@ -1,0 +1,31 @@
+from decimal import Decimal as D
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    EngineState, LegRole, CommandKind, OrderState, CommandStatus, Side)
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+def test_no_ws_retry(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+        h.tick(8)
+        t0 = h.clock()
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("4"), history_lag_s=30, ws=False)
+        for i in range(20):
+            key = f"a{i}"
+            h.command(CommandKind.BASELINE_AUDIT, {"observed_position": "11", "note": "audit"}, key=key)
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=key)
+            print(round(h.clock() - t0), rec.status.value, rec.result.get("error"), rec.result.get("reasons"),
+                  rec.result.get("new_effective_baseline"))
+            if rec.status == CommandStatus.APPLIED:
+                break
+        print("effective baseline", h.engine.effective_baseline)
+        h.tick(40)
+        print("after history: P", h.engine.endpoints.P, "venue", h.fx.net_position, h.state, h.engine.reasons[:3])
+    finally:
+        h.close()

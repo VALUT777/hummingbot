@@ -1,0 +1,47 @@
+import sys, tempfile, os
+from decimal import Decimal as D
+REPO = "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid"
+sys.path.insert(0, REPO)
+sys.path.insert(0, REPO + "/test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+os.environ["HUMMINGBOT_NEUTRAL_GRID_HOST_DIR"] = tempfile.mkdtemp()
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, LegRole, Side, OrderState
+from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+
+MUTATE = len(sys.argv) > 1 and sys.argv[1] == "mutate"
+if MUTATE:
+    orig = E.NeutralGridEngine._audit_evidence_unsettled
+    def patched(self, now):
+        saved = self.fills_commit_seq
+        self.fills_commit_seq = -1
+        try:
+            return orig(self, now)
+        finally:
+            self.fills_commit_seq = saved
+    E.NeutralGridEngine._audit_evidence_unsettled = patched
+
+h = Harness(tempfile.mkdtemp())
+try:
+    h.bootstrap(D("0")); h.tick(2)
+    cell = h.buy_cells()[-1]
+    h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+    h.tick(8)
+    # wait for a tick in which an account poll happened
+    for _ in range(10):
+        before = h.engine._last_account_poll_at
+        h.tick()
+        if h.engine._last_account_poll_at != before:
+            break
+    print("poll at", h.engine._last_account_poll_at, "now", h.clock(), "pos", h.engine.position.net_base)
+    entry = h.live_order(cell, LegRole.ENTRY)
+    h.fx.fill(entry.cid, D("4"))
+    h.tick()   # scan commits the fill, no poll
+    print("after commit: poll at", h.engine._last_account_poll_at, "pos(engine)", h.engine.position.net_base,
+          "venue", h.fx.net_position, "pseq", h.engine.position_seq, "fseq", h.engine.fills_commit_seq,
+          "entry state", h.engine.leg_by_cid(entry.cid).state, "filled", h.engine.leg_by_cid(entry.cid).filled)
+    h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.engine.position.net_base), "note": "audit"}, key="a1")
+    h.tick()
+    rec = h.engine.store.get_command(idempotency_key="a1")
+    print("MUTATE" if MUTATE else "CURRENT", rec.status, rec.result, "effective B", h.engine.effective_baseline)
+finally:
+    h.close()

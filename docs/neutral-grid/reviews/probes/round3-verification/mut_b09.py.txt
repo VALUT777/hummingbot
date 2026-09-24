@@ -1,0 +1,13 @@
+"""Scratch plugin: in-memory revert of the B-09 owner check (no file change)."""
+import inspect, textwrap
+
+
+def pytest_configure(config):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import store as S
+    src = textwrap.dedent(inspect.getsource(S.NeutralGridStore._release_blocker))
+    old = "if owner is None or owner[0] is None or owner[0] != self._owner_token:"
+    assert old in src
+    src = src.replace(old, "if False:")
+    ns = {}
+    exec(compile(src, S.__file__, "exec"), S.__dict__, ns)
+    S.NeutralGridStore._release_blocker = ns["_release_blocker"]

@@ -1,0 +1,321 @@
+"""verify3 probes for round-3 batch v2 (D1-02, D1-16, D2-04, CR-2). Read-only against the worktree."""
+from decimal import Decimal as D
+
+import pytest
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import EngineState, LegRole, OrderState
+from hummingbot.strategy_v2.executors.neutral_grid_executor.snapshot import format_status
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import InvalidTransitionError, StoreError
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+def _started(h):
+    h.bootstrap(D("0"))
+    h.tick(2)
+
+
+def _conflict_on(h, cell, size=D("3"), wrong=D("1"), persistent=True):
+    entry = h.live_order(cell, ENTRY)
+    h.fx.fill(entry.cid, size)
+    h.tick(4)
+    t1 = h.engine.store.fills(entry.cid)[0].trade_id_str
+    h.fx.inject_conflicting_trade(t1, wrong, persistent=persistent)
+    h.tick(4)
+    return entry
+
+
+# ---------------------------------------------------------------- CR-2 base scenario (critic walk-through)
+def test_cr2_base(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        a = h.buy_cells()[-1]
+        entry = _conflict_on(h, a)
+        print("CR2 base state", h.state, "tp_blocked", h.engine.tp_blocked_cells)
+        h.fx.fill(entry.cid, D("2"))
+        h.tick(10)
+        print("CR2 base E", h.cell(a).cycles[-1].E, "TPs", [(l.cid, str(l.requested), l.state.value) for l in h.legs(a, TP)])
+        assert not h.legs(a, TP)
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- CR-2 variant: transient contradiction
+def test_cr2_transient_conflict_then_tp(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        a = h.buy_cells()[-1]
+        entry = _conflict_on(h, a, persistent=False)
+        print("transient: after conflict", h.state, h.engine.tp_blocked_cells,
+              h.engine.store.engine().manual_reconcile_reason)
+        h.tick(6)
+        print("transient: later", h.state, "complete", h.engine.history_complete, "blocked", h.engine.tp_blocked_cells)
+        h.fx.fill(entry.cid, D("2"))
+        h.tick(10)
+        tps = [(str(l.requested), l.state.value) for l in h.legs(a, TP)]
+        print("transient: E", h.cell(a).cycles[-1].E, "TPs", tps, "state", h.state,
+              "manual", h.engine.store.engine().manual_reconcile_required)
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- CR-2 variant: restart with the conflict open
+def test_cr2_restart_with_conflict(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        a = h.buy_cells()[-1]
+        entry = _conflict_on(h, a)
+        h.fx.fill(entry.cid, D("2"))
+        h.tick(6)
+        assert not h.legs(a, TP)
+        h.restart()
+        for i in range(12):
+            h.tick()
+            if h.legs(a, TP):
+                break
+        print("restart: A TPs", [(str(l.requested), l.state.value) for l in h.legs(a, TP)], "state", h.state,
+              "startup_reconciled", h.engine.startup_reconciled, "tp_blockers", h.engine.tp_blockers,
+              "blocked", h.engine.tp_blocked_cells)
+        # D1-02 restart variant: another exact cell's committed obligation and outside-bounds cancels
+        other = h.sell_cells()[0]
+        oe = h.live_order(other, ENTRY)
+        print("other entry", oe and oe.state)
+        h.fx.fill(oe.cid, D("10"))
+        h.tick(12)
+        print("restart: other E", h.cell(other).cycles[-1].E, "other TP", h.live_order(other, TP),
+              "tp_blockers", h.engine.tp_blockers)
+        c0 = len(h.fx.cancels())
+        h.fx.set_book(D("6.2"), D("6.3"))
+        h.tick(8)
+        print("restart: cancels after outside bounds", len(h.fx.cancels()) - c0, "state", h.state,
+              "live entries", sum(1 for c in h.engine.cells for l in h.legs(c, ENTRY) if l.state == OrderState.LIVE))
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-02 variant: recurring refusal in _settle
+def test_d102_recurring_settle_refusal(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        a = h.buy_cells()[-1]
+        ea = h.live_order(a, ENTRY)
+        h.fx.fill(ea.cid, D("10"))
+        h.tick(6)
+        tpa = h.live_order(a, TP)
+        assert tpa is not None and tpa.state == OrderState.LIVE
+        store = h.engine.store
+        orig = store.close_cycle
+
+        def refuse(tx, grid_id, cell_id, gen, **kw):
+            if cell_id == a:
+                raise InvalidTransitionError("simulated: close_cycle refused for cell A")
+            return orig(tx, grid_id, cell_id, gen, **kw)
+
+        monkeypatch.setattr(store, "close_cycle", refuse)
+        h.fx.fill(tpa.cid, D("10"))
+        h.tick(40)
+        print("settle: state", h.state, "committed", store.engine().engine_state, "freezes", list(h.engine.meta.freezes))
+        other = h.sell_cells()[0]
+        h.fx.fill(h.live_order(other, ENTRY).cid, D("10"))
+        h.tick(10)
+        print("settle: other TP", h.live_order(other, TP) is not None)
+        c0 = len(h.fx.cancels())
+        h.fx.set_book(D("6.2"), D("6.3"))
+        h.tick(8)
+        print("settle: cancels", len(h.fx.cancels()) - c0, "snapshot",
+              format_status(h.engine.latest_committed_snapshot(), now=h.clock()).splitlines()[0])
+        assert h.live_order(other, TP) is not None
+        assert len(h.fx.cancels()) > c0
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-02 variant: recurring refusal while acting
+def test_d102_recurring_act_refusal_cancel(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        store = h.engine.store
+        entries = sorted(l.cid for c in h.engine.cells for l in h.legs(c, ENTRY) if l.state == OrderState.LIVE)
+        victim = entries[0]
+        orig = store.record_cancel_intent
+
+        def refuse(tx, cid, reason=""):
+            if cid == victim:
+                raise InvalidTransitionError("simulated: cancel intent refused for one leg")
+            return orig(tx, cid, reason)
+
+        monkeypatch.setattr(store, "record_cancel_intent", refuse)
+        c0 = len(h.fx.cancels())
+        h.fx.set_book(D("6.2"), D("6.3"))
+        h.tick(10)
+        print("act: cancels", len(h.fx.cancels()) - c0, "of", len(entries) - 1, "state", h.state,
+              "committed", store.engine().engine_state)
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-02 variant: recurring refusal in history apply
+def test_d102_recurring_history_apply_refusal(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        orig = h.engine._apply_history
+
+        def refuse(result, now, in_progress):
+            if result.new_trades or result.new_orders:
+                raise StoreError("simulated: history batch refused")
+            return orig(result, now, in_progress)
+
+        monkeypatch.setattr(h.engine, "_apply_history", refuse)
+        other = h.sell_cells()[0]
+        h.fx.fill(h.live_order(other, ENTRY).cid, D("10"))
+        h.tick(10)
+        print("hist: other E", h.cell(other).cycles[-1].E, "TP", h.live_order(other, TP) is not None,
+              "state", h.state, "committed", h.engine.store.engine().engine_state,
+              "history_complete", h.engine.history_complete)
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-16: crash between the handler and the recovery
+def test_d116_crash_inside_recovery(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        original = h.engine._reconcile_active
+
+        def refuse_once(now):
+            monkeypatch.setattr(h.engine, "_reconcile_active", original)
+            raise StoreError("simulated store refusal")
+
+        class Die(BaseException):
+            pass
+
+        def die():
+            raise Die()
+
+        monkeypatch.setattr(h.engine, "_reconcile_active", refuse_once)
+        monkeypatch.setattr(h.engine, "_reload", die)        # process dies at the very start of the recovery
+        with pytest.raises(Die):
+            h.tick()
+        h.crash_restart()
+        h.tick(3)
+        print("D116 crash in recovery: freezes", dict(h.engine.meta.freezes), h.state)
+        assert "LEDGER_INVARIANT" in h.engine.meta.freezes
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D2-04: CLI shows FROZEN under a recurring refusal
+def test_d204_cli_and_committed_state(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+
+        def refuse(now):
+            raise StoreError("simulated recurring refusal")
+
+        monkeypatch.setattr(h.engine, "_settle", refuse)
+        h.tick(20)
+        snap = h.engine.latest_committed_snapshot()
+        print("D204: committed", h.engine.store.engine().engine_state, "snap", snap["engine_state"])
+        print("D204 CLI:", format_status(snap, now=h.clock()).splitlines()[:2])
+        assert snap["engine_state"] == "FROZEN"
+        assert h.engine.store.engine().engine_state == EngineState.FROZEN
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-02 original scenario (store OVERFILL) + restart
+def test_d102_original_overfill_then_restart(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import Side
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeTradeLeg
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        a, b = h.buy_cells()[0], h.buy_cells()[-1]
+        ea, eb = h.live_order(a, ENTRY), h.live_order(b, ENTRY)
+        tid = h.fx._new_trade_id()
+        h.fx.trade_legs.append(FakeTradeLeg(
+            trade_id=tid, own_side=Side.BUY, order_index=h.fx.order_by_cid(ea.cid).order_index,
+            client_order_id=ea.cid, size=D("11"), price=ea.price, is_maker=True, timestamp_ms=h.fx._now_ms(),
+            visible_at=h.clock(), raw={"trade_id": tid, "size": "11", "price": str(ea.price)},
+            account_index=h.fx.account_index))
+        h.tick(10)
+        print("orig: conflicts", [(c.kind, c.cid == ea.cid) for c in h.engine.open_conflicts], h.state,
+              "complete", h.engine.history_complete)
+        h.restart()
+        h.fx.fill(eb.cid, D("10"))
+        h.tick(12)
+        print("orig+restart: B TP", h.live_order(b, TP) is not None, "tp_blockers", h.engine.tp_blockers,
+              "startup_reconciled", h.engine.startup_reconciled, "complete", h.engine.history_complete,
+              h.engine.history_incomplete_reason)
+        c0 = len(h.fx.cancels())
+        h.fx.set_book(D("6.2"), D("6.3"))
+        h.tick(6)
+        print("orig+restart: cancels", len(h.fx.cancels()) - c0)
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D2-04 double fault: the snapshot commit itself refuses
+def test_d204_snapshot_commit_refuses(tmp_path, monkeypatch):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import LedgerError
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        h.tick(3)
+
+        def refuse(now):
+            raise LedgerError("simulated: snapshot build refused")
+
+        monkeypatch.setattr(h.engine, "_commit_snapshot", refuse)
+        h.tick(20)
+        snap = h.engine.latest_committed_snapshot()
+        print("D204 dbl: committed row", h.engine.store.engine().engine_state, "reason",
+              (h.engine.store.engine().engine_state_reason if hasattr(h.engine.store.engine(), 'engine_state_reason') else None),
+              "snap", snap["engine_state"])
+        print("D204 dbl CLI:", format_status(snap, now=h.clock()).splitlines()[:2])
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-02 residual: recurring history-apply refusal + restart
+def test_d102_recurring_history_refusal_after_restart(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        x = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(x, ENTRY).cid, D("10"))
+        h.tick(6)
+        tpx = h.live_order(x, TP)
+        print("hist+restart: X TP before", tpx is not None and tpx.state.value)
+        h.restart()
+
+        def install():
+            orig = h.engine._apply_history
+
+            def refuse(result, now, in_progress):
+                if result.new_trades or result.new_orders:
+                    raise StoreError("simulated: history batch refused")
+                return orig(result, now, in_progress)
+            monkeypatch.setattr(h.engine, "_apply_history", refuse)
+
+        install()
+        other = h.sell_cells()[0]
+        h.fx.fill(h.live_order(other, ENTRY).cid, D("10"))        # an uncommitted row recurs in every walk
+        h.tick(10)
+        print("hist+restart: startup_reconciled", h.engine.startup_reconciled, "tp_blockers", h.engine.tp_blockers,
+              "state", h.state)
+        c0 = len(h.fx.cancels())
+        h.fx.set_book(D("6.2"), D("6.3"))
+        h.tick(8)
+        print("hist+restart: cancels", len(h.fx.cancels()) - c0)
+    finally:
+        h.close()

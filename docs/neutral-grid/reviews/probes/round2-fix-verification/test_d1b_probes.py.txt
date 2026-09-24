@@ -1,0 +1,133 @@
+"""Scratch probes for D1b findings (read-only verification; not part of the repo)."""
+from decimal import Decimal
+
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import EngineState, LegRole, OrderState, Side
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeExchange
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import StoreError
+
+D = Decimal
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+def _started(h, baseline=D("0")):
+    h.bootstrap(baseline)
+    h.tick(2)
+
+
+def _pending_cancel_legs(h):
+    s = h.engine.store
+    return [leg for leg in h.engine.non_final_legs()
+            if leg.state == OrderState.CANCEL_PENDING
+            and any(o.kind == "CANCEL" and o.status == "PENDING" for o in s.outbox_for_cid(leg.cid))]
+
+
+# ---------------------------------------------------------------- D1-11 variant: normal / tp-blocked branch
+def _crash_after_cancel_intent_outside_bounds(h):
+    h.fx.set_book(D("6.1"), D("6.2"))                  # outside bounds -> OUTSIDE_BOUNDS cancels
+    h.hooks.arm("after_cancel_intent_commit")
+    assert h.tick_crashing(1)
+    pending = _pending_cancel_legs(h)
+    assert pending, "no committed-but-unsent cancel after the crash"
+    return pending[0]
+
+
+def test_probe_d111_normal_branch_resumes_pending_cancel(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        h.tick(3)
+        leg = _crash_after_cancel_intent_outside_bounds(h)
+        h.tick(30)
+        assert not h.fx.order_by_cid(leg.cid).is_open, (h.engine.leg_by_cid(leg.cid).state, h.engine.reasons)
+    finally:
+        h.close()
+
+
+def test_probe_d111_tp_blocked_branch_resumes_pending_cancel(tmp_path):
+    h = Harness(tmp_path, options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=2.0))
+    try:
+        _started(h)
+        h.tick(3)
+        h.fx._rules["supports_limit"] = False            # MARKET_NOT_TRADABLE: a TP blocker (blocked branch)
+        h.run_until(lambda: "MARKET_NOT_TRADABLE" in h.engine.tp_blockers, max_ticks=90)
+        assert "MARKET_NOT_TRADABLE" in h.engine.tp_blockers, h.engine.tp_blockers
+        leg = _crash_after_cancel_intent_outside_bounds(h)
+        h.tick(30)
+        assert "MARKET_NOT_TRADABLE" in h.engine.tp_blockers, h.engine.tp_blockers
+        assert h.engine.startup_reconciled
+        assert not h.fx.order_by_cid(leg.cid).is_open, (h.engine.leg_by_cid(leg.cid).state, h.engine.reasons)
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-16 variant: crash before the next tick
+def test_probe_d116_freeze_after_immediate_crash_restart(tmp_path, monkeypatch):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        original = h.engine._reconcile_active
+
+        def refuse_once(now):
+            monkeypatch.setattr(h.engine, "_reconcile_active", original)
+            raise StoreError("simulated store refusal")
+
+        monkeypatch.setattr(h.engine, "_reconcile_active", refuse_once)
+        h.tick()
+        assert "LEDGER_INVARIANT" in h.engine.meta.freezes
+        h.crash_restart()                                 # process dies before the next tick's reload
+        h.tick(5)
+        print("D116 freezes after immediate crash:", dict(h.engine.meta.freezes), h.state)
+        assert "LEDGER_INVARIANT" in h.engine.meta.freezes, "freeze lost across a crash before the next tick"
+    finally:
+        h.close()
+
+
+# ---------------------------------------------------------------- D1-17 variant: unmatched manual trade same tick
+class _RacyManualFx(FakeExchange):
+    """A manual trade executes after the account read and before the history read of the same tick."""
+    pending_manual = None
+
+    async def inactive_orders_page(self, cursor, limit=100):
+        if self.pending_manual is not None and cursor is None:
+            side, qty, price = self.pending_manual
+            self.pending_manual = None
+            self.manual_trade(side, qty, price)
+        return await super().inactive_orders_page(cursor, limit)
+
+
+def _release_with_manual(tmp_path, inject_at=None):
+    h = Harness(tmp_path)
+    h.fx.remove_ws_listener(h.engine.wake)
+    h.engine.store.close()
+    h.fx = _RacyManualFx(h.clock)
+    h.engine = h.open()
+    try:
+        _started(h)
+        a = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(a, ENTRY).cid, D("10"))
+        h.run_until(lambda: h.live_order(a, TP) is not None, max_ticks=10)
+        h.fx.fill(h.live_order(a, TP).cid, D("10"))
+        gen = h.cell(a).generation
+        for i in range(40):
+            if i == inject_at:
+                h.fx.pending_manual = (Side.BUY, D("1"), D("5.5"))
+                h.engine.wake({"type": "order", "status": "filled"})
+            before_blockers = list(h.engine.store_entry_blockers)
+            h.tick()
+            if h.cell(a).current is None or h.cell(a).generation != gen:
+                return i, list(h.engine.store_entry_blockers), before_blockers
+        return None, list(h.engine.store_entry_blockers), None
+    finally:
+        h.close()
+
+
+def test_probe_d117_unmatched_manual_trade_in_release_tick_blocks_release(tmp_path):
+    release_tick, _, _ = _release_with_manual(tmp_path / "probe")
+    assert release_tick is not None
+    tick, blockers, before = _release_with_manual(tmp_path / "race", inject_at=release_tick)
+    print("D117 release tick", release_tick, "with manual trade:", tick, blockers, before)
+    # A release in the very tick that committed the unmatched trade would be premature (NG-CELL-001 (5)).
+    assert tick is None or tick > release_tick, (release_tick, tick, blockers)

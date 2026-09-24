@@ -1,0 +1,60 @@
+"""verify3 probes for D2-07: (a) the original own-fill scenario (re-run), (b) the same ordering with an UNMATCHED
+(manual) trade committed after the position read -- the audit acknowledges that inbox row while rebasing on a read
+that predates it."""
+from decimal import Decimal as D
+
+import pytest
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    CommandKind, CommandStatus, LegRole, Side)
+
+ENTRY = LegRole.ENTRY
+
+
+def _tick_until_poll(h, max_ticks=10):
+    for _ in range(max_ticks):
+        before = h.engine._last_account_poll_at
+        h.tick()
+        if h.engine._last_account_poll_at != before:
+            return
+    raise AssertionError("no poll")
+
+
+@pytest.mark.parametrize("settle", [None, "0"])
+@pytest.mark.parametrize("kind", ["own", "manual"])
+def test_d207_position_read_predates_committed_trade(tmp_path, kind, settle):
+    kw = {} if settle is None else {"settlement_delay_s": D(settle)}
+    h = Harness(tmp_path, **kw)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+        h.tick(14)
+        _tick_until_poll(h)
+        pos_at = h.engine.position.net_base
+        if kind == "own":
+            h.fx.fill(h.live_order(cell, ENTRY).cid, D("4"))
+        else:
+            h.fx.manual_trade(Side.BUY, D("2"), D("5.4"))
+        results = []
+        for i in range(3):          # stay before the next poll
+            h.tick()
+            if h.engine._last_account_poll_at == h.clock() - 1.0:
+                break
+            h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.engine.position.net_base),
+                                                   "note": "x"}, key=f"k{i}")
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=f"k{i}")
+            results.append((i, rec.status.value, rec.result))
+            if rec.status == CommandStatus.APPLIED:
+                break
+        print(kind, settle, "pos read", pos_at, "venue", h.fx.net_position, results)
+        applied = [r for r in results if r[1] == "APPLIED"]
+        if applied:
+            h.tick(12)
+            print("   after: B", h.engine.effective_baseline, "P", h.engine.endpoints.P, "venue", h.fx.net_position,
+                  h.engine.engine_state, h.engine.reasons[:3])
+        assert not applied, applied
+    finally:
+        h.close()

@@ -1,0 +1,11 @@
+import sys
+import pytest
+sys.path.insert(0, "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+sys.path.insert(0, "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_neutral_grid_host_dir(tmp_path, monkeypatch):
+    host_dir = tmp_path / "ng-host"
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(host_dir))
+    return host_dir

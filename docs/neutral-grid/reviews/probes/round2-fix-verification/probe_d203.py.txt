@@ -1,0 +1,33 @@
+import sys, tempfile, os
+from decimal import Decimal as D
+REPO = "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid"
+sys.path.insert(0, REPO)
+sys.path.insert(0, REPO + "/test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+os.environ["HUMMINGBOT_NEUTRAL_GRID_HOST_DIR"] = tempfile.mkdtemp()
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import LegRole
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+opts = EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0, weight_budget_per_min=100000)
+h = Harness(tempfile.mkdtemp(), options=opts)
+try:
+    h.bootstrap(D("0")); h.tick(2)
+    for c in sorted(h.engine.cells):
+        s = h.engine.cells[c].spec
+        print(c, s.entry_side.value, "entry", s.entry_price, "tp", s.tp_price)
+    target = next(c for c in h.engine.cells if h.engine.cells[c].spec.entry_price == D("5.6"))
+    old = h.live_order(target, LegRole.ENTRY)
+    print("target", target, "live entry", old.cid if old else None)
+    h.fx.venue_cancel(old.cid)
+    h.fx.set_rules(tick_size=D("0.0007"))    # 5.6 on tick, TP 5.5 off tick
+    h.tick(15)
+    new = h.live_order(target, LegRole.ENTRY)
+    print("re-armed entry:", new.cid if new else None, "state", new.state if new else None,
+          "blocker", h.engine.cell_blockers.get(target))
+    if new is not None:
+        h.fx.fill(new.cid, D("10"))
+        h.tick(10)
+        print("after fill: TP legs", [t.state.value for t in h.legs(target, LegRole.TP)], "blocker", h.engine.cell_blockers.get(target),
+              "legs total", len(h.engine.store.legs()))
+        n = len(h.engine.store.legs()); h.tick(30); print("legs after 30 more ticks", len(h.engine.store.legs()), "(was", n, ")")
+finally:
+    h.close()

@@ -1,0 +1,26 @@
+import sys, tempfile
+from pathlib import Path
+from decimal import Decimal as D
+sys.path.insert(0, "test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+from ng_engine_harness import Harness, make_config, start_payload
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind
+
+tmp = Path(tempfile.mkdtemp(dir="/private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify3"))
+h = Harness(tmp, order_amount_base=D("10"), max_gross_position=D("1000"))
+try:
+    h.tick(2)   # engine A publishes snapshots, awaiting START
+    p = start_payload(D("0")); p["material_id"] = "a" * 24
+    h.command(CommandKind.START, p, key="web-start-for-A")   # enqueued against A's revisions, not yet claimed
+    h.config = make_config(order_amount_base=D("20"), max_gross_position=D("2000"))
+    h.restart()      # engine restarts with B before claiming the START
+    h.tick(2)
+    rc = h.engine.store.get_command(idempotency_key="web-start-for-A")
+    print("START status after restart:", rc.status, rc.result)
+    print("meta.started", h.engine.meta.started, "start_material", h.engine.meta.start_material_id,
+          "fp==current", h.engine.meta.start_config_fingerprint == h.engine.full_fingerprint)
+    h.run_until(lambda: h.engine.bootstrap_ready(h.clock())[0], max_ticks=60)
+    h.command(CommandKind.CONFIRM_BASELINE, {"expected_initial_position": "0"}, key="confirm-nonweb")
+    h.tick()
+    print("bootstrapped", h.engine.bootstrapped, "Q", h.engine.config.order_amount_base, h.engine.recent_commands[-1]["result"])
+finally:
+    h.close()

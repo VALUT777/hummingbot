@@ -1,0 +1,20 @@
+from decimal import Decimal as D
+from controllers.generic.neutral_grid import NeutralGridConfig
+base = dict(id="x", lower_price=D("5"), upper_price=D("6"), cell_count=10, expected_initial_position=D("0"), enabled=True)
+for key in ["_operator_confirmed_start", "operator_confirmed_start", "_operator_resume_stop_ms", "operator_confirmed_migration"]:
+    try:
+        c = NeutralGridConfig(**base, **{key: True if "resume" not in key else 5})
+        print(key, "ACCEPTED", c.executor_config().operator_confirmed_start, c.executor_config().operator_resume_stop_ms, c.executor_config().operator_confirmed_migration)
+    except Exception as e:
+        print(key, "REJECTED", type(e).__name__, str(e).splitlines()[1] if len(str(e).splitlines())>1 else e)
+# model_validate path
+try:
+    c = NeutralGridConfig.model_validate({**base, "_operator_confirmed_start": True})
+    print("model_validate _ ACCEPTED", c.executor_config().operator_confirmed_start)
+except Exception as e:
+    print("model_validate _ REJECTED", type(e).__name__)
+# how does hummingbot load controller configs?
+import inspect, scripts.v2_with_controllers as v
+src = inspect.getsource(v)
+import re
+print([l for l in src.splitlines() if "load" in l.lower()][:10])

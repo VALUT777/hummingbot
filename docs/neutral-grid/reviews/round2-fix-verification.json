@@ -1,0 +1,670 @@
+{
+ "head": "203e31370",
+ "counts": {
+  "FIXED": 71,
+  "PARTIAL": 14
+ },
+ "notFixed": [
+  {
+   "id": "B-09",
+   "status": "PARTIAL",
+   "evidence": "The resend scenario is fixed: attempts>1 (store.py:3031) and an earlier non-NOT_SENT attempt (store.py:3033-3037) both keep the leg SUBMIT_UNKNOWN and the reservation. Covered by ::test_review4_release_outcome_on_a_resend_keeps_unknown_and_reservation (passes; mutation test_mut_b01_release_blocker_none makes it fail). The restart variant named in the finding is still reachable at the store API. Probe scratchpad/verify/test_probe_b.py::test_probe_b09_restart_dispatched_row_not_sent: intent, then mark_dispatching commits, then a crash before transport, then reopen, then record_transport_result(NOT_SENT) on the DISPATCHED row (attempts==1). Result: leg=REJECTED_UNSENT, reservations=[] (released). No owner or process token ties NOT_SENT to the process that dispatched the row, and no repo test covers this case (test_ac16_crash_after_dispatch_mark_is_ambiguous_not_absent does not try NOT_SENT).",
+   "residual_risk": "Reachable only through a direct store call. The engine records NOT_SENT only for PENDING rows (engine.py:1754-1766 _close_open_outbox, 2393-2399 pre-send happens before mark_dispatching, 2417-2429 _withdraw/_pending_submit_outbox), so the integrated engine does not hit it today. Any future caller that treats a dead process's DISPATCHED row as unsent would free the reservation and allow a new ENTRY CID."
+  },
+  {
+   "id": "E-03",
+   "status": "PARTIAL",
+   "evidence": "The in-process host is fixed. host.py:77-90 exposes engine persistence_error and fatal_reason, and views.health_view (views.py:250-271) turns them into the «не зафиксировано» banner. Covered by test_ngweb_health.py::test_in_process_host_reports_engine_persistence_error. Attach mode uses the engine sidecar <db>.health.json (engine.py:746-763; runtime.py:212-242). The engine writes the file only when its status changes, into the same directory as the DB, so the first tick leaves a 'healthy' file behind. Probe scratchpad/verify/probe_e03_sidecar.py ran a real Harness, applied FaultHooks.simulate_disk_full and made the data directory read-only to model a full or read-only filesystem. Result: engine.persistence_error='...SQLITE_FULL...', every sidecar write failed with 'could not be written', and the file still held persistence_error=null from the first tick. health_view then returned known=True, banner=None next to a stale snapshot. The UI therefore shows only STALE, which is the original failure mode. The stale-snapshot «неизвестно» fallback fires only when the file is missing or unreadable, not when it is outdated. The tests (test_ngweb_health.py::test_attach_health_file_error_shown_next_to_stale; engine test_w3_health_sidecar_*) cover only a hand-written error file, or disk-full on SQLite while the sidecar stays writable.",
+   "residual_risk": "Attach mode on a full or read-only filesystem, the headline scenario, still shows no persistence banner. A variant with a writable directory (for example a DB locked only through SQLite) is covered."
+  },
+  {
+   "id": "E-09",
+   "status": "PARTIAL",
+   "evidence": "The literal scenario is fixed. The web no longer reads a separate YAML. Preview, preview_id, the B check and engine_identity all come from the snapshot's engine_config (runtime.py:253-269), and the store rejects stale revisions at enqueue and at claim (store.py:3943-3956). Covered by test_ngweb_attach.py::test_attach_preview_identity_and_baseline_come_from_engine_config, and my real-engine probe matched. A variant is still reachable, because the engine never binds the acknowledged START to the config it runs. engine.py:845-883 validates only the format of preview_id and stores meta.start_preview_id without ever comparing it. meta.started persists across restarts, and a pre-bootstrap config change is accepted. Probe scratchpad/verify/probe_e_restart_cfg.py: START applied for a Q=10 config, restart with Q=20 and caps of 2000 before bootstrap, and the snapshot still says started=True. Web confirm_baseline is then allowed (commands.py:245 checks only engine_started), and CONFIRM_BASELINE with B=0 was APPLIED and bootstrapped the Q=20 grid. The operator's risk acknowledgement covered a different grid.",
+   "residual_risk": "The engine trades a grid whose preview and risk were never acknowledged, whenever the config changes between an applied START and CONFIRM_BASELINE. Fix: record the config fingerprint at START and reset or refuse started/CONFIRM_BASELINE on a mismatch, or have the web refuse confirm when the applied START's preview material differs from the current engine_config."
+  },
+  {
+   "id": "D1-02",
+   "status": "PARTIAL",
+   "evidence": "Checked at HEAD 203e31370. engine.py:124 now blocks TPs engine-wide only for CID_ALLOCATION and CONFIG_MISMATCH. engine.py:1928-1958 (`_scoped_tp_blocks`) limits HISTORY_CONFLICT and LEDGER_INVARIANT blocking to the affected cells, applied at engine.py:2084-2086. engine.py:2153-2158 plus 2123-2135 keep risk-reducing cancels (OUTSIDE_BOUNDS, cancel retries, unsent cancels) flowing while TPs are blocked. Tests test_ng_engine_review1.py::test_r02_one_cells_history_conflict_does_not_withhold_other_cells_tps_or_risk_cancels and ::test_r02_ledger_invariant_freeze_keeps_tps_of_exact_cells_and_outside_bounds_cancels pass. Both runtime mutations make them fail: putting LEDGER_INVARIANT back in `_FREEZES_BLOCKING_TP`, and a global HISTORY_CONFLICT TP blocker. The finding's own example still reproduces, though. Probe scratchpad/verify/test_probe_d102.py makes the active-orders row of cell A's entry contradict its leg (initial_base_amount 11 != 10). `record_order_evidence` then raises InvalidTransitionError in `_reconcile_active` (engine.py:1663) on every tick. The tick is caught at engine.py:737-743 before `_act` (engine.py:729), which never runs: `_reload` resets `_active_reconciled_at`, so the same row raises again. Result: cell B's 10 fill was committed but B had no TP after 15 ticks, and the outside-bounds move gave 0 cancels over 8 ticks, with the engine FROZEN and STORE_REFUSED every tick. r02 only covers a one-time refusal (refuse_once).",
+   "residual_risk": "A refusal that recurs every tick withholds every cell's TPs and every outside-bounds or risk-reducing cancel until an operator acts, which is the finding's own example. Any persistent StoreError or LedgerError raised in `_scan_history`, `_reconcile_active`, `_settle` or `_detect_drift` does the same. No test pins the recurring case."
+  },
+  {
+   "id": "D1-07",
+   "status": "PARTIAL",
+   "evidence": "Checked at HEAD 203e31370. engine.py:678-681 (`wake`) skips trade ids already in `_committed_trade_ids`. engine.py:1428-1431 expires client-id-only labels after a complete walk that started after them. engine.py:1471-1478 pops labels on commit. Test test_ng_engine_review1.py::test_r12_ws_signal_for_an_already_committed_trade_is_not_history_lag passes, and both runtime mutations (no committed check; no cid-label expiry) make it fail. Trade-id labels, however, never expire unless this engine commits that row. executor.py:358-364 forwards every connector OrderFilledEvent to `wake` with no trading-pair filter (ExecutorBase registers listeners for the whole connector). Probe scratchpad/verify/test_probe_d107.py sends one trade-id signal that this engine never commits, like another pair's fill: after 120 ticks with history_complete=True, history_lag_s = 120.0 and snapshot lag_s = 119.0, both still growing. `_audit_evidence_unsettled` also refuses baseline audits permanently ('1 WS trade signal(s) not yet in committed history').",
+   "residual_risk": "A fill event of another trading pair on the same connector produces the same permanent false lag and also blocks baseline audits forever. So does a restart replay of a trade older than the 5000-row committed cache and the scan overlap. The finding's second remedy (expiry after a covering complete walk) was applied only to client-id labels."
+  },
+  {
+   "id": "D1-11",
+   "status": "PARTIAL",
+   "evidence": "Stop branch: engine.py:2144-2150 now adds legs in CANCEL_PENDING that still have a PENDING CANCEL outbox row (_pending_cancel_outbox, line 2120). store.record_cancel_intent returns the open row (store.py:2916-2919), and mark_dispatching then works without a resend. This is pinned by test_ng_engine_review1.py::test_r07_stop_drain_dispatches_a_committed_but_unsent_cancel (line 351, crash at after_cancel_intent_commit). The test passes. Reverting the stop-branch clause makes it fail with 'condition not reached in 60 ticks; state=STOPPING'. Non-stop branches: _risk_reducing_cancels (engine.py:2134-2135, RESUME_PENDING_CANCEL) is used by both the tp_blockers branch (2153-2158, only when startup_reconciled and no PERSISTENCE_FAILURE) and the normal path (2159). My scratch probes pass at HEAD for both: an outside-bounds cancel crashed after its intent commit, in normal state and under a MARKET_NOT_TRADABLE TP blocker, is dispatched and the venue order is gone. However, the mutation that removes the RESUME_PENDING_CANCEL clause survives all 171 tests in test_ng_engine_crash/review1/review2/cycles/ops/risk. Under that mutation both of my probes fail and the order stays open.",
+   "residual_risk": "The tp_blockers branch named in the finding is fixed in code, and so is the normal path, because resuming a PENDING cancel moved out of _resume_pending_intents. No committed test pins either path, so a regression there would leave a committed-but-unsent cancel resting on the venue outside a STOP. The blocked branch also waits for startup_reconciled after a restart."
+  },
+  {
+   "id": "D1-16",
+   "status": "PARTIAL",
+   "evidence": "engine.py:737-744: the StoreError/LedgerError handler now also records FREEZE_INVARIANT in _sticky_freezes. _reload (engine.py:544-560) re-applies it and persists engine_meta in its own transaction. Only ack_history_conflict removes it (engine.py:1221-1227). test_r16_ledger_invariant_freeze_survives_reload_and_restart_until_acknowledged (review1:544) passes, and removing the sticky line makes it fail at line 557. The original scenario (the next tick's reload drops the freeze) is fixed. My scratch probe test_probe_d116_freeze_after_immediate_crash_restart covers a remaining gap. It triggers the refusal, then calls crash_restart() before any further tick. The freeze is lost: the output was 'freezes after immediate crash: {} EngineState.NORMAL'. The freeze is persisted only by the next tick's _reload, never in the except handler.",
+   "residual_risk": "If the process dies or restarts within the roughly one-tick window after a store or ledger refusal, the LEDGER_INVARIANT freeze disappears without an operator ack. The engine can return to NORMAL unless the refusal recurs deterministically. The suggested alternative, persisting the freeze in its own transaction inside the handler, would close this window."
+  },
+  {
+   "id": "D1-17",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1726-1728: _settle now recomputes reconciliation through _position_reconciled_now (engine.py:1377-1382). That requires a fresh position requested after the latest fill commit (position_seq > fills_commit_seq), equality with the ledger P, and no store_entry_blockers. _reread_position_for_release (engine.py:1384-1395, called at line 724 after _scan_history) re-reads the position when a cell waits only on condition (5). test_r17_release_needs_a_position_read_after_the_closing_fill_commit (review1:251) and test_r03 (review1:208) pass. r17 fails only when both parts are reverted (the settle recompute and the re-read): (6, 6, Decimal('0')). Reverting only the _settle line the finding names, so that it uses the previous tick's position_reconciled flag, survives all 115 tests in review1/review2/cycles/ops/risk/history. My scratch probe test_probe_d117_unmatched_manual_trade_in_release_tick_blocks_release covers the manual-trade variant from the finding. An unmatched manual trade executes after the account read and is committed by the same tick's history walk. At HEAD there is no release, blocked by 'unmatched account trade(s)'. Under the _settle-only revert, the cell is released in exactly that tick.",
+   "residual_risk": "The fix is correct in code, but the exact mechanism the finding names (release on the previous tick's flag) is not pinned. Neither is the unmatched-manual-trade variant, nor a re-read skipped by the weight budget. A regression in _settle alone would pass the committed suite and allow a premature NG-CELL-001 release."
+  },
+  {
+   "id": "D2-01",
+   "status": "PARTIAL",
+   "evidence": "Fix: executor.py:250-271 (_track_stop re-sends STOP with a new key and fresh revisions on CONFLICT/REJECTED; _stop_command_sent is set only when APPLIED). scripts/lighter_robinhood_fixed_neutral_grid.py:50 and 216-255: the drain now waits stop_uncertain_after_s+30 = 150 s and reports the committed outcome (STOP_NOT_APPLIED / STOPPING / the committed outcome). Test test/controllers/generic/test_neutral_grid.py::test_a_hummingbot_stop_is_resent_after_a_conflict_until_the_engine_applies_it passes. A mutation that restores the old no-re-send behaviour makes it fail (no APPLIED stop row). The CONFLICT scenario is fixed and pinned. Variant still reachable: _send_stop records the key before enqueue (268-271), and _track_stop treats a missing row (record None, 258-260) the same as QUEUED. Probe scratchpad/verify/probe_d201.py forced one failed STOP insert (FaultHooks.fail_statement('INSERT INTO commands', OperationalError('database is locked'))). early_stop then raised PersistenceError, which would also raise out of orchestrator.execute_actions in the drain. For the next 200 ticks the engine stayed NORMAL with 10 owned orders live, there was no STOP row, and the STOP was never re-sent. stop_requested_ms stayed None.",
+   "residual_risk": "If the STOP insert fails once (SQLITE_BUSY from the web command client past its 5 s busy timeout, disk full, or an I/O error), the Hummingbot stop is lost for good. The engine keeps trading. The drain times out as STOP_NOT_APPLIED, but its log still says orders are 'reconciled on the next start', and the next launcher START resumes normal trading. Suggested fix: re-send when the tracked key has no row, or enqueue before recording the key and retry on exception."
+  },
+  {
+   "id": "D2-04",
+   "status": "PARTIAL",
+   "evidence": "engine.py:733-744: the except path records the LEDGER_INVARIANT freeze in _sticky_freezes. _reload (544-560) re-applies it and persists engine_meta. Only ack_history_conflict clears it (1234-1236). Test test_ng_engine_review1.py::test_r16_ledger_invariant_freeze_survives_reload_and_restart_until_acknowledged passes, and fails when the mutation clears the sticky freezes before reload. Probe scratchpad/verify/probe_d204.py made _reconcile_active raise StoreError on every tick. The freeze is now kept in memory (FROZEN) and in durable engine_meta, and no entries are sent (0 submits). However: committed engine row engine_state=NORMAL, committed snapshot engine_state=NORMAL, and format_status prints 'state NORMAL' with no reason. Only a SNAPSHOT STALE tag appears after 15 s. The health sidecar covers only persistence/fatal errors.",
+   "residual_risk": "The second half of the finding is still reachable: while the refusal recurs every tick, no FROZEN state or snapshot is ever committed (no set_engine_state in the except or _reload path). Web and CLI keep showing the last committed NORMAL state."
+  },
+  {
+   "id": "D2-07",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1056-1070 (line 1059): _audit_evidence_unsettled refuses the audit (AUDIT_EVIDENCE_NOT_SETTLED, retryable) when position_seq < fills_commit_seq, which is the suggested fix. It also refuses on history lag, pending WS signals, no complete walk after the position read, or unresolved orders. Probe scratchpad/verify/probe_d207.py ran the exact scenario: account poll, then a 4 LIT own fill committed before the next poll, then an audit with observed=7. Current code: REJECTED, reason 'position read predates the latest committed fill'. With that single check neutralised, the audit is APPLIED with new_effective_baseline 3 instead of 7. Under the same mutation, test_ng_engine_risk.py, test_ng_engine_review1.py and test_ng_engine_review2.py (74 tests, including test_d_baseline_audit_is_refused_while_an_own_fill_may_be_missing_from_history and test_r13) all still pass.",
+   "residual_risk": "The code path is fixed, but no test pins the finding's scenario (position read older than a committed fill). test_d covers only the reverse case, where history lags the position. Reverting line 1059 would go unnoticed."
+  },
+  {
+   "id": "D2-15",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1256-1271 resolve_unknown_submit now calls _absence_not_proven (engine.py:1274-1290). It requires an active list requested after the outbox dispatched_at_ms and within history_freshness_s, plus one complete walk that started after the dispatch. review1::test_r08_resolve_unknown_submit_is_refused_without_an_active_list and ::test_r08_..._with_an_active_list_older_than_the_dispatch pin the stale and None cases, and both pass. The suggested settlement predicate was not implemented: no settlement_delay_s, no settlement_scans, no check for a pending WS signal on that CID. Probe scratchpad/verify/test_probe_d15.py: FakeExchange(active_lag_s=7), TP with TIMEOUT_LANDED, operator retries resolve_unknown_submit each tick. It is REJECTED at +1..+5 s and APPLIED at +6 s while the venue order is still open. Leg -> REJECTED_ZERO_FILL, a second TP CID for the same cell goes out (two open TP orders at the venue), and the state is NORMAL until it later turns RISK_BLOCKED 'final order ... is still active on the venue'. Same result with active_lag_s=15.",
+   "residual_risk": "Venue active-list or history lag of a few seconds still lets an audited 'not landed' through, producing a new CID and double exposure for the cell. Needs settlement delay plus N walks started after dispatch+delay, and no pending WS signal, before accepting."
+  },
+  {
+   "id": "D2-17",
+   "status": "PARTIAL",
+   "evidence": "The engine now remembers meta.colliding_cid (sticky across reload) at engine.py:2369-2375. The audited action 'retire_colliding_cid' (engine.py:1239-1248) calls store.retire_cid and pops FREEZE_CID in the command transaction. review2::test_f_cid_collision_is_recovered_by_an_audited_retire passes and would fail without the action. The action is in commands.EXTENDED_AUDIT_ACTIONS only, and no product surface can send it: web/neutral_grid/commands.py:37-40,218 accepts only the base AUDIT_ACTIONS ('Недопустимое действие аудита' otherwise), and git grep finds no launcher, bin or controller code that enqueues retire_colliding_cid. The trace itself leaves this as open request R5. The suggested automatic retire of an id already recorded as foreign was not implemented.",
+   "residual_risk": "In a real deployment an operator still cannot clear FREEZE_CID, which blocks every TP, without hand-writing a command row into the SQLite queue (store.enqueue_command from Python). That is audited now, unlike the old engine_kv edit, but there is still no operator path."
+  },
+  {
+   "id": "D2-18",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1028-1033 and 1056-1070: the audit is refused with AUDIT_EVIDENCE_NOT_SETTLED when the position was read before the latest fill commit, when any WS signal is pending or history lag > 0, when no complete walk started after the position read, or when non-LIVE own orders exist. review2::test_d_baseline_audit_is_refused_while_an_own_fill_may_be_missing_from_history (lagging fill with WS signal) passes. Probe scratchpad/verify/test_probe_d18.py reproduces the finding's case with a WS signal: REJECTED. Probe scratchpad/verify/test_probe_d18b.py uses the same scenario, but the own fill arrives without a WS event (fx.fill(..., history_lag_s=30, ws=False)), the only difference. The audit is APPLIED at +9 s with new_effective_baseline=11. After history delivers the fill, P=15 vs venue 11 and the state is still NORMAL. The owned LIVE entry's active row already reported filled_base_amount=4 (recorded as order evidence in _reconcile_active), but _audit_evidence_unsettled does not compare active-row cumulative with ledger fills.",
+   "residual_risk": "A missed or dropped WS event (the spec treats WS as a hint only) still lets the rebase absorb an own fill into B and count it twice. Needs a check that no owned LIVE order's active-row cumulative filled exceeds its history-proven fills (or a settlement delay after the position read)."
+  }
+ ],
+ "results": [
+  {
+   "id": "A-01",
+   "status": "FIXED",
+   "evidence": "cells.py:682 is now `late = leg.is_final` (the `or cycle.closed` clause is gone). cells.py:717-737: acknowledge_late_evidence turns REJECTED_* and TERMINAL legs with late fills into TERMINAL with terminal_cumulative = filled. Engine: engine.py:1113-1175 (_cmd_ack_late_evidence) writes meta.audited_cumulative durably, and _project_terminal (engine.py:493-503) re-applies it after a reload. Tests that pin it: core/test_cells.py::TestLateEvidenceResolution::test_resolution_tp_fills_do_not_relatch_and_later_cycles_release and ::test_audited_execution_of_a_rejected_leg_becomes_terminal; engine/test_ng_engine_history.py::test_ac42_super_delayed_fill_after_reuse_freezes_and_goes_to_old_cycle_only_by_audit (passes, and also checks the audit survives a restart). Mutation probe (in-memory source patch, scratchpad/verify/mutate_a.py): putting `or cycle.closed` back, dropping the terminal_cumulative update, or leaving REJECTED legs uncorrected each fails TestLateEvidenceResolution. Exact-scenario probe (probe_a.py): gen0 entry 4, TP 4, release, late fill 1 gives LATE_EVIDENCE; ack gives check_invariants()==[]; partial fills 0.4+0.6 of the resolution TP are APPLIED; after TERMINAL there is no late flag, invariants are [], and next_entry_identity is gen 1. Core suite: 127 passed.",
+   "residual_risk": "Separate, documented open risk #4 in the WS-A trace: late evidence on an already-final TP whose remainder was re-dispatched can over-exit (X > E). That leaves a check_invariants violation that no ledger API clears. It is a different scenario from this finding. Also, a late obligation below the runtime minimum becomes DUST and locks the cell (open risk #2)."
+  },
+  {
+   "id": "A-02",
+   "status": "FIXED",
+   "evidence": "risk.py:40 adds UNRESOLVED_SUBMIT_STATES={SUBMIT_UNKNOWN}. risk.py:245 and :257: freeable = in_flight + unresolved + candidates, so SUBMIT_UNKNOWN same-side entries count as pending headroom. The result is WAIT with reason WAIT_UNRESOLVED_SUBMIT, not risk_blocked. Test: core/test_risk.py::TestTpHeadroom::test_submit_unknown_same_side_entry_is_pending_not_risk_blocked, which also asserts RISK_BLOCKED when only confirmed position and TP orders exceed the cap. Mutation that drops `unresolved` from freeable: test fails (killed). Router-level probe of the exact scenario (cap 20, P_max 20 from a SUBMIT_UNKNOWN BUY entry of 20, BUY TP 10) now gives WAIT 'WAIT_ENTRY_TERMINAL:...,WAIT_UNRESOLVED_SUBMIT:20' instead of BLOCKED. The same input with the entry LIVE gives CANCEL + WAIT.",
+   "residual_risk": "Pinned only at the plan_tp_headroom unit level. No router or engine test uses a SUBMIT_UNKNOWN entry together with a net cap. Unknown-role (role=None) same-side orders are still treated as unfreeable, which is intentionally conservative."
+  },
+  {
+   "id": "A-03",
+   "status": "FIXED",
+   "evidence": "cells._split_valid (cells.py:936-938) now delegates to grid.partition_valid (grid.py:137-165). That function balances ceil(n/big) chunks when k*m <= n, so 10 with max_base 6 and min 5 gives 5+5. Otherwise it uses the largest splittable amount, (k-1)*big. dust.aggregate (dust.py:99-128) also uses partition_valid and no longer skips groups above max_base. Tests: core/test_cells.py::...::test_max_base_split_is_balanced_so_no_avoidable_dust and core/test_dust.py::...::test_aggregate_above_max_base_is_split_into_valid_balanced_orders. A greedy-split mutation applied to grid, cells and dust fails 2 tests (killed). Exhaustive probe (step 1, min 1..7, max_base m..14, qty 0..59): 0 cases where partition_valid misses the brute-force maximum, and every chunk is within [min, max_base]. Ledger probe of the exact scenario: plan (5,5), dust 0, refresh_dust gives {}.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "A-04",
+   "status": "FIXED",
+   "evidence": "AC-39 is now implemented in the ledger. Leg.allocation (cells.py:137-167) water-fills per generation and is persisted in to_record/from_record. Cycle.tp_parts/X (cells.py:279-297) count aggregate shares. _dispatch_analysis (cells.py:460-507) emits aggregate TpDispatchItems with an exact allocation. add_tp_intent(..., allocation=) (cells.py:540-590) checks each share against its cycle's unassigned amount and requires hosting by the newest generation. check_invariants validates allocations. The engine dispatches with allocation=item.allocation (engine.py:2214, 2292-2341), and the store keeps allocations/fill_allocations rows. Tests: core/test_dust.py::TestLedgerAggregateTp (the reviewer's exact DUST 2 + DUST 3 scenario: one SELL 5 aggregate, exact per-cycle X, idempotence, order independence, round-trip, release); core/test_properties.py::test_aggregate_tp_random_splits_are_exact_and_idempotent; engine/test_ng_engine_history.py::test_ac39_aggregate_tp_over_audited_late_and_current_cycle_is_exact_and_durable and engine/test_ng_engine_cycles.py::test_ac39_same_side_target_remainders_merge_into_one_exact_tp (both run and pass); store/test_ng_store_review_fixes.py::test_ws_a_aggregate_tp_water_fills_generations_like_cell_ledger.",
+   "residual_risk": "dust.AggregateTp remains as a separate helper that the ledger does not use, which is harmless. Aggregation still happens only when every contributing cycle's entry is final."
+  },
+  {
+   "id": "A-05",
+   "status": "FIXED",
+   "evidence": "admission._full_q_blocker (admission.py:236-242) checks both ENTRY and TP prices, and CellLedger.begin_entry (cells.py:438-441) checks both prices as well. New test: core/test_admission.py::TestRuntimeMinimumChange::test_ac34_runtime_floor_invalid_only_at_tp_price_blocks_arming. It uses min_notional 54.8 with SELL cell 26 (entry 5.4909, TP 5.4727), asserts blocked[26] starts with FULL_Q_INVALID_TP, and asserts begin_entry raises 'tp price 5.4727'. Mutations: admission checking the entry price only raises KeyError in the test (killed); begin_entry checking the entry price only fails the test (killed).",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "A-06",
+   "status": "FIXED",
+   "evidence": "admission.plan head-of-line logic (admission.py:205-222): a cell that does not fit sets head_blocked=True, and every later idle cell is queued. New test: core/test_admission.py::TestHeadOfLine::test_head_needing_more_slots_blocks_cells_behind_and_arms_first. It uses min_notional 27 so head cell 23 needs 4 slots and cell 21 needs 3, with 3 free. It asserts newly_armed=() and queued=(23,21), then that the head arms first once slots free up. Replacing `head_blocked = True` with a skip-ahead fails the test (killed).",
+   "residual_risk": "Pinned at the admission unit level only. The engine arms only plan.newly_armed, so engine-level starvation would need a router-level blocker on the head, which is outside this finding."
+  },
+  {
+   "id": "A-07",
+   "status": "FIXED",
+   "evidence": "cid.py:65-76: known() now wraps a validate_cid failure from the durable lookup in `raise self._fail(exc)`, so allocator.failed is latched and allocate() on any new identity raises CidError. Test: core/test_cid.py::TestCid::test_malformed_durable_lookup_latches_fail_closed. It asserts the raise, that failed is set, that a later allocate(ident(1)) raises CidError, and that high_water stays 0. Reverting to a bare `raise exc` fails the test (killed).",
+   "residual_risk": "CidAllocator is used only by tests and core helpers. The production engine allocates through store.allocate_cid (engine.py:2330). That path relies on the cid_map schema CHECK (cid > 0 AND cid <= 2^48-1, migrations/m0001_initial.py:206) and latches FREEZE_CID/DEGRADED on CidAllocationError (engine.py:2369-2376). store.cid_for does not re-validate a row value in Python."
+  },
+  {
+   "id": "A-08",
+   "status": "FIXED",
+   "evidence": "admission.plan step 2b (admission.py:171-190) trims unused reservations when the effective cap drops below actual + reserved: entry-side spare slots first, exit-only cells last. SlotBudget.from_plan (router.py:104-108) also sets headroom = cap - actual as a hard ceiling in take(). When a TP gets no slot, the router takes the AC-44 emergency path (select_entries_to_cancel, then WAIT_SLOT). The engine always builds its budget with SlotBudget.from_plan and also checks len(non_final_legs) >= plan.slots.cap before committing (engine.py:2179, 2205-2207). Tests: core/test_admission.py::TestCapReduction (test_cap_drop_trims_stale_reservations_and_tp_goes_to_emergency_path, test_oversubscription_trims_entry_side_reservations_before_exit_ones, test_sim_never_submits_over_a_reduced_cap); engine/test_ng_engine_risk.py::test_ac44_full_cap_tp_priority_cancels_cap_consuming_entry (run, passes). Mutation that disables the trim (deficit=0): 2 failures (killed). Probe of the exact scenario (cap 3, venue cap dropped to 1, partial fill 5): SlotLedger(cap=1, actual=1, reserved_unused=0, free=0), no submits, the entry is cancel-requested, 1 non-final order.",
+   "residual_risk": "The headroom ceiling in SlotBudget is redundant with the trim: removing it alone leaves the suite green. It is defense in depth, and after the trim sum(cell_unused) + free <= cap - actual always holds, so this is not a live gap."
+  },
+  {
+   "id": "B-01",
+   "status": "FIXED",
+   "evidence": "store.py:2981 record_transport_result sends NOT_SENT/DEFINITIVE_REJECT_ZERO_FILL through _release_blocker (store.py:3029-3042). The blocker fires in four cases: attempts>1, an earlier attempt that was not NOT_SENT, a leg that is not INTENT/SUBMIT_UNKNOWN (for example LIVE), or venue evidence (ACCEPTED, an exchange id or last_evidence_ms). In each case the effective outcome becomes UNKNOWN, the leg stays SUBMIT_UNKNOWN or LIVE, and the reservation is kept. Tests: test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_review_fixes.py::test_review4_release_outcome_on_a_resend_keeps_unknown_and_reservation[NOT_SENT|DEFINITIVE_REJECT_ZERO_FILL] covers scenario (a) and also checks that no new ENTRY revision is allowed. ::test_review4_not_sent_after_venue_evidence_does_not_release covers scenario (b). All pass. Mutation check (scratchpad/verify/test_mutations_b.py::test_mut_b01_release_blocker_none): with _release_blocker patched to return None, both tests fail. Probe test_probe_b01_dispatched_resend_zero_fill_after_restart: UNKNOWN, then restart, then a resend with ZERO_FILL. The leg stays SUBMIT_UNKNOWN and the reservation is kept.",
+   "residual_risk": "A restart variant (a DISPATCHED row with attempts==1 left by a dead process) is still accepted as a release. It is tracked under B-09 and is not part of B-01's failure scenario."
+  },
+  {
+   "id": "B-02",
+   "status": "FIXED",
+   "evidence": "store.py:2874-2878 mark_dispatching checks degraded state first for SUBMIT. A DISPATCHED row without resend_same_cid now raises InvalidTransitionError. Every dispatch increments attempts and inserts an outbox_attempts row. The engine re-dispatches only PENDING submits (engine.py:2413-2425 _resume_pending_intents/_pending_submit_outbox). Test ::test_review5_dispatched_row_needs_explicit_same_cid_resend_and_respects_degraded covers crash after transport, restart, plain re-dispatch raising, degraded resend raising PersistenceError, and explicit resend giving attempts==2. It passes.",
+   "residual_risk": "Cancels may still be re-dispatched while degraded, which is intentional (NG-DB-004 allows a cancel only if its intent commits). Same-CID submit resend stays opt-in and the engine never uses it."
+  },
+  {
+   "id": "B-03",
+   "status": "FIXED",
+   "evidence": "store.py:470-486 default_host_dir() = ~/.hummingbot/neutral_grid (or $HUMMINGBOT_NEUTRAL_GRID_HOST_DIR), which does not depend on data_path. store.py:1382-1385 puts the host marker at <lock_dir>/../markers/<key>.marker.json, outside the DB data directory. The production path, executor.py:167 -> engine.py:214 open_engine_store, passes lock_dir=None, so it uses the host-wide default. _open_existing (store.py:1527-1546) repairs a missing marker on the next open. Tests: ::test_review1_lock_and_prior_run_marker_are_host_wide_not_per_data_path uses rmtree on checkout data and then expects PriorRunEvidenceError. test_ng_store_prior_run.py::test_wiped_data_directory_still_blocked_by_host_marker also covers it. Both pass.",
+   "residual_risk": "If both ~/.hummingbot/neutral_grid and data/ are wiped, or the engine runs in a container whose home directory is not persisted (docker-compose mounts only ./data and similar), the engine still creates a fresh epoch-1 database. There is no mandatory venue-evidence callback (executor passes prior_run_markers=None), and the fresh epoch is not derived from CIDs seen at the venue. The native macOS deployment is covered."
+  },
+  {
+   "id": "B-04",
+   "status": "FIXED",
+   "evidence": "The late fill on a COMPLETE cycle is recorded: late_evidence=1 plus a LATE_FILL conflict (store.py:3349, 3370-3385). late_obligation_cycles (store.py:2204) lists COMPLETE cycles with E!=X or late_evidence=1. load_state includes them as late_cycles, together with their legs (store.py:4082-4085). _cycle_accepts (store.py:2766) allows a TP on a released cycle once late_evidence==2 (after the audit) and E>X, and allocate_cid and record_intent both use it. The covering TP's fills are not treated as late (store.py:3349). open_cycle refuses while a late obligation exists (store.py:2230). grid_mutation_blockers covers all cycles plus unresolved conflicts (store.py:2012-2031). Test ::test_review2_late_fill_on_released_cycle_is_an_outstanding_obligation checks, after a restart: late_cycles==[(3,1)], a mutation blocker, open_cycle refused before and after the audit, a TP on the old cycle after the audit, no new conflict from its fill, and generation 2 allowed afterwards. It passes. Mutation check test_mut_b10_open_cycle_ignores_late makes the test fail.",
+   "residual_risk": "Engine-level coverage (the ack_late_evidence command followed by the TP) belongs to WS-D and was not re-verified here."
+  },
+  {
+   "id": "B-05",
+   "status": "FIXED",
+   "evidence": "store.py:1266 uses default_lock_dir() when lock_dir is None. store.py:482-486 resolves that to <default_host_dir()>/locks and no longer to <data_path>/neutral_grid/locks. A second flock on <db>.lock is still taken. The production opener (engine.py:214, executor.py:167) passes lock_dir=None. Test ::test_review1_lock_and_prior_run_marker_are_host_wide_not_per_data_path uses two data_paths and the default lock_dir, and the second open raises StoreLockedError. That checkout then also gets PriorRunEvidenceError on a fresh DB, so there is no epoch-1 collision. It passes.",
+   "residual_risk": "Two containers on one host, or two OS users, each have their own home directory. Unless HUMMINGBOT_NEUTRAL_GRID_HOST_DIR points to a shared mount, they can still run two engines. This is documented only in ws-b-store.md:111-114. The repo ships a Dockerfile/docker-compose that does not mount ~/.hummingbot."
+  },
+  {
+   "id": "B-06",
+   "status": "FIXED",
+   "evidence": "The host marker now lives at <host_dir>/markers/<key>.marker.json (store.py:1382-1385), outside data/neutral_grid. Deleting data/neutral_grid or data/ leaves it in place, so _prior_run_evidence raises PriorRunEvidenceError and no fresh epoch-1 database is created. Tests: ::test_review1_lock_and_prior_run_marker_are_host_wide_not_per_data_path (rmtree of the whole data dir with default_db_path/default_lock_dir, as the suggested fix asked). test_ng_store_prior_run.py::test_wiped_data_directory_still_blocked_by_host_marker. Both pass.",
+   "residual_risk": "This is the same as B-03. Wiping the host directory too, or a recreated container whose home directory is ephemeral, still allows a fresh epoch-1 database and CID reuse."
+  },
+  {
+   "id": "B-07",
+   "status": "FIXED",
+   "evidence": "grid_mutation_blockers (store.py:1998-2029) now checks every cycle of the grid, whether OPEN or COMPLETE. It blocks on E!=X, dust, late_evidence==1, unallocated aggregate fills and unresolved history conflicts, and migrate_grid (store.py:2046-2048) refuses when any blocker exists. Test ::test_review2_late_fill_on_released_cycle_is_an_outstanding_obligation asserts a 'cell 3 gen 1' blocker for the late fill that leaves E=5, X=4. Mutation check test_mut_b07_blockers_open_only (blockers limited to OPEN cycles) makes it fail. Probes test_probe_b07_migrate_grid_refused_with_late_obligation (migrate_grid raises ConfigMutationError before and after the audit) and test_probe_b07_conflict_only_blocks_migration both pass.",
+   "residual_risk": "No repo test calls migrate_grid itself with a late obligation; the tests pin grid_mutation_blockers instead. The conflict-only and late_evidence==1 blockers are not pinned separately."
+  },
+  {
+   "id": "B-08",
+   "status": "FIXED",
+   "evidence": "A durable per-stream flag cursors.retention_gap_open is set whenever the stored required boundary is older than the oldest available history (store.py:3453-3459). complete=True is refused while the gap is open (store.py:3460). entry_blockers reads the flag (store.py:2579-2585). Only record_manual_reconciliation(resolved_retention_gaps=[stream]) clears it (store.py:3724-3728, 3750-3752), and clear_manual_reconcile does not. Tests: ::test_review10_retention_gap_is_cleared_only_by_a_reconciliation_naming_it covers variant (a), an unrelated conflict resolution that leaves the gap blocking. ::test_review10_gap_written_through_cursors_blocks_and_cannot_be_complete covers variant (b). Both pass.",
+   "residual_risk": "Detecting that a stream's history is shorter than the required boundary is still the job of WS-C/WS-D."
+  },
+  {
+   "id": "B-09",
+   "status": "PARTIAL",
+   "evidence": "The resend scenario is fixed: attempts>1 (store.py:3031) and an earlier non-NOT_SENT attempt (store.py:3033-3037) both keep the leg SUBMIT_UNKNOWN and the reservation. Covered by ::test_review4_release_outcome_on_a_resend_keeps_unknown_and_reservation (passes; mutation test_mut_b01_release_blocker_none makes it fail). The restart variant named in the finding is still reachable at the store API. Probe scratchpad/verify/test_probe_b.py::test_probe_b09_restart_dispatched_row_not_sent: intent, then mark_dispatching commits, then a crash before transport, then reopen, then record_transport_result(NOT_SENT) on the DISPATCHED row (attempts==1). Result: leg=REJECTED_UNSENT, reservations=[] (released). No owner or process token ties NOT_SENT to the process that dispatched the row, and no repo test covers this case (test_ac16_crash_after_dispatch_mark_is_ambiguous_not_absent does not try NOT_SENT).",
+   "residual_risk": "Reachable only through a direct store call. The engine records NOT_SENT only for PENDING rows (engine.py:1754-1766 _close_open_outbox, 2393-2399 pre-send happens before mark_dispatching, 2417-2429 _withdraw/_pending_submit_outbox), so the integrated engine does not hit it today. Any future caller that treats a dead process's DISPATCHED row as unsent would free the reservation and allow a new ENTRY CID."
+  },
+  {
+   "id": "B-10",
+   "status": "FIXED",
+   "evidence": "This is the same mechanism as B-04. The late fill credits the old cycle and sets late_evidence=1 (store.py:3349, 3370-3371). After the audit, record_manual_reconciliation sets late_evidence=2 (store.py:3742-3746), and _cycle_accepts then lets allocate_cid and record_intent create a TP for E>X (store.py:2766, 2354-2355). open_cycle refuses a new generation while any released cycle of the cell has E!=X or unacknowledged evidence, and while any conflict is open (store.py:2230-2238). grid_mutation_blockers covers COMPLETE cycles. Tests: ::test_review2_late_fill_on_released_cycle_is_an_outstanding_obligation and ::test_ws_a_aggregate_tp_water_fills_generations_like_cell_ledger[5+7|7+5] (late fill on gen1 while gen2 is open). Both pass. Probe test_probe_b10_late_fill_after_next_gen_open_then_standalone_tp passes: before the audit a gen1 TP is refused; after it a standalone gen1 TP of 2 is accepted and a TP beyond that is refused; gen3 is refused until the gen1 TP fills, then gen3 opens.",
+   "residual_risk": "A late fill on a TP leg that pushes X above E leaves the cell permanently blocked (E!=X), with only manual resolution. This fails closed and is outside B-10's scenario."
+  },
+  {
+   "id": "B-11",
+   "status": "FIXED",
+   "evidence": "_validated_allocations (store.py:2790-2826) only accepts allocations on a TP leg. It requires the target's (grid, cell) to equal the leg's own cell (a foreign cell raises, with a message about the same TP side and price). Each target cycle must accept a TP and have tp_side==side and tp_price==price. Shares must sum to the amount, and the host must be the newest generation. _intent_preconditions also fixes the request side and price to the cycle's TP (store.py:2744-2747). Test ::test_review7_allocations_must_share_tp_side_and_fixed_tp_price covers cell 40 (opposite side) and cell 6 (other price). It passes. Probe test_probe_b11_same_cell_other_side_price (own cell with an off-target price) is refused.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "B-12",
+   "status": "FIXED",
+   "evidence": "Aggregate TP fills are now split by water-fill at history time (store.py:3362-3371, _water_fill at 421), so X is credited in the same transaction and a deferred, unallocated state no longer arises for new data. As defense in depth, set_leg_state(TERMINAL) refuses a leg with unallocated fills (store.py:2515-2518), and _tp_reserved counts the unallocated quantity of final aggregate legs (store.py:2690-2695). record_manual_reconciliation also refuses to finalise legs with unallocated fills. Tests: ::test_review3_terminal_aggregate_tp_with_unallocated_fills_cannot_admit_duplicate_tp (asserts X=10 before TERMINAL and that a duplicate TP is refused with 'exceeds confirmed entry'), ::test_review3_late_unallocated_fill_on_final_aggregate_tp_still_counts, and ::test_ws_a_aggregate_tp_water_fills_generations_like_cell_ledger. All pass. Probe test_probe_b12_own_tp_terminal_then_dup passes.",
+   "residual_risk": "The TERMINAL and unallocated-reserve guards only matter for pre-alignment rows. No test would fail if only those two guards were reverted, but the scenario itself is no longer reachable."
+  },
+  {
+   "id": "B-13",
+   "status": "FIXED",
+   "evidence": "_scope (store.py:1798-1814) marks the caller's transaction as failed when a store method raises after changing rows (total_changes delta), and transaction() refuses COMMIT when tx._failed is set (store.py:1760-1762). Guards now validate before writing: allocate_fill checks sum, distinctness, caps and the existing split before any INSERT (store.py:3510-3531), and record_intent runs _intent_preconditions, including the allocation sum, before the first INSERT (store.py:2627, 2798-2825). Tests: ::test_review6_any_store_error_after_writes_poisons_the_transaction, ::test_review6_caught_allocation_sum_error_leaves_no_dispatchable_intent and ::test_review6_caught_guard_error_cannot_commit_half_applied_allocation all pass. Mutation check test_mut_b13_no_poison (poisoning removed) makes the poison test fail.",
+   "residual_risk": "test_review6_caught_guard_error_* no longer exercises the manual-split write path, because water-fill pre-splits fills. The general poisoning test pins the protection."
+  },
+  {
+   "id": "B-14",
+   "status": "FIXED",
+   "evidence": "record_order_evidence raises ValueError for final=True (store.py:2551-2553) and always writes final=False (store.py:2565). venue_final is set only by _apply_order_row inside apply_history_batch (store.py:3406), with inbox, dedupe and payload-conflict checks. The engine calls record_order_evidence(tx, row, final=False) only for active orders (engine.py:1663). Test ::test_review11_non_history_row_can_never_be_terminal_proof: final=True raises, the non-final WS row is recorded, TERMINAL is refused as 'unproven', and the reservation is kept. It passes.",
+   "residual_risk": "The operator's audited leg_resolutions in record_manual_reconciliation can still finalise a leg without a history row. This is intended, as an audited path."
+  },
+  {
+   "id": "B-15",
+   "status": "FIXED",
+   "evidence": "_check_cumulative (store.py:3411-3422) now builds the conflict key as CUMULATIVE_EXCEEDS_ORDER:{inbox}:{cid}:{canonical leg.filled}. A further excess after an audited resolution therefore creates a new open conflict. Test ::test_review9_new_excess_after_resolved_cumulative_conflict_is_flagged_again: resolve at filled=4, then an extra trade of 2 gives a new open CUMULATIVE_EXCEEDS_ORDER conflict. It passes. Probe test_probe_b15_same_cumulative_again (an extra trade of 1) also re-flags, and it blocks entries.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "B-16",
+   "status": "FIXED",
+   "evidence": "_validated_allocations raises 'ENTRY intents cannot carry allocations' for any non-TP role (store.py:2797-2798). _intent_preconditions also requires the ENTRY amount to equal cycle.planned_amount (store.py:2750-2753), so a 20-unit glued entry is refused even without allocations. Test ::test_review8_entry_intents_cannot_carry_allocations passes and leaves no legs. Probe test_probe_b16_entry_amount_must_equal_planned passes: prepare_submit with amount 20 is refused, and so is record_intent with dict allocations {1:10}.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "C-01",
+   "status": "FIXED",
+   "evidence": "history.py:654-661: when a key repeats with a different fingerprint in one walk, both versions go to conflicted_keys through _withhold. history.py:481-494: _result skips every key in progress.conflicted_keys and emits rows only when emit_rows=True, which only _finalize (line 724) passes. So in-progress, backoff and _fail results offer no rows. history.py:642-644 also withholds non-terminal inactive rows. InMemoryHistoryCursorView.commit (257-278) raises instead of overwriting a conflicting payload. Tests: SCAN::ConflictWithholdingTest::test_ac40_in_scan_conflicting_trade_duplicate_is_withheld_and_never_committed, ::test_conflict_on_a_later_page_of_a_multi_call_walk_is_never_pre_committed, ::test_ac40_inactive_order_with_contradicting_filled_is_withheld (filled=3 vs 5), ::test_non_terminal_inactive_row_is_withheld, and SCAN::HistoryScannerTest::test_ac12_bad_pagination_makes_history_incomplete (conflicting_duplicate subtest checks the key is absent). All pass. In-process mutant (scratchpad/verify/probe_c_mutants.py) that makes _result ignore conflicted_keys: 7 of 8 targeted tests fail; baseline 0 failures. The engine's _remember_committed and _apply_history (engine.py:1471-1516) commit only result.new_*.",
+   "residual_risk": "Trades attributed to a conflicted order row are still offered when their sum does not exceed the first-seen version's filled amount. They are uncontradicted rows, not guessed quantities, and the engine pauses on conflicts. A key that conflicted in one walk and is served consistently in the next walk is committed then, by design."
+  },
+  {
+   "id": "C-02",
+   "status": "FIXED",
+   "evidence": "history.py:140-145: order_dedupe_key is now (domain, account, market, exact exchange id) and raises HistorySchemaError when the row has no exchange id. history.py:148-164: the client ids stay in order_payload_fingerprint, so a client-id disagreement becomes duplicate_key_payload_mismatch within a scan and committed_payload_mismatch across scans. store.py:384-386 (store key) and engine.py:89/533/1480 (c_order_key) use the same exchange-id identity. lighter_port.py:167-176 forces order_id and order_index to agree, so the key is stable. Test SCAN::ConflictWithholdingTest::test_ac40_same_exchange_order_with_different_client_id_is_conflict asserts equal keys for both rows, an in-scan conflict with nothing offered, and a cross-scan committed_payload_mismatch. SCAN::ConflictWithholdingTest::test_order_row_without_exchange_id_is_schema_error passes too. Reverting to a key that includes the client id breaks the test's assertEqual on the keys.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "C-03",
+   "status": "FIXED",
+   "evidence": "lighter_perpetual_derivative.py:347-359: tracking_states stamps lighter_history_reconciled=True on CID orders, and restore_tracking_states puts marked ids back into _history_reconciled_client_order_ids before calling super. :311-339: _update_orders, _update_lost_orders and _cancel_lost_orders skip CIDs in the set. :478-482: _update_trade_history skips them. :340-345: limit_orders skips them. :367-374: the _execute_cancel guard stops the lost-order cancel path. Legs from saved states without a marker are covered by the launcher: scripts/lighter_robinhood_fixed_neutral_grid.py:177 calls register_durable_cids (executor.py:72-88; transport_cids_of = every leg not in INTENT or REJECTED_UNSENT) in the strategy __init__, which runs before trading_core restores market states (trading_core.py:533-538). The tracker is empty until that restore, so nothing can be polled earlier. Tests: CONN::test_restored_cid_orders_stay_excluded_from_polling_lost_orders_and_resend (JSON save/restore, no status poll, no recentTrades, resend refused, lost-order update and cancel do nothing), CONN::test_engine_can_register_durable_cids_before_polling_starts, and test/controllers/generic/test_neutral_grid.py::test_durable_cids_are_registered_before_polling_and_released_once_final. All pass. Mutants caught: restore ignoring the marker, and an unfiltered _cancel_lost_orders.",
+   "residual_risk": "CIDs restored from a pre-fix saved state without a marker depend on the launcher reading the engine DB. If the DB is missing or unreadable (the error is only logged), those orders fall back to legacy polling, but the engine itself fails closed in that case."
+  },
+  {
+   "id": "C-04",
+   "status": "FIXED",
+   "evidence": "lighter_perpetual_derivative.py:1707-1715: release_history_reconciled_order now only calls stop_tracking_order and never discards the CID from the set. :1631-1636: submit_with_client_id refuses any CID in the process-lifetime set, or in the tracker, with UNKNOWN duplicate_client_order_id_in_flight, so the refusal no longer depends on the 30 s TTL cache. :1649: the CID is added right after start_tracking_order, with no await in between. :478-482: _update_trade_history skips set members, including released orders still in the cache. The docstring was corrected. Test CONN::test_released_cid_is_refused_for_process_lifetime_and_stays_unpolled clears _cached_orders to simulate TTL expiry, then asserts the resend is refused, create_order was awaited only once, and recentTrades was not polled after release. It passes. A mutant where release discards the CID fails it.",
+   "residual_risk": "The guard lasts for the process lifetime only. Across restarts it relies on register_durable_cids and on the engine never re-dispatching SUBMIT_UNKNOWN rows (outside this finding)."
+  },
+  {
+   "id": "C-05",
+   "status": "FIXED",
+   "evidence": "Same fix as C-01, plus the cumulative part. history.py:687-693: _finalize withholds the order of every trades_exceed_order_cumulative conflict and every trade attributed to it, by exchange id or client id. history.py:257-278: the reference commit never overwrites a conflicting payload, and its docstring states that offered rows never include a contradicted key. Tests: SCAN::HistoryScannerTest::test_ac40_trades_exceeding_terminal_order_cumulative_is_conflict (new_orders==[], new_trades==[], last_conflicted_rows counts {orders:1, trades:2}) and SCAN::ConflictWithholdingTest::test_ac40_in_scan_conflicting_trade_duplicate_is_withheld_and_never_committed (size 1 vs 7, then view.commit, committed_payload is None). Both pass. They fail under the no-withholding mutant.",
+   "residual_risk": "The cumulative check compares only rows inside the current walk. Late executions for a terminal order that was committed in an earlier scan and is not re-read in this walk are not withheld by the scanner. The engine's settlement or late-evidence logic (WS-D) has to catch those."
+  },
+  {
+   "id": "C-06",
+   "status": "FIXED",
+   "evidence": "test_lighter_perpetual_history_pagination.py:134-137: the tripwire is now a plain MagicMock(return_value='424242') that does not raise. :418-459: each subtest asserts the exact detail string (for example 'transport_exception: TimeoutError' or 'transport_error: code=21120'), _new_client_order_id.assert_not_called(), create_order.assert_awaited_once() with the original client_order_index, and that a resend is refused without a second create_order. In-process mutant: submit_with_client_id retries with int(self._new_client_order_id()) after a transport exception. The test fails (7 subtest failures); the unmutated baseline passes.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "C-07",
+   "status": "FIXED",
+   "evidence": "Same mechanism as C-03. The exclusion survives restore through the tracking-state marker (lighter_perpetual_derivative.py:347-359) and through the launcher's pre-restore register_durable_cids (scripts/lighter_robinhood_fixed_neutral_grid.py:177; executor.py:72-88). Restored CID orders are therefore never polled per order (:311-322), so they never gather not-found counts and cannot become lost. The lost-order status poll and auto-cancel skip them as well (:324-339), and the cancel path is guarded (:367-374). Tests: CONN::test_restored_cid_orders_stay_excluded_from_polling_lost_orders_and_resend, which injects the order into _lost_orders and asserts no poll and no cancel_order; CONN::test_engine_can_register_durable_cids_before_polling_starts; test_neutral_grid.py::test_durable_cids_are_registered_before_polling_and_released_once_final. All pass. Mutation probes of the restore and lost-cancel filters are caught.",
+   "residual_risk": "Same as C-03: legacy fallback if the launcher cannot read the ledger and the saved state has no marker."
+  },
+  {
+   "id": "C-08",
+   "status": "FIXED",
+   "evidence": "lighter_perpetual_derivative.py:367-374: _execute_cancel returns None for any history-reconciled CID, which covers cancel_all, generic cancel() and the lost-order cancel. :361-365: cancel_all drops those ids from its results. :340-345: limit_orders excludes them. The stop path trading_core.cancel_outstanding_orders (trading_core.py:604-613) only calls connector.cancel_all. No other caller of _execute_order_cancel or _place_cancel exists apart from the filtered _cancel_lost_orders. The stop path instead goes through executor.early_stop, a durable STOP and the engine drain (executor.py:270/338; test_neutral_grid.py::test_launcher_stop_drives_the_engine_drain passes). Test CONN::test_cancel_all_and_generic_cancel_never_touch_cid_orders passes. A mutant without the _execute_cancel guard fails it, because signer.cancel_order gets awaited.",
+   "residual_risk": "A Hummingbot stop that does not go through the launcher's on_stop drain leaves engine orders live on the venue. This is intended (fail-safe) and is documented as open risk 10 in the WS-C trace."
+  },
+  {
+   "id": "C-09",
+   "status": "FIXED",
+   "evidence": "lighter_port.py:235-245: market_is_tradable requires status=='active', a dict market_config, hidden is False and force_reduce_only is False; anything missing or not boolean fails closed. lighter_port.py:303-325: trading_rules() awaits _update_trading_rules(); _format_trading_rules then rebuilds _markets_by_trading_pair wholesale (lighter_perpetual_derivative.py:741-745), so no stale entry survives. It sets supports_limit and supports_post_only from market_is_tradable(raw_info). The engine blocks new exposure when these flags are false (engine.py:1842-1850, 2277-2279). Test PORT::LighterPortTest::test_trading_rules_reflect_market_state_and_fail_closed covers tradable, force_reduce_only, hidden, inactive, a missing market_config, a missing flag and a non-boolean flag, and asserts a refresh on every call. It passes and would fail if the flags were hard-coded True again.",
+   "residual_risk": "The rules are only as fresh as the engine's trading_rules() call cadence. A switch to force_reduce_only between refreshes can still produce UNKNOWN sends until the next refresh."
+  },
+  {
+   "id": "E-01",
+   "status": "FIXED",
+   "evidence": "Web: web/neutral_grid/commands.py:245-250 refuses confirm_baseline with 409 start_required unless views.engine_started(snapshot) is True. views.py:229-240 prefers summary.started, which the engine now publishes at snapshot.py:182. The UI disables the button until an applied Start (app.js:321-324). Engine (defence in depth): engine.py:950-958 requires the enabled/offline_demo gate plus meta.started. START itself needs risk_acknowledged and a 24-hex preview_id (engine.py:845-854). Tests passing at 203e31370: test/web/neutral_grid/test_ngweb_commands.py::test_confirm_baseline_refused_before_start[False/None], which checks nothing is enqueued before Start and a 202 after; test/hummingbot/.../engine/test_ng_engine_review1.py::test_w1_confirm_baseline_requires_an_applied_acknowledged_start and ::test_w1_confirm_baseline_applies_the_enabled_gate.",
+   "residual_risk": "Once meta.started is set it persists across restarts and is not tied to a config fingerprint. A START acknowledged for one config can therefore carry over to a different config set before bootstrap (see E-09). The literal 'confirm before any Start' scenario is closed."
+  },
+  {
+   "id": "E-02",
+   "status": "FIXED",
+   "evidence": "--config was removed from bin/lighter_robinhood_neutral_grid_web.py, and the README shows only --attach-db. In attach mode the config, the B check and the identity come from the committed summary.engine_config (runtime.py:124-135, 253-269), which is parsed strictly with the fingerprint recomputed by core. The engine publishes engine_config at snapshot.py:170. I probed a real Harness engine, the real SQLite store and StoreGateway: the parsed config equals the engine's config, the preview shows Q=20 and grid engine-real-grid, and errors=[]. Tests pass: test_ngweb_attach.py::test_attach_preview_identity_and_baseline_come_from_engine_config (B=330, P range [0,550], wrong B gets 422, correct B gets 202), ::test_attach_engine_config_is_strict[*], test_ngweb_launcher.py::test_config_option_removed_attach_reads_engine_config, ::test_attach_mode_serves_store_and_never_logs_token, and engine test_ng_engine_review1.py::test_w2_snapshot_publishes_engine_config_started_and_runtime_rules_bounds, which round-trips through web runtime.engine_config_from_snapshot.",
+   "residual_risk": "Attach mode fails closed until the engine has committed a snapshot that carries engine_config. That is intended."
+  },
+  {
+   "id": "E-03",
+   "status": "PARTIAL",
+   "evidence": "The in-process host is fixed. host.py:77-90 exposes engine persistence_error and fatal_reason, and views.health_view (views.py:250-271) turns them into the «не зафиксировано» banner. Covered by test_ngweb_health.py::test_in_process_host_reports_engine_persistence_error. Attach mode uses the engine sidecar <db>.health.json (engine.py:746-763; runtime.py:212-242). The engine writes the file only when its status changes, into the same directory as the DB, so the first tick leaves a 'healthy' file behind. Probe scratchpad/verify/probe_e03_sidecar.py ran a real Harness, applied FaultHooks.simulate_disk_full and made the data directory read-only to model a full or read-only filesystem. Result: engine.persistence_error='...SQLITE_FULL...', every sidecar write failed with 'could not be written', and the file still held persistence_error=null from the first tick. health_view then returned known=True, banner=None next to a stale snapshot. The UI therefore shows only STALE, which is the original failure mode. The stale-snapshot «неизвестно» fallback fires only when the file is missing or unreadable, not when it is outdated. The tests (test_ngweb_health.py::test_attach_health_file_error_shown_next_to_stale; engine test_w3_health_sidecar_*) cover only a hand-written error file, or disk-full on SQLite while the sidecar stays writable.",
+   "residual_risk": "Attach mode on a full or read-only filesystem, the headline scenario, still shows no persistence banner. A variant with a writable directory (for example a DB locked only through SQLite) is covered."
+  },
+  {
+   "id": "E-04",
+   "status": "FIXED",
+   "evidence": "runtime.py:150-209 snapshot_market reads runtime_rules.supports_limit and supports_post_only; a missing or non-bool value adds an error and is treated as False. It uses rr.fetched_at and fails closed when rules are older than the engine-published max_age_s or max_age_s is missing, and when the committed snapshot is older than stale_after_s. The engine publishes these fields at snapshot.py:161-168. Preview errors make can_start false, and commands.py:268-270 answers 422 on Start. My real-engine probe: all fields present, supports_* are bools, max_age_s='180.0'. Tests pass: test_ngweb_attach.py::test_attach_market_rules_flags_and_freshness[post-only False, supports_limit unknown, rules too old, no max_age_s, stale snapshot 120 s], ::test_rules_freshness_uses_engine_max_age_not_history_freshness.",
+   "residual_risk": "The mid comes from summary bid/ask and has no separate freshness bound beyond snapshot staleness. That is minor."
+  },
+  {
+   "id": "E-05",
+   "status": "FIXED",
+   "evidence": "gateway.py:152-199 has no scan windows left. It uses the store's indexed exact-text reads: find_orders_by_id on exchange_order_id, order_index or cid; find_fills_by_trade_id; and keyset commands_page/audit_page with id < ? LIMIT ? (store.py:3829-3869; indexes in migrations m0001 orders_by_exchange_id and m0003 fills_by_trade_id/orders_by_order_index). The server paging is in server.py:210-266. Tests pass: test_ngweb_drilldown_store.py::test_more_than_5000_rows_old_trade_and_oldest_journal_rows_reachable, where 6000 newer fills, commands and audit rows are added, the oldest trade is found by its 2^64+1 id, and pages reach id 1 with truncated=false. Also ::test_old_big_ids_found_through_indexed_store_reads, ::test_journal_pages_reach_the_true_end and test_ngweb_truncation.py::test_gateway_calls_indexed_reads_with_exact_types.",
+   "residual_risk": "list_commands with a status filter still reads up to 1000 QUEUED rows, but only for the Start-already-queued guard. That is harmless."
+  },
+  {
+   "id": "E-06",
+   "status": "FIXED",
+   "evidence": "views.py:50-54 for_display now converts Decimal time values (store JSON floats parse as Decimal) and numeric strings under DISPLAY_TIME_KEYS, including 'at' and 'committed_at', to float. server.py:92 applies it to the snapshot served by /api/state. Test passes: test_ngweb_store_gateway.py::test_real_store_snapshot_times_render_as_numbers. It commits a float error 'at' through the real store and asserts that errors[0].at, snapshot.committed_at and freshness.committed_at are floats, so reverting the Decimal branch would fail it.",
+   "residual_risk": "none observed"
+  },
+  {
+   "id": "E-07",
+   "status": "FIXED",
+   "evidence": "ngweb_fakes.FakeGateway.live_clock (ngweb_fakes.py:97-103) re-stamps committed_at on every read, the way a running engine commits. test_ngweb_browser.py:48-55 enables it and waits a deliberate 6 s, longer than stale_after_s=5, before expecting 'Работает'. Without live_clock this is exactly the old failure. It switches live_clock off only for the STALE step. I ran test_ngweb_browser.py::test_browser_truthful_state_security_and_keyboard with real headless Chrome: 1 passed in 13 s, not skipped.",
+   "residual_risk": "This is a test-only fix; the browser tests are skipped when no Chrome binary is found."
+  },
+  {
+   "id": "E-08",
+   "status": "FIXED",
+   "evidence": "test_ngweb_demo_engine.py:183-201 now requires summary.history.lag_s >= 10. It also requires the target entry (by the CID the demo action returns) to stay uncredited during the lag, and to be credited by exactly the lagged qty after history_lag_off. The browser check at test_ngweb_browser.py:231-233 requires >= 10 s. Mutation proof run with an out-of-tree pytest plugin (scratchpad/verify/plug/nolag_plugin.py; worktree unchanged) that made history_lag_on keep a 1 s lag: test_demo_engine_full_operator_flow failed with 'timeout waiting for history lag >= 10 s'. The unmutated test passed in 67 s.",
+   "residual_risk": "I did not mutation-test the browser demo flow separately, though it uses the same >= 10 s threshold."
+  },
+  {
+   "id": "E-09",
+   "status": "PARTIAL",
+   "evidence": "The literal scenario is fixed. The web no longer reads a separate YAML. Preview, preview_id, the B check and engine_identity all come from the snapshot's engine_config (runtime.py:253-269), and the store rejects stale revisions at enqueue and at claim (store.py:3943-3956). Covered by test_ngweb_attach.py::test_attach_preview_identity_and_baseline_come_from_engine_config, and my real-engine probe matched. A variant is still reachable, because the engine never binds the acknowledged START to the config it runs. engine.py:845-883 validates only the format of preview_id and stores meta.start_preview_id without ever comparing it. meta.started persists across restarts, and a pre-bootstrap config change is accepted. Probe scratchpad/verify/probe_e_restart_cfg.py: START applied for a Q=10 config, restart with Q=20 and caps of 2000 before bootstrap, and the snapshot still says started=True. Web confirm_baseline is then allowed (commands.py:245 checks only engine_started), and CONFIRM_BASELINE with B=0 was APPLIED and bootstrapped the Q=20 grid. The operator's risk acknowledgement covered a different grid.",
+   "residual_risk": "The engine trades a grid whose preview and risk were never acknowledged, whenever the config changes between an applied START and CONFIRM_BASELINE. Fix: record the config fingerprint at START and reset or refuse started/CONFIRM_BASELINE on a mismatch, or have the web refuse confirm when the applied START's preview material differs from the current engine_config."
+  },
+  {
+   "id": "E-10",
+   "status": "FIXED",
+   "evidence": "The YAML loader path (grid_config_from_mapping/load_grid_config) no longer exists in web/ or bin/, and --config is rejected by argparse (test_ngweb_launcher.py::test_config_option_removed_attach_reads_engine_config). runtime.py:71-121 grid_config_from_engine_json requires every GridConfig field and rejects unknown keys, float decimals, non-int ints and non-bool bools, with no defaults. runtime.py:133 checks the fingerprint against core grid.config_fingerprint. Tests pass: test_ngweb_attach.py::test_attach_engine_config_is_strict[missing config, missing account_index, unknown key, fingerprint mismatch, float order_amount_base], each giving a preview error, can_start false, Start 422 and nothing enqueued. Also ::test_engine_config_parser_direct, and the engine W2 test parses the real engine snapshot through the web parser.",
+   "residual_risk": "none observed; account_index now comes from the engine's own published config"
+  },
+  {
+   "id": "E-11",
+   "status": "FIXED",
+   "evidence": "Same fix as E-05. Indexed exact-string lookups (store.find_orders_by_id / find_fills_by_trade_id), keyset commands_page and audit_page (id < before_id LIMIT <= 1000), and next_cursor computed from limit+1 rows (server.py:216-217, 264-265), so paging reaches the true end. truncated is always false and no longer means silent truncation. Tests pass: test_ngweb_drilldown_store.py::test_more_than_5000_rows_old_trade_and_oldest_journal_rows_reachable (end-to-end over the web API on a real store with more than 5000 newer rows, reaching the oldest id 1), ::test_journal_pages_reach_the_true_end and ::test_old_big_ids_found_through_indexed_store_reads.",
+   "residual_risk": "none observed"
+  },
+  {
+   "id": "E-12",
+   "status": "FIXED",
+   "evidence": "runtime.py:177-200 passes the snapshot's supports_limit and supports_post_only through, adding an error when either is missing. MarketContext.fetched_at is rr['fetched_at'], not committed_at. The rules are marked stale when now - fetched_at exceeds the engine-published max_age_s. The engine publishes supports_*, fetched_at and max_age_s (snapshot.py:161-168), and False flags reach core validate_config, which produces the post-only error. Tests pass: test_ngweb_attach.py::test_attach_market_rules_flags_and_freshness[(True, False) -> 'post' error, can_start false], ::test_attach_rules_fetched_at_is_the_rules_time_not_snapshot_time (rules 4 s older than the snapshot; preview rules_fetched_at equals rr.fetched_at). My real-engine probe showed rules_fetched_at=1790000000.0 against committed_at=1790000004.0.",
+   "residual_risk": "none observed"
+  },
+  {
+   "id": "D1-01",
+   "status": "FIXED",
+   "evidence": "Checked at HEAD 203e31370. engine.py:1574-1578 stamps `_cell_fill_commit_ms[cell]` with self.clock() after the history commit. engine.py:2111-2116 (`_tp_candidates`) starts the SLO clock at the commit of the fill that made the obligation dispatchable, so a below-minimum fill is not the anchor. engine.py:2202-2216 commits every router-approved TP intent before any transport is awaited. engine.py:2217-2223 sends TP transports first, then withdrawals, resumed intents, cancels (OUTSIDE_BOUNDS included) and entries. engine.py:2386-2388 measures latency at the actual durable commit. Tests: test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine/test_ng_engine_review1.py::test_r01_every_tp_intent_commits_within_slo_although_each_transport_takes_time, ::test_r01_tp_transports_are_sent_before_entry_cancels, ::test_r01_slo_clock_starts_when_the_obligation_becomes_dispatchable. All pass. I reverted each fix at runtime in scratchpad/verify/test_mutations.py and every mutation made its test fail: (a) dispatch after each commit gives delays [0..4400] ms; (b) cancels before TPs puts the cancels first; (c) anchoring to the first fill gives a latency of 60.0 s.",
+   "residual_risk": "The clock starts at the cell's latest fill commit. An obligation that becomes dispatchable with no new fill reports latency counted from that fill, not from the moment it became dispatchable. Examples: a TP_ACCUMULATING remainder released when the entry finalizes, or a cleared latch or blocker. This works as queue age by design. `_reread_position_for_release` (engine.py:1384) awaits one position read between the fill commit and the TP intent commit; that time is measured honestly, not hidden."
+  },
+  {
+   "id": "D1-02",
+   "status": "PARTIAL",
+   "evidence": "Checked at HEAD 203e31370. engine.py:124 now blocks TPs engine-wide only for CID_ALLOCATION and CONFIG_MISMATCH. engine.py:1928-1958 (`_scoped_tp_blocks`) limits HISTORY_CONFLICT and LEDGER_INVARIANT blocking to the affected cells, applied at engine.py:2084-2086. engine.py:2153-2158 plus 2123-2135 keep risk-reducing cancels (OUTSIDE_BOUNDS, cancel retries, unsent cancels) flowing while TPs are blocked. Tests test_ng_engine_review1.py::test_r02_one_cells_history_conflict_does_not_withhold_other_cells_tps_or_risk_cancels and ::test_r02_ledger_invariant_freeze_keeps_tps_of_exact_cells_and_outside_bounds_cancels pass. Both runtime mutations make them fail: putting LEDGER_INVARIANT back in `_FREEZES_BLOCKING_TP`, and a global HISTORY_CONFLICT TP blocker. The finding's own example still reproduces, though. Probe scratchpad/verify/test_probe_d102.py makes the active-orders row of cell A's entry contradict its leg (initial_base_amount 11 != 10). `record_order_evidence` then raises InvalidTransitionError in `_reconcile_active` (engine.py:1663) on every tick. The tick is caught at engine.py:737-743 before `_act` (engine.py:729), which never runs: `_reload` resets `_active_reconciled_at`, so the same row raises again. Result: cell B's 10 fill was committed but B had no TP after 15 ticks, and the outside-bounds move gave 0 cancels over 8 ticks, with the engine FROZEN and STORE_REFUSED every tick. r02 only covers a one-time refusal (refuse_once).",
+   "residual_risk": "A refusal that recurs every tick withholds every cell's TPs and every outside-bounds or risk-reducing cancel until an operator acts, which is the finding's own example. Any persistent StoreError or LedgerError raised in `_scan_history`, `_reconcile_active`, `_settle` or `_detect_drift` does the same. No test pins the recurring case."
+  },
+  {
+   "id": "D1-03",
+   "status": "FIXED",
+   "evidence": "Checked at HEAD 203e31370. engine.py:1362-1370 (`_read_position`) records request time and causal sequence before the await. engine.py:1575-1576 bumps `fills_commit_seq` after a history commit that has new fills. engine.py:1372-1375 (`_position_fresh_for_ledger`) needs position_seq > fills_commit_seq, and `_detect_drift` (engine.py:1775-1779) skips drift judgement otherwise. engine.py:1384-1395 re-reads the position after the commit when a release waits only on condition (5). Tests test_ng_engine_review1.py::test_r03_position_read_before_the_same_ticks_history_commit_is_not_drift and ::test_r17_release_needs_a_position_read_after_the_closing_fill_commit pass. Runtime mutation (drift judged on any fresh position, ignoring seq) makes r03 fail with exactly 'position drift: venue 25 outside ledger reachable [-25, 15]'.",
+   "residual_risk": "When every poll tick also commits a new fill, drift comparison waits for a later read. Only a waiting release triggers an extra read, so detection of real drift can be delayed in a sustained busy market. The fix does not cover a venue position endpoint that lags the trades endpoint."
+  },
+  {
+   "id": "D1-04",
+   "status": "FIXED",
+   "evidence": "Checked at HEAD 203e31370. engine.py:1309-1332 charges the rules read before the attempt and backs off exponentially on failure (`_rules_retry_at`; rules_retry_initial_s 2 s to rules_retry_max_s 60 s, data_types.py:44-45). The read only runs while one page of each history stream plus one account poll still fit the budget (reserve), and within `_rules_allowance` (engine.py:1354-1360; about 600 weight/min, 2 reads/min, with poll 5 s). Test test_ng_engine_review1.py::test_r04_failing_rules_refresh_backs_off_and_does_not_starve_history passes: at most 12 rules calls and at least 20 trade pages in 120 s. Runtime mutation removing both backoff and allowance makes it fail with 42 rules calls.",
+   "residual_risk": "Reverting only the backoff does not fail r04, because the allowance alone caps rules reads under the test cadence. The backoff is therefore not pinned on its own; it matters with a longer poll_interval_s, where the allowance is large."
+  },
+  {
+   "id": "D1-05",
+   "status": "FIXED",
+   "evidence": "Checked at HEAD 203e31370. engine.py:2346-2347 stores `arming_min_tp` (the minimum at arming time) with the entry intent. engine.py:2104-2110 (`_tp_candidates`) keeps a TP smaller than that minimum undispatched while the entry is live and shows the TP_ACCUMULATING blocker, so it accumulates inside the cell's reservation. Aggregate (allocation) items only arise after entries are final. Test test_ng_engine_review1.py::test_r05_runtime_minimum_decrease_never_emergency_cancels_other_cells_entries passes. Runtime mutation `_arming_min -> None` makes it fail with ['SLOT_EMERGENCY_TP_PRIORITY:tp:3:1:0'].",
+   "residual_risk": "Entries created before this version have no arming_min_tp and keep per-fill dispatch (acknowledged in the ws-d trace). Other runtime rule changes are not covered, for example a max_base decrease that splits a TP into more chunks than were reserved."
+  },
+  {
+   "id": "D1-06",
+   "status": "FIXED",
+   "evidence": "Checked at HEAD 203e31370. Off-tick grid prices are blocked in planning before any intent or CID: engine.py:1992 (`_idle_eligibility`), 2089-2098 (TP, keeps queue age) and 2009-2018 (`_off_tick`). The TP quantity pre-check runs in planning (engine.py:2100-2103). Pre-send and definitive venue rejects latch the cell and role (engine.py:2028-2044 `_latch`, 2393-2399, 2411-2412). A PRESEND latch holds until the rules or config fingerprint changes. A venue reject gets one immediate retry (AC-56), then backs off from 30 s up to 3600 s (`_latched`, engine.py:2051-2065). The blocker is visible per cell. Tests test_ng_engine_review1.py::test_r06_off_tick_prices_latch_a_blocker_instead_of_dead_legs_every_tick and ::test_r06_definitive_venue_reject_is_latched_with_backoff_not_resent_every_tick pass. Runtime mutations make them fail: no latch and no off-tick check gives 30 REJECTED_UNSENT legs; no latch gives 63 venue sends in 60 s.",
+   "residual_risk": "Off-tick blocking and the PRESEND latch are redundant defences, so each test fails only when both are reverted. A STORE_REFUSED_INTENT is re-attempted every tick, but it rolls back and consumes no CID."
+  },
+  {
+   "id": "D1-07",
+   "status": "PARTIAL",
+   "evidence": "Checked at HEAD 203e31370. engine.py:678-681 (`wake`) skips trade ids already in `_committed_trade_ids`. engine.py:1428-1431 expires client-id-only labels after a complete walk that started after them. engine.py:1471-1478 pops labels on commit. Test test_ng_engine_review1.py::test_r12_ws_signal_for_an_already_committed_trade_is_not_history_lag passes, and both runtime mutations (no committed check; no cid-label expiry) make it fail. Trade-id labels, however, never expire unless this engine commits that row. executor.py:358-364 forwards every connector OrderFilledEvent to `wake` with no trading-pair filter (ExecutorBase registers listeners for the whole connector). Probe scratchpad/verify/test_probe_d107.py sends one trade-id signal that this engine never commits, like another pair's fill: after 120 ticks with history_complete=True, history_lag_s = 120.0 and snapshot lag_s = 119.0, both still growing. `_audit_evidence_unsettled` also refuses baseline audits permanently ('1 WS trade signal(s) not yet in committed history').",
+   "residual_risk": "A fill event of another trading pair on the same connector produces the same permanent false lag and also blocks baseline audits forever. So does a restart replay of a trade older than the 5000-row committed cache and the scan overlap. The finding's second remedy (expiry after a covering complete walk) was applied only to client-id labels."
+  },
+  {
+   "id": "D1-08",
+   "status": "FIXED",
+   "evidence": "Checked at HEAD 203e31370. In engine.py:2191-2200, each BLOCKED router action sets `cell_blockers[cell] = action.reason` and records `meta.risk_blocked[tp_key] = reason`. The RISK_BLOCKED freeze detail lists every `tp:<cell>:<gen>:<i>=reason`, and `ack_risk_blocked` clears it (engine.py:1251-1255). The snapshot shows the per-cell blocker and freezes (snapshot.py:58, 173). Test test_ng_engine_review1.py::test_r13_risk_blocked_tps_name_their_cells_and_every_reason passes. Runtime mutations make it fail: dropping the cell-blocker line gives (2, {}); keeping only the first reason shows only 'tp:2:1:0=...'.",
+   "residual_risk": "The freeze detail string is cut at 1900 chars when many obligations are blocked; per-cell blockers are still complete. Stale entries in `risk_blocked` stay until the operator acknowledges them (intended)."
+  },
+  {
+   "id": "D1-09",
+   "status": "FIXED",
+   "evidence": "Checked at HEAD 203e31370. `_settle` (engine.py:1726-1735) now calls `can_release(self._position_reconciled_now(now))`. That check (engine.py:1377-1382) needs venue position == ledger P on a read requested after the latest fill commit, with no store blockers. Test test_ng_engine_review1.py::test_r14_release_waits_until_the_account_position_equals_the_ledger passes: venue off by 1 inside [P_min, P_max] gives no release and no new entry for 20 ticks, and the cell re-arms at gen+1 once the venue agrees. Runtime mutation `_position_reconciled_now -> bootstrapped` (release ignores condition 5) makes r14 fail.",
+   "residual_risk": "r14 runs within the 30 s position-gap grace. A longer mismatch also raises the global POSITION_UNRECONCILED entry blocker, which r14 does not exercise."
+  },
+  {
+   "id": "D1-10",
+   "status": "FIXED",
+   "evidence": "The test at test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine/test_ng_engine_ops.py:230-260 (test_status_states_are_honest_during_bootstrap_and_reconcile) was rewritten. It sets max_scan_pages_per_tick=1, restarts, injects 100 own fills (more than one scanner page), ticks once and asserts state == RECONCILING, a resumable walk and zero new submits. It then asserts state != NORMAL on every tick while the walk is still resumable, and NORMAL only after history_complete and startup_reconciled. The hasattr tautology is gone (grep finds no match). The test passes at 203e31370. I tried two in-memory mutations through a scratch plugin (scratchpad/verify/ngmut.py). Both kill it at line 249: (a) _evaluate_state returns NORMAL instead of RECONCILING, which fails with (NORMAL, [...'RECONCILING']); (b) an in-progress walk sets history_complete=True, which fails with (NORMAL, []).",
+   "residual_risk": "None significant. The test covers only the restart-with-backlog path. The first-bootstrap RECONCILING path is covered only by the BOOTSTRAPPING assertions."
+  },
+  {
+   "id": "D1-11",
+   "status": "PARTIAL",
+   "evidence": "Stop branch: engine.py:2144-2150 now adds legs in CANCEL_PENDING that still have a PENDING CANCEL outbox row (_pending_cancel_outbox, line 2120). store.record_cancel_intent returns the open row (store.py:2916-2919), and mark_dispatching then works without a resend. This is pinned by test_ng_engine_review1.py::test_r07_stop_drain_dispatches_a_committed_but_unsent_cancel (line 351, crash at after_cancel_intent_commit). The test passes. Reverting the stop-branch clause makes it fail with 'condition not reached in 60 ticks; state=STOPPING'. Non-stop branches: _risk_reducing_cancels (engine.py:2134-2135, RESUME_PENDING_CANCEL) is used by both the tp_blockers branch (2153-2158, only when startup_reconciled and no PERSISTENCE_FAILURE) and the normal path (2159). My scratch probes pass at HEAD for both: an outside-bounds cancel crashed after its intent commit, in normal state and under a MARKET_NOT_TRADABLE TP blocker, is dispatched and the venue order is gone. However, the mutation that removes the RESUME_PENDING_CANCEL clause survives all 171 tests in test_ng_engine_crash/review1/review2/cycles/ops/risk. Under that mutation both of my probes fail and the order stays open.",
+   "residual_risk": "The tp_blockers branch named in the finding is fixed in code, and so is the normal path, because resuming a PENDING cancel moved out of _resume_pending_intents. No committed test pins either path, so a regression there would leave a committed-but-unsent cancel resting on the venue outside a STOP. The blocked branch also waits for startup_reconciled after a restart."
+  },
+  {
+   "id": "D1-12",
+   "status": "FIXED",
+   "evidence": "engine.py:1256-1271. resolve_unknown_submit now requires history_complete, fresh history and no terminal row, and then calls _absence_not_proven (engine.py:1274-1290). That check rejects the command unless all of these hold: the active list is not None; active_at, stamped at request time (line 1346-1349), is later than the latest SUBMIT dispatched_at_ms; now - active_at is within history_freshness_s; and the last complete walk started after the dispatch. The check `any(... for r in self.active_rows)` runs only after this gate. When a fetch fails, active_rows is set to None (line 1351). When a poll is skipped for budget, the old active_at predates the dispatch. Both tests pass: test_r08_resolve_unknown_submit_is_refused_without_an_active_list (review1:375) and test_r08_..._with_an_active_list_older_than_the_dispatch (review1:391). I tried a mutation that removes the gate and restores `(self.active_rows or [])`. It kills both tests: the first ends APPLIED instead of REJECTED, the second resolves as 'not_landed' while the TP is still open.",
+   "residual_risk": "The freshness bound and the walk-after-dispatch clause are not pinned on their own. Both r08 tests are already refused by the None and predates-dispatch checks. Proving absence still depends on the venue's active list being complete."
+  },
+  {
+   "id": "D1-13",
+   "status": "FIXED",
+   "evidence": "engine.py:2479-2502. _finish_stop returns STOPPED or STOPPED_WITH_INVENTORY only when there are no open legs, history_complete holds and _position_fresh_for_ledger(now) holds: position not None, not stale, and position_seq > fills_commit_seq. Inventory is true if any cycle has E != X or dust, if position.net_base != 0, or if effective_baseline != 0. Otherwise the outcome stays STOPPING, or becomes STOP_UNCERTAIN on UNKNOWN legs or after timeout. STOP_UNCERTAIN is not in STOPPED_OUTCOMES (engine.py:130). test_r09_stop_is_never_stopped_with_an_unknown_position_and_counts_the_baseline (review1:411; B=330, account endpoint failing) passes. Two mutations kill it: a full revert, and dropping only the freshness requirement. Both produce STOPPED_WITH_INVENTORY while the position is unknown.",
+   "residual_risk": "The effective_baseline != 0 clause is not pinned on its own: removing just that clause leaves r09 passing, because the fresh venue position of 330 already flags inventory. It only matters when a fresh position is 0 while B != 0, which is a drift case. The finding's scenario (unknown position leading to STOPPED) is blocked by the freshness requirement, and that requirement is pinned."
+  },
+  {
+   "id": "D1-14",
+   "status": "FIXED",
+   "evidence": "engine.py:634-640 with _LOOKBACK_STATES at engine.py:127-128. oldest_unresolved_ms now returns the minimum intent_ms only over non-final legs that are SUBMIT_UNKNOWN, TERMINAL_UNKNOWN, CANCEL_PENDING or CANCEL_UNKNOWN, or that have a committed terminal row awaiting settlement. Proven-LIVE resting orders no longer pull the scanner boundary back. The scanner uses this value as an anchor through _CursorView.oldest_unresolved_ms (engine.py:264) in history._begin (history.py:460-476). test_r10_proven_live_orders_do_not_extend_the_history_lookback (review1:430) passes: the value is None when every leg is LIVE, and equals the intent of the single SUBMIT_UNKNOWN TP otherwise. Restoring the minimum over all non-final legs makes it fail at line 436.",
+   "residual_risk": "The docstring assumes a LIVE order produces only new-dated rows. The FakeExchange dates inactive-order rows by updated_ms. If the real Lighter 'timestamp' on a terminal order row is the creation time, the terminal row is found only after active-list absence moves the leg to TERMINAL_UNKNOWN and so re-enables the lookback. That is safe but adds a poll of delay and is untested with creation-dated rows. A SUBMIT_UNKNOWN left unresolved for a long time still extends every walk, as the suggested fix intends."
+  },
+  {
+   "id": "D1-15",
+   "status": "FIXED",
+   "evidence": "engine.py:1648-1656 and 1579-1582. For a CID whose exact terminal row is already committed (it is in terminal_rows), _reconcile_active never calls record_order_evidence. The row is skipped when active_seq < terminal_commit_seq[cid]. A newer active row for a final leg raises manual reconciliation, and one for a non-final leg is ignored. Active reads are stamped with a causal seq at request time (line 1346-1349), and terminal commits take a later seq (line 1580-1582). terminal_commit_seq is not reset by _reload, so a reload cannot loop back into a refusal. test_r11_active_row_older_than_the_terminal_commit_is_ignored_not_a_store_refusal (review1:451; the rest of the fill lands between the poll and the history read) passes. Removing the terminal_rows block kills it with the original InvalidTransitionError 'cumulative filled regressed 10 -> 3; final order row changed'.",
+   "residual_risk": "Low. Only a terminal-row commit updates venue_filled from history, so an active row that is stale only relative to trade commits cannot trigger the regression check."
+  },
+  {
+   "id": "D1-16",
+   "status": "PARTIAL",
+   "evidence": "engine.py:737-744: the StoreError/LedgerError handler now also records FREEZE_INVARIANT in _sticky_freezes. _reload (engine.py:544-560) re-applies it and persists engine_meta in its own transaction. Only ack_history_conflict removes it (engine.py:1221-1227). test_r16_ledger_invariant_freeze_survives_reload_and_restart_until_acknowledged (review1:544) passes, and removing the sticky line makes it fail at line 557. The original scenario (the next tick's reload drops the freeze) is fixed. My scratch probe test_probe_d116_freeze_after_immediate_crash_restart covers a remaining gap. It triggers the refusal, then calls crash_restart() before any further tick. The freeze is lost: the output was 'freezes after immediate crash: {} EngineState.NORMAL'. The freeze is persisted only by the next tick's _reload, never in the except handler.",
+   "residual_risk": "If the process dies or restarts within the roughly one-tick window after a store or ledger refusal, the LEDGER_INVARIANT freeze disappears without an operator ack. The engine can return to NORMAL unless the refusal recurs deterministically. The suggested alternative, persisting the freeze in its own transaction inside the handler, would close this window."
+  },
+  {
+   "id": "D1-17",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1726-1728: _settle now recomputes reconciliation through _position_reconciled_now (engine.py:1377-1382). That requires a fresh position requested after the latest fill commit (position_seq > fills_commit_seq), equality with the ledger P, and no store_entry_blockers. _reread_position_for_release (engine.py:1384-1395, called at line 724 after _scan_history) re-reads the position when a cell waits only on condition (5). test_r17_release_needs_a_position_read_after_the_closing_fill_commit (review1:251) and test_r03 (review1:208) pass. r17 fails only when both parts are reverted (the settle recompute and the re-read): (6, 6, Decimal('0')). Reverting only the _settle line the finding names, so that it uses the previous tick's position_reconciled flag, survives all 115 tests in review1/review2/cycles/ops/risk/history. My scratch probe test_probe_d117_unmatched_manual_trade_in_release_tick_blocks_release covers the manual-trade variant from the finding. An unmatched manual trade executes after the account read and is committed by the same tick's history walk. At HEAD there is no release, blocked by 'unmatched account trade(s)'. Under the _settle-only revert, the cell is released in exactly that tick.",
+   "residual_risk": "The fix is correct in code, but the exact mechanism the finding names (release on the previous tick's flag) is not pinned. Neither is the unmatched-manual-trade variant, nor a re-read skipped by the weight budget. A regression in _settle alone would pass the committed suite and allow a premature NG-CELL-001 release."
+  },
+  {
+   "id": "D2-01",
+   "status": "PARTIAL",
+   "evidence": "Fix: executor.py:250-271 (_track_stop re-sends STOP with a new key and fresh revisions on CONFLICT/REJECTED; _stop_command_sent is set only when APPLIED). scripts/lighter_robinhood_fixed_neutral_grid.py:50 and 216-255: the drain now waits stop_uncertain_after_s+30 = 150 s and reports the committed outcome (STOP_NOT_APPLIED / STOPPING / the committed outcome). Test test/controllers/generic/test_neutral_grid.py::test_a_hummingbot_stop_is_resent_after_a_conflict_until_the_engine_applies_it passes. A mutation that restores the old no-re-send behaviour makes it fail (no APPLIED stop row). The CONFLICT scenario is fixed and pinned. Variant still reachable: _send_stop records the key before enqueue (268-271), and _track_stop treats a missing row (record None, 258-260) the same as QUEUED. Probe scratchpad/verify/probe_d201.py forced one failed STOP insert (FaultHooks.fail_statement('INSERT INTO commands', OperationalError('database is locked'))). early_stop then raised PersistenceError, which would also raise out of orchestrator.execute_actions in the drain. For the next 200 ticks the engine stayed NORMAL with 10 owned orders live, there was no STOP row, and the STOP was never re-sent. stop_requested_ms stayed None.",
+   "residual_risk": "If the STOP insert fails once (SQLITE_BUSY from the web command client past its 5 s busy timeout, disk full, or an I/O error), the Hummingbot stop is lost for good. The engine keeps trading. The drain times out as STOP_NOT_APPLIED, but its log still says orders are 'reconciled on the next start', and the next launcher START resumes normal trading. Suggested fix: re-send when the tracked key has no row, or enqueue before recording the key and retry on exception."
+  },
+  {
+   "id": "D2-02",
+   "status": "FIXED",
+   "evidence": "engine.py:2144-2152: the stop branch of _act now also cancels legs in CANCEL_PENDING that have a PENDING CANCEL outbox row (_pending_cancel_outbox, 2120). The blocked (tp_blockers) branch gets the same through _risk_reducing_cancels (2123-2135, RESUME_PENDING_CANCEL). store.record_cancel_intent returns the existing open row, so this is safe to repeat (store.py:2916-2919). A crash after mark_dispatching leaves the leg CANCEL_UNKNOWN, which _cancel_retry_due already handles. Test test_ng_engine_review1.py::test_r07_stop_drain_dispatches_a_committed_but_unsent_cancel passes. With _pending_cancel_outbox forced to False (scratch pytest plugin mutation) it fails: 'condition not reached in 60 ticks; state=STOPPING'.",
+   "residual_risk": "None found for this path."
+  },
+  {
+   "id": "D2-03",
+   "status": "FIXED",
+   "evidence": "engine.py:1985-2000: _idle_eligibility checks the reject latch and _off_tick(entry_price) (line 1992) before any open_cycle, CID or intent, and sets a visible cell blocker. engine.py:2071-2118: _tp_candidates checks the latch, _off_tick(tp_price) (line 2090) and _qty_blocker in planning, keeps the obligation's queue-age clock and stores the blocker. A PRESEND latch (2051-2065) waits for a rules/config fingerprint change. Tests test_ng_engine_review2.py::test_c_off_tick_prices_are_durable_visible_blockers_without_any_intent_or_cid and test_ng_engine_review1.py::test_r06_off_tick_prices_latch_a_blocker_instead_of_dead_legs_every_tick pass. The mutation _off_tick -> None fails test_c (12 legs instead of 11: an intent was created). test_r06 still passes under that mutation because of the latch.",
+   "residual_risk": "Idle eligibility checks the tick only for the entry price, not the paired TP price. Probe scratchpad/verify/probe_d203.py: with tick 0.0007, the engine re-armed a new SELL entry at on-tick 5.6 whose TP 5.5 is off-tick. After the fill the TP is visibly blocked (PRICE_NOT_ON_TICK:5.5@0.0007) with no churn (leg count stable over 30 ticks). So new exposure can still open with a known-unplaceable exit. The suggested fix asked for TP-tick validation in admission as well."
+  },
+  {
+   "id": "D2-04",
+   "status": "PARTIAL",
+   "evidence": "engine.py:733-744: the except path records the LEDGER_INVARIANT freeze in _sticky_freezes. _reload (544-560) re-applies it and persists engine_meta. Only ack_history_conflict clears it (1234-1236). Test test_ng_engine_review1.py::test_r16_ledger_invariant_freeze_survives_reload_and_restart_until_acknowledged passes, and fails when the mutation clears the sticky freezes before reload. Probe scratchpad/verify/probe_d204.py made _reconcile_active raise StoreError on every tick. The freeze is now kept in memory (FROZEN) and in durable engine_meta, and no entries are sent (0 submits). However: committed engine row engine_state=NORMAL, committed snapshot engine_state=NORMAL, and format_status prints 'state NORMAL' with no reason. Only a SNAPSHOT STALE tag appears after 15 s. The health sidecar covers only persistence/fatal errors.",
+   "residual_risk": "The second half of the finding is still reachable: while the refusal recurs every tick, no FROZEN state or snapshot is ever committed (no set_engine_state in the except or _reload path). Web and CLI keep showing the last committed NORMAL state."
+  },
+  {
+   "id": "D2-05",
+   "status": "FIXED",
+   "evidence": "engine.py:2479-2503 (line 2484): STOPPED or STOPPED_WITH_INVENTORY is decided only when there are no open legs, history is complete and _position_fresh_for_ledger holds (1372-1375: a known, non-stale position requested after the latest fill commit). position.net_base != 0 or effective_baseline != 0 counts as inventory. Otherwise the outcome stays STOPPING, then STOP_UNCERTAIN after the timeout. On a restart with the position endpoint failing, this can no longer produce STOPPED. Test test_ng_engine_review1.py::test_r09_stop_is_never_stopped_with_an_unknown_position_and_counts_the_baseline passes. A mutation restoring the old _finish_stop fails it (outcome 'STOPPED').",
+   "residual_risk": "After a restart with the position unknown, an earlier STOPPED_WITH_INVENTORY is downgraded to STOPPING or STOP_UNCERTAIN until a fresh read. This is conservative, not dishonest."
+  },
+  {
+   "id": "D2-06",
+   "status": "FIXED",
+   "evidence": "controllers/generic/neutral_grid.py:50-52, 106-108 and 122-125: the default db_path is None, and the executor resolves the store's per-account/market path (executor.py:43-50 engine_db_path). The launcher's MIGRATE phrase (scripts/lighter_robinhood_fixed_neutral_grid.py:63-65, 121, 187) leads to open_engine(allow_grid_migration=True) (engine.py:202-236). The engine then stays frozen (CONFIG_MISMATCH) until the executor's _maybe_migrate (executor.py:284-307) sends the audited migrate_grid, handled by _cmd_migrate_grid (engine.py:1178-1210): quiescence check, new grid id, fresh rules, store.migrate_grid. Tests passing: test_ng_engine_review2.py::test_e_quiescent_grid_is_migrated_by_an_audited_command_keeping_old_cycles, ::test_e_migration_is_refused_while_the_old_grid_has_obligations, test/controllers/generic/test_neutral_grid.py::test_e_controller_default_database_is_per_account_and_market, ::test_b_e_launcher_confirmations_bind_resume_and_migration_to_explicit_phrases. End-to-end probe scratchpad/verify/probe_d206.py: executor g1 stopped (STOPPED); a second executor for g2 (5.1-6.1, migration and resume flags) on the same default DB migrated to g2 and reached NORMAL with 10 orders from 5.1 upward. That probe wrote a git-ignored ledger into <worktree>/data/neutral_grid/ through the default path. I removed it afterwards; git status is clean.",
+   "residual_risk": "No test covers the executor-level wiring end to end (_maybe_migrate, operator_confirmed_migration). A migration requires a new grid_id (NEW_GRID_ID_REQUIRED). A ledger from an older version under a per-grid-id file is not picked up automatically."
+  },
+  {
+   "id": "D2-07",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1056-1070 (line 1059): _audit_evidence_unsettled refuses the audit (AUDIT_EVIDENCE_NOT_SETTLED, retryable) when position_seq < fills_commit_seq, which is the suggested fix. It also refuses on history lag, pending WS signals, no complete walk after the position read, or unresolved orders. Probe scratchpad/verify/probe_d207.py ran the exact scenario: account poll, then a 4 LIT own fill committed before the next poll, then an audit with observed=7. Current code: REJECTED, reason 'position read predates the latest committed fill'. With that single check neutralised, the audit is APPLIED with new_effective_baseline 3 instead of 7. Under the same mutation, test_ng_engine_risk.py, test_ng_engine_review1.py and test_ng_engine_review2.py (74 tests, including test_d_baseline_audit_is_refused_while_an_own_fill_may_be_missing_from_history and test_r13) all still pass.",
+   "residual_risk": "The code path is fixed, but no test pins the finding's scenario (position read older than a committed fill). test_d covers only the reverse case, where history lags the position. Reverting line 1059 would go unnoticed."
+  },
+  {
+   "id": "D2-08",
+   "status": "FIXED",
+   "evidence": "snapshot.py:292-299: format_status now shows the trades and orders cursors, pages read, per-stream walk progress and backoff. Lines 306-309 add 'remaining' per TP child. Test test_ng_engine_review2.py::test_g_cli_status_shows_cursor_progress_and_tp_remaining asserts 'trades cursor', 'orders cursor', 'pages' and 'remaining 6'. It passes, and it would fail on the old renderer.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "D2-09",
+   "status": "FIXED",
+   "evidence": "controllers/generic/neutral_grid.py:53-69: the confirmations are PrivateAttr and only settable through mark_operator_confirmed. ControllerConfigBase inherits extra='forbid' (hummingbot/client/config/config_data_types.py:27). The launcher calls mark_operator_confirmed only after evaluate_launch passes the profile, enabled, phrase and API-key checks (scripts/lighter_robinhood_fixed_neutral_grid.py:97-122, 181-191). Probe scratchpad/verify/probe_d209.py: operator_confirmed_start, _operator_confirmed_start, _operator_resume_stop_ms and operator_confirmed_migration each raise ValidationError, both as kwargs and through model_validate. Test test/controllers/generic/test_neutral_grid.py::test_i_operator_confirmations_cannot_be_loaded_from_yaml passes, and would fail if the fields were restored.",
+   "residual_risk": "NeutralGridExecutorConfig (data_types.py:191-194) still has public operator_confirmed_* fields, so other Python code that builds an executor config directly could set them. That route is code, not YAML."
+  },
+  {
+   "id": "D2-10",
+   "status": "FIXED",
+   "evidence": "test_ng_engine_review2.py:244-265 (test_j_ac12_no_entry_while_history_is_incomplete_and_resumption_after_recovery): drains out of bounds, injects a repeating trades page_error and brings the book back inside so cells are eligible. It asserts no new ENTRY submit on each of 10 ticks while history_complete is False, then that entries resume after recovery. It passes. A mutation that strips the HISTORY_* entry blockers after _evaluate_state fails it (20 entry submits instead of 10).",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "D2-11",
+   "status": "FIXED",
+   "evidence": "test_ng_engine_review2.py:268-286 (test_j_ac42_release_waits_the_full_settlement_delay_at_tick_granularity): sets settlement_delay_s=20, records the tick at which the leg became TERMINAL and asserts that release minus first_terminal_seen is at least 20 and under 26. It passes. A mutation forcing settlement_delay_s=0 in engine.evaluate_terminal_release (call at engine.py:1696-1706) fails it: 1790000028 - 1790000023 = 5 < 20.",
+   "residual_risk": "None found."
+  },
+  {
+   "id": "D2-12",
+   "status": "FIXED",
+   "evidence": "Tests in test_ng_engine_review2.py pass: test_j_ac55_intent_write_failure_sends_nothing (289-305), test_j_ac55_dispatch_mark_failure_sends_nothing (308-325), test_j_ac55_cancel_intent_failure_sends_no_cancel (328-342). Each injects FaultHooks.fail_statement at the outbox INSERT or the DISPATCHED update. Each asserts that the fault actually fired, that no submit or cancel reached the fake, and that the state is DEGRADED with PERSISTENCE_FAILURE, then checks recovery. Three mutations each fail their test: transport after a failed intent commit (11 vs 10 submits), transport after a failed dispatch mark (11 vs 10), and cancel after a failed cancel-intent write (10 vs 0 cancels).",
+   "residual_risk": "The fault pattern 'INSERT INTO outbox' also matches 'INSERT INTO outbox_attempts'. In these scenarios the leg and state assertions show the fault fired at the intended write."
+  },
+  {
+   "id": "D2-13",
+   "status": "FIXED",
+   "evidence": "New exact assertions in test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine/test_ng_engine_review2.py:349 (test_j_ac17_unknown_submit_counts_exactly_in_the_reachable_interval_and_slots: P_min == P - sum of every non-final SELL remainder, including the SUBMIT_UNKNOWN TP's 10, plus slots.actual == number of non-final legs) and :372 (test_j_ac21_cancel_unknown_keeps_the_full_remainder_reachable: P_max == P + every BUY remainder including the CANCEL_UNKNOWN 7, plus slot accounting). Mutation probe: a pytest plugin (scratchpad/verify/mut_unknown.py) patched risk.endpoints_from_ledgers to drop SUBMIT_UNKNOWN/CANCEL_UNKNOWN legs. Under it both J tests FAIL (-50 != 10-70; 33 != 3+37). The legacy crash tests test_ac16_crash_after_dispatch_commit... and test_ac17_timeout_keeps_unknown... still PASS under the mutation. Unmutated: review2 17/17 pass.",
+   "residual_risk": "The legacy weak assertions are still in test_ng_engine_crash.py: line 96 (P_max >= remaining), line 132 (side_rem >= leg.remaining, which still cannot fail) and line 222. The AC-16 crash scenario itself (an ENTRY BUY left SUBMIT_UNKNOWN) has no exact endpoint assertion. It is protected only because the J AC-17 test pins the same SUBMIT_UNKNOWN state on a SELL TP."
+  },
+  {
+   "id": "D2-14",
+   "status": "FIXED",
+   "evidence": "test_ng_engine_ops.py:230 test_status_states_are_honest_during_bootstrap_and_reconcile asserts == RECONCILING after a restart with a backlog above one scanner step (max_scan_pages_per_tick=1), then != NORMAL until the walk completes. The hasattr tautology is gone. test_ng_engine_review2.py:391 test_j_honest_stopping_state_during_a_drain asserts that states[0] is STOPPING and that every drain state is STOPPING, STOPPED or STOPPED_WITH_INVENTORY. The CLI now prints cursors, pages, walk progress and backoff (snapshot.py:296-302), pinned by review2::test_g_cli_status_shows_cursor_progress_and_tp_remaining. Probe (scratchpad/verify/test_probe_d14.py) after a restart with 250 own fills gave RECONCILING, RECONCILING, RECONCILING, NORMAL, and the status line showed 'trades cursor ... | pages {...} | walk resumable (...)'. Targeted runs pass.",
+   "residual_risk": "Only the first tick of the walk is pinned to RECONCILING. Later walk ticks are only asserted != NORMAL, so DEGRADED or PAUSED on those ticks would not be caught. The G test checks the labels only, not the values."
+  },
+  {
+   "id": "D2-15",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1256-1271 resolve_unknown_submit now calls _absence_not_proven (engine.py:1274-1290). It requires an active list requested after the outbox dispatched_at_ms and within history_freshness_s, plus one complete walk that started after the dispatch. review1::test_r08_resolve_unknown_submit_is_refused_without_an_active_list and ::test_r08_..._with_an_active_list_older_than_the_dispatch pin the stale and None cases, and both pass. The suggested settlement predicate was not implemented: no settlement_delay_s, no settlement_scans, no check for a pending WS signal on that CID. Probe scratchpad/verify/test_probe_d15.py: FakeExchange(active_lag_s=7), TP with TIMEOUT_LANDED, operator retries resolve_unknown_submit each tick. It is REJECTED at +1..+5 s and APPLIED at +6 s while the venue order is still open. Leg -> REJECTED_ZERO_FILL, a second TP CID for the same cell goes out (two open TP orders at the venue), and the state is NORMAL until it later turns RISK_BLOCKED 'final order ... is still active on the venue'. Same result with active_lag_s=15.",
+   "residual_risk": "Venue active-list or history lag of a few seconds still lets an audited 'not landed' through, producing a new CID and double exposure for the cell. Needs settlement delay plus N walks started after dispatch+delay, and no pending WS signal, before accepting."
+  },
+  {
+   "id": "D2-16",
+   "status": "FIXED",
+   "evidence": "engine.py:862-871: a START with source=launcher is REJECTED DURABLE_STOP_ACTIVE while meta.stop_requested_ms is set, unless resume_stop_ms equals that stop. executor.py:30-40 launcher_start_payload always sets source='launcher'; resume_stop_ms is set only from the exact 'RESUME <grid_id> AFTER STOP <stop_ms>' phrase (scripts/lighter_robinhood_fixed_neutral_grid.py:114-121, stop_ms read from the ledger). If the ledger read fails, stop_ms=None and the engine still refuses. executor._track_start surfaces the refusal. Drain timeout is now stop_uncertain_after_s + 30 = 150 s (script:50), and the drain log reports the committed durable outcome (_durable_stop_outcome). Tests: review2::test_b_automatic_launcher_start_never_overrides_a_durable_stop, review2::test_b_launcher_resume_must_name_the_durable_stop_it_resumes, CTL::test_b_e_launcher_confirmations_bind_resume_and_migration_to_explicit_phrases, CTL::test_a_drain_reports_the_durable_outcome_and_waits_at_least_the_uncertain_bound. All pass (review2 17/17, test_neutral_grid.py 27/27).",
+   "residual_risk": "An explicit web START still clears a durable STOP (intended: key plus expected revisions)."
+  },
+  {
+   "id": "D2-17",
+   "status": "PARTIAL",
+   "evidence": "The engine now remembers meta.colliding_cid (sticky across reload) at engine.py:2369-2375. The audited action 'retire_colliding_cid' (engine.py:1239-1248) calls store.retire_cid and pops FREEZE_CID in the command transaction. review2::test_f_cid_collision_is_recovered_by_an_audited_retire passes and would fail without the action. The action is in commands.EXTENDED_AUDIT_ACTIONS only, and no product surface can send it: web/neutral_grid/commands.py:37-40,218 accepts only the base AUDIT_ACTIONS ('Недопустимое действие аудита' otherwise), and git grep finds no launcher, bin or controller code that enqueues retire_colliding_cid. The trace itself leaves this as open request R5. The suggested automatic retire of an id already recorded as foreign was not implemented.",
+   "residual_risk": "In a real deployment an operator still cannot clear FREEZE_CID, which blocks every TP, without hand-writing a command row into the SQLite queue (store.enqueue_command from Python). That is audited now, unlike the old engine_kv edit, but there is still no operator path."
+  },
+  {
+   "id": "D2-18",
+   "status": "PARTIAL",
+   "evidence": "engine.py:1028-1033 and 1056-1070: the audit is refused with AUDIT_EVIDENCE_NOT_SETTLED when the position was read before the latest fill commit, when any WS signal is pending or history lag > 0, when no complete walk started after the position read, or when non-LIVE own orders exist. review2::test_d_baseline_audit_is_refused_while_an_own_fill_may_be_missing_from_history (lagging fill with WS signal) passes. Probe scratchpad/verify/test_probe_d18.py reproduces the finding's case with a WS signal: REJECTED. Probe scratchpad/verify/test_probe_d18b.py uses the same scenario, but the own fill arrives without a WS event (fx.fill(..., history_lag_s=30, ws=False)), the only difference. The audit is APPLIED at +9 s with new_effective_baseline=11. After history delivers the fill, P=15 vs venue 11 and the state is still NORMAL. The owned LIVE entry's active row already reported filled_base_amount=4 (recorded as order evidence in _reconcile_active), but _audit_evidence_unsettled does not compare active-row cumulative with ledger fills.",
+   "residual_risk": "A missed or dropped WS event (the spec treats WS as a hint only) still lets the rebase absorb an own fill into B and count it twice. Needs a check that no owned LIVE order's active-row cumulative filled exceeds its history-proven fills (or a settlement delay after the position read)."
+  },
+  {
+   "id": "D2-19",
+   "status": "FIXED",
+   "evidence": "Tick and quantity checks now run in planning, before open_cycle, CID or intent. Entries: engine.py:1985-2000 _idle_eligibility (_latched / _off_tick -> cell_blockers) plus admission FULL_Q_INVALID. TPs: engine.py:2071-2118 _tp_candidates (_latched / _off_tick / _qty_blocker, which also keeps the obligation queue-age clock in meta.obligations). The remaining post-commit refusals (_pre_send_blocker, engine.py:2269-2285: post-only/limit support, etc.) latch as PRESEND until the rules fingerprint changes (_latch/_latched 2028-2065). Tests: review2::test_c_off_tick_prices_are_durable_visible_blockers_without_any_intent_or_cid (no new legs over 200 ticks, durable blocker, queue_age >= 200) and review1::test_r06_off_tick_prices_latch_a_blocker_instead_of_dead_legs_every_tick; both pass. Probe scratchpad/verify/test_probe_d19.py changed tick_size=0.0007, min_base=20, max_base=5 and supports_post_only=False. In every case the leg count stayed constant over 200 ticks and blockers were visible (PRICE_NOT_ON_TICK, BELOW_MIN, FULL_Q_INVALID_ENTRY).",
+   "residual_risk": "Engine state can stay NORMAL while one TP is blocked. The blocker is visible per cell (snapshot, CLI, queue age), not as a global state. A rules change that trips a post-commit-only check can burn one CID per cell/role before the latch holds."
+  },
+  {
+   "id": "D2-20",
+   "status": "FIXED",
+   "evidence": "engine.py:2479-2502 _finish_stop finalises STOPPED or STOPPED_WITH_INVENTORY only when no legs are open, history is complete and _position_fresh_for_ledger holds (known, not stale, requested after the latest fill commit). A non-zero effective_baseline counts as inventory. Otherwise the drain stays STOPPING and becomes STOP_UNCERTAIN after the timeout. review1::test_r09_stop_is_never_stopped_with_an_unknown_position_and_counts_the_baseline passes (B=330, account endpoint failing -> STOP_UNCERTAIN, then STOPPED_WITH_INVENTORY after recovery). Mutation probe scratchpad/verify/mut_stop.py (old logic, no freshness check) makes r09 FAIL.",
+   "residual_risk": "The 'baseline counts as inventory' clause is not independently pinned: in r09 the fresh position is already 330, so inventory is set either way."
+  },
+  {
+   "id": "D2-21",
+   "status": "FIXED",
+   "evidence": "Position reads carry a causal sequence (engine.py:1363-1370 _read_position stamps request-time clock() and _next_seq()). Fill commits bump fills_commit_seq (engine.py:1576, 1127). _detect_drift (1769-1795) skips the comparison unless _position_fresh_for_ledger (1372-1375: position_seq > fills_commit_seq). review1::test_r03_position_read_before_the_same_ticks_history_commit_is_not_drift (racy fake injecting a fill after the position read in the same tick) passes. Mutation probe scratchpad/verify/mut_drift.py (freshness without the seq check) makes r03 FAIL with a false 'position drift ... baseline audit required'.",
+   "residual_risk": "None significant. It relies on the venue position endpoint not lagging behind history, which is the normal direction."
+  },
+  {
+   "id": "D2-22",
+   "status": "FIXED",
+   "evidence": "snapshot.py:296-302 format_status adds 'trades cursor <hw> | orders cursor <hw> | pages {...} | walk resumable/idle (<stream> pages N done=... oldest=...)' plus backoff. review2::test_g_cli_status_shows_cursor_progress_and_tp_remaining asserts these labels and passes. Probe during a RECONCILING walk printed \"trades cursor None | orders cursor None | pages {'inactive_orders': 0, 'trades': 1} | walk resumable (inactive_orders pages 1 done=True ..., trades pages 1 done=False oldest=...)\".",
+   "residual_risk": "The test checks label presence only, not that the values advance."
+  },
+  {
+   "id": "D2-23",
+   "status": "FIXED",
+   "evidence": "scripts/lighter_robinhood_fixed_neutral_grid.py:68-81 validate_profile now requires the caps only to be finite positive Decimals. :84-86 profile_warnings warns when they differ from DEFAULT_CAPS, and the launcher logs those warnings without refusing. CTL::test_h_profile_caps_are_defaults_not_a_product_ceiling (1500 accepted with a warning) and CTL::test_profile_and_confirmation_policy (2000 accepted) pass. No other hardcoded 1000 cap exists in grid/risk/web/controller: the only 1000s are defaults (controllers/generic/neutral_grid.py:39-40, web/neutral_grid/runtime.py:286).",
+   "residual_risk": "None."
+  }
+ ],
+ "critic": [
+  {
+   "title": "Lighter auth token reaches the committed snapshot, /api/state, the web UI and CLI status through the ACTIVE_ORDERS_UNAVAILABLE error text",
+   "file": "hummingbot/strategy_v2/executors/neutral_grid_executor/engine.py",
+   "line": 1350,
+   "requirement": "Handoff/spec forbid secrets in logs, API or UI. Spec §11: \"Секреты и auth token не выводятся\". NG-UI-001 forbids secrets in API responses. NG-UI-002 says the drill-down and audit history must contain no secrets.",
+   "severity": "medium",
+   "failure_scenario": "1. LighterAuth.rest_authenticate (lighter_perpetual_auth.py:26) always adds `auth=<token>` to the query of authenticated GETs. fetch_active_orders (lighter_perpetual_derivative.py, is_auth_required=True) is one of them.\n2. Lighter or a proxy/CDN answers accountActiveOrders with a status below 400 and a Content-Type that is not JSON, text/plain or text/html. Examples: an empty 200/204 with no Content-Type (aiohttp reports it as application/octet-stream), or text/xml.\n3. Hummingbot's RESTResponse.json() then calls aiohttp's json(), which raises aiohttp.ContentTypeError. Its str() is `200, message='Attempt to decode JSON ...', url='https://.../accountActiveOrders?account_index=..&market_id=..&auth=<TOKEN>'`.\n4. ContentTypeError is not an IOError, so it passes through _api_request unchanged. LighterExchangePort.active_orders (lighter_port.py:348) catches only LighterHistoryResponseError, so it passes through there too.\n5. NeutralGridEngine._refresh_account catches it at engine.py:1349-1351: `self._error(\"ACTIVE_ORDERS_UNAVAILABLE\", f\"{type(exc).__name__}: {exc}\", now)`. No redaction is applied.\n6. snapshot.build_summary copies engine.errors into the snapshot (snapshot.py:224). The snapshot is committed to SQLite and served by /api/state (server.py:179 `errors`). app.js renderErrors shows it in the UI. format_status prints the last 5 errors in the CLI `status` (snapshot.py:329-330). executor.get_custom_info also exposes the snapshot to the V2 controller.\nThe token grants read access to the account's private orders and trades for about 10 minutes (DEFAULT_AUTH_TOKEN_EXPIRY_SECONDS). The copy in the SQLite snapshot rows is persisted indefinitely.\nOther history paths only record type(exc).__name__: the scanner's page_fetch_error and the port's submit/cancel. This active-orders path is the gap.",
+   "evidence": "Reproduced offline with scratch test /private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify/test_scratch_auth_leak.py (2 passed).\n(a) LighterExchangePort(stub).active_orders() re-raises the aiohttp.ContentTypeError, and its str() contains `auth=SECRET_LIGHTER_AUTH_TOKEN_abc123`.\n(b) With the real engine harness, fx.active_orders was patched to raise that exception and the engine ran 3 ticks. engine.latest_committed_snapshot()['errors'] then contained `ContentTypeError: 200, message='Attempt to decode JSON with unexpected mimetype: application/octet-stream', url='https://mainnet.zklighter.elliot.ai/api/v1/accountActiveOrders?account_index=4242&market_id=5&auth=SECRET_LIGHTER_AUTH_TOKEN_abc123'`.\nCode: engine.py:1346-1351 (`except Exception as exc: ... self._error(\"ACTIVE_ORDERS_UNAVAILABLE\", f\"{type(exc).__name__}: {exc}\", now)`); lighter_port.py:348-352 (only LighterHistoryResponseError is wrapped); lighter_perpetual_auth.py:24-26 (`params.setdefault(\"auth\", auth_token)`); server.py:179; snapshot.py:224 and 329-330.\nNo redaction: security.redact_text exists but is never applied to engine errors."
+  },
+  {
+   "title": "Scoped TP freeze misses scanner-withheld conflicts: a cell whose committed fill is contradicted still gets a new TP from that quantity",
+   "file": "hummingbot/strategy_v2/executors/neutral_grid_executor/engine.py",
+   "line": 1928,
+   "requirement": "NG-HIST-002 / AC-40: one key with a different payload is a history conflict and pauses; quantity is never guessed. NG-OPS-001: an unknown fill blocks new exposure of the affected cell. The review fix #2 (trace ws-d-engine.md row 2) limits TP blocking to the affected cells via `tp_blocked_cells`.",
+   "severity": "high",
+   "failure_scenario": "Two review fixes combine badly. (1) The history scanner now withholds conflicted keys (history.py:658-667), so the store never records them. (2) `_scoped_tp_blocks` only blocks TPs for cells named by a store `open_conflicts` row with a CID. A payload or committed-payload conflict on an own trade therefore never names its cell. Walk-through: entry fill T1=3 is committed, and the TP is held below the 5 LIT floor. The venue then re-serves T1 with size 1, which is a `committed_payload_mismatch`. The engine goes FROZEN, but `tp_blocked_cells=={}` and there are no store conflicts. A further fill of 2 makes the committed E=5, and a TP of 5 is dispatched and goes LIVE. That TP is built from the contradicted 3. If the venue's corrected value is true, the TP over-closes the cell by 2 LIT and creates unintended net exposure, while the engine reports FROZEN. The store headroom check does not help because it uses the committed E=5.",
+   "evidence": "Scratch probe /private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify/test_probe_ack_conflict.py::test_probe_tp_dispatched_for_cell_with_contradicted_fill prints: `after conflict: EngineState.FROZEN [... 'STORE:manual reconciliation required: history conflict: conflict:committed_payload_mismatch:...']`, `tp_blocked_cells: {} open store conflicts: []`, `E: 5 TPs: [(1099511627787, '5', 'LIVE')] state: EngineState.FROZEN`, `cell blocker: None`. `_scoped_tp_blocks` (engine.py:1928-1941) iterates only `self.open_conflicts` (store rows). `_apply_history` (engine.py ~1580) turns scanner conflicts only into `mark_manual_reconcile_required`, with no cell or CID mapping, even though the withheld row carries `own_client_order_id`."
+  },
+  {
+   "title": "Operator ack_history_conflict cannot restore history completeness for payload conflicts; the grid stays RECONCILING forever and STOP ends STOP_UNCERTAIN",
+   "file": "hummingbot/strategy_v2/executors/neutral_grid_executor/engine.py",
+   "line": 1449,
+   "requirement": "NG-HIST-002 / AC-40 / AC-12: a conflict pauses until an operator audit. The web offers `ack_history_conflict` as that audit, and `_acknowledge_scan_conflicts` documents that audited conflicts 'are not re-flagged, and the walk boundary is rebased'. NG-OPS-003: stop must be able to finish once own orders are terminal.",
+   "severity": "medium",
+   "failure_scenario": "The venue keeps serving an own trade or order row whose payload differs from the committed one, e.g. a changed field (`committed_payload_mismatch`) or a duplicate with another payload. The operator audits it with `ack_history_conflict`, which is APPLIED. `_only_audited_conflicts` converts a walk to complete only when every conflict starts with `conflict:trades_exceed_order_cumulative:`, so every later walk stays `complete=False` / `conflict`. Rebasing the floor to now-overlap does not help. `_fetch_page` (history.py:602-605) applies every row of a page, including rows older than the boundary, so the contradicted row keeps conflicting while it is within the first 100 rows. On a low-volume grid that is indefinitely. The results: history_complete stays False, so no leg settles and no cell releases; entries stay blocked with HISTORY_INCOMPLETE; a venue-cancelled partially filled entry stays TERMINAL_UNKNOWN; a STOP can only end STOP_UNCERTAIN. No other audit action lifts this.",
+   "evidence": "Probe test_probe_ack_conflict.py::test_probe_committed_payload_mismatch_after_ack (same scratch dir). After an APPLIED ack (`{'status': 'APPLIED', 'result': {'resolved_conflicts': []}}`) and 600 ticks it prints `last: (599, 'RECONCILING', False, 'conflict')` and `walk conflicts: ['conflict:committed_payload_mismatch:...']`. After a venue cancel it prints `entry after venue cancel: TERMINAL_UNKNOWN 2 history_complete False`, and after STOP `stop outcome: STOP_UNCERTAIN`. The sibling probe test_probe_persistent_payload_conflict_after_ack shows the same for `duplicate_key_payload_mismatch`. Code: engine.py:1449-1465 (kind whitelist), engine.py:1072-1082 (ack only rebases the floor), history.py:602-615."
+  },
+  {
+   "title": "Launcher START that turns CONFLICT is silently dropped; an explicit resume-after-stop phrase has no effect",
+   "file": "hummingbot/strategy_v2/executors/neutral_grid_executor/executor.py",
+   "line": 273,
+   "requirement": "Review fix A/B and NG-OPS-003 / AC-36: a durable stop may be resumed only by an explicit operator START or a launcher resume naming that stop. Operator commands must reflect committed state, and a refused start must be visible (`start_error`).",
+   "severity": "medium",
+   "failure_scenario": "The executor enqueues the launcher START (with `resume_stop_ms`) in `on_start` using the current revisions. An older queued command, for example a PAUSE clicked in the attach-mode web UI while Hummingbot was down, is claimed first in the same tick and APPLIED, which bumps `engine_revision`. `claim_next_command` then marks the launcher START as CONFLICT (`stale_at_apply`). `_track_start` only reacts to REJECTED. Review fix A made `_track_stop` re-send a CONFLICTed STOP, and `_maybe_migrate` / `_maybe_confirm_baseline` retry too, but START was not given the same handling. The START is never re-sent and `start_error` stays None, so the engine silently stays STOPPED although the operator typed the exact resume phrase for that stop.",
+   "evidence": "Probe /private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify/test_probe_launcher_start.py::test_probe_resume_start_lost_when_older_command_applies_first prints `('start', 'CONFLICT', 'launcher-start-...', {... 'reason': 'stale_at_apply'})`, `('pause', 'APPLIED', 'web-pause-000000000001', ...)`, `state: EngineState.STOPPED stop_requested_ms: 1790000025000 outcome: STOPPED`, `start_error: None start_refused: False`. Code: executor.py:273-283 checks only `record.status == CommandStatus.REJECTED`; store.py:3953-3956 converts stale rows to CONFLICT at claim."
+  },
+  {
+   "title": "Executor forwards every connector fill as a WS trade hint; fills outside this market never clear, so lag grows forever and baseline audits are refused",
+   "file": "hummingbot/strategy_v2/executors/neutral_grid_executor/executor.py",
+   "line": 357,
+   "requirement": "AC-13: history lag must be shown honestly. AC-30 / NG-RISK-003: a baseline audit or rebase must stay possible. Review fix D refuses the audit while any WS trade signal is pending.",
+   "severity": "medium",
+   "failure_scenario": "ExecutorBase registers the fill forwarder on the whole connector, so `process_order_filled_event` fires for every order of that connector. `_wake` forwards each one without checking `event.trading_pair` or whether `event.order_id` is a grid CID. `engine.wake` stores the trade id in `ws_pending`, and it is removed only when that trade id is committed from this market's history. Trade labels are never pruned by complete walks. Any fill of another market on the same connector therefore stays pending forever, for example another V2 controller using this generic controller's connector. `history_lag_s` then grows without bound (a false AC-13 lag in snapshot, UI and CLI). `_audit_evidence_unsettled` (engine.py:1061) makes every `baseline` audit REJECTED with `AUDIT_EVIDENCE_NOT_SETTLED`, so after drift the operator can never rebase.",
+   "evidence": "Probe test_probe_ack_conflict.py::test_probe_foreign_ws_fill_blocks_baseline_audit_forever (engine.wake with a trade id that never appears in this market's history) prints `lag: 300.0 ws_pending: {'777000111': ...}`, `audit: REJECTED {'error': 'AUDIT_EVIDENCE_NOT_SETTLED', 'reasons': ['1 WS trade signal(s) not yet in committed history', 'history lag 300.0 s'], 'retryable': True}`, `snapshot lag: 301.0`. Code: executor.py:357-365 has no filter; engine.py:665-684 is `ws_pending.setdefault`; engine.py:1437-1438 prunes only non-trade labels; executor_base.py:59/329-335 subscribes on the whole connector."
+  },
+  {
+   "title": "Launcher pre-start ledger reads fail on an older schema: the resume phrase is ignored and CID pre-registration is skipped",
+   "file": "scripts/lighter_robinhood_fixed_neutral_grid.py",
+   "line": 177,
+   "requirement": "Review fix B/E: the launcher reads the durable stop and registers engine-owned CIDs before the connector's polling starts. Schema migration must be fail-closed but must not disable operator confirmations.",
+   "severity": "low",
+   "failure_scenario": "`register_durable_cids` and `durable_stop_ms` use `NeutralGridStore.open_readonly`, which refuses any database older than the code's latest migration (`allow_upgrade=False`). The v3 `m0003_drilldown_indexes` was added late, so a ledger created by an earlier build is v2. On the first launch after upgrading, both reads raise SchemaVersionError. The launcher's broad except logs it and continues with `stop_ms=None`: no resume notice is shown, the operator's `resume_after_stop_confirmation` is ignored (so the engine then REJECTS the START with DURABLE_STOP_ACTIVE), and no durable CIDs are registered before polling. Only a second restart, after the executor has upgraded the DB, behaves as documented.",
+   "evidence": "Probe /private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify/test_probe_old_schema.py creates the DB with MIGRATIONS[:-1] and prints `raised: SchemaVersionError database schema 2 is older than 3; the engine must migrate it first` for both `durable_stop_ms` and `register_durable_cids`. Code: scripts/lighter_robinhood_fixed_neutral_grid.py:170-181 (except Exception -> stop_ms stays None); executor.py durable_stop_ms/register_durable_cids -> store.py:1587-1588."
+  },
+  {
+   "title": "Example config documents the wrong default ledger path after review fix E",
+   "file": "conf/controllers/lighter_robinhood_fixed_neutral_grid.yml.example",
+   "line": 35,
+   "requirement": "NG-DB-004 / AC-54: operators must restore the correct database from backup. Review fix E changed the default ledger to the store's per-account/market path.",
+   "severity": "low",
+   "failure_scenario": "The example says `default is <hummingbot data path>/neutral_grid_<grid_id>.sqlite`. With `db_path: null` the code actually uses `default_db_path(identity)` = `<data>/neutral_grid/neutral_grid.<domain>.<account>.<pair>.sqlite3`, as `engine_db_path` in executor.py and `NeutralGridStore.open(None, ...)` do. An operator backing up, restoring or pointing `--attach-db` at the documented file uses a path that never exists. After a loss, the host marker then makes the engine fail closed (PriorRunEvidenceError) while the real ledger sits elsewhere.",
+   "evidence": "conf/controllers/lighter_robinhood_fixed_neutral_grid.yml.example:35 has the old comment. store.py:490-495 `default_db_path` returns `Path(base_dir) / 'neutral_grid' / f'{identity.lock_key}.sqlite3'`; executor.py `engine_db_path` uses the same; controllers/generic/neutral_grid.py:46-47 says '<data>/neutral_grid/<domain>.<account>.<pair>'."
+  }
+ ]
+}

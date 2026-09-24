@@ -1,0 +1,33 @@
+from decimal import Decimal as D
+import pytest
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    EngineState, LegRole, CommandKind, OrderState, CommandStatus, Side)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+_FAST_RULES = EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0, weight_budget_per_min=100000)
+
+
+@pytest.mark.parametrize("change", [dict(supports_post_only=False), dict(max_base=D("5")), dict(min_base=D("20")),
+                                    dict(tick_size=D("0.0007"))])
+def test_variant(tmp_path, change):
+    h = Harness(tmp_path, options=_FAST_RULES)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        tp_cell = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(tp_cell, ENTRY).cid, D("10"))
+        idle = h.buy_cells()[0]
+        h.fx.venue_cancel(h.live_order(idle, ENTRY).cid)
+        h.fx.set_rules(**change)
+        h.tick(4)
+        n0 = len(h.engine.store.legs())
+        h.tick(100)
+        n1 = len(h.engine.store.legs())
+        h.tick(100)
+        n2 = len(h.engine.store.legs())
+        view = {c["cell_id"]: c for c in h.engine.last_snapshot["cells"]}
+        print(change, "legs", n0, n1, n2, "state", h.state.value, "tp blocker", view[tp_cell]["blocker"],
+              "idle blocker", view[idle]["blocker"], "tp live", h.live_order(tp_cell, TP) is not None)
+    finally:
+        h.close()

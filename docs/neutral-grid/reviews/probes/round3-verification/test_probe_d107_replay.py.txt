@@ -1,0 +1,35 @@
+import dataclasses
+from decimal import Decimal as D
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import LegRole, CommandKind
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+
+ENTRY = LegRole.ENTRY
+
+
+def test_replay_of_old_trade_for_live_partially_filled_entry(tmp_path):
+    opts = EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, committed_cache_rows=1)
+    h = Harness(tmp_path, options=opts, fx_kwargs={"min_base": D("0.1"), "min_notional": D("0.1")})
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cells = h.buy_cells()
+        c1 = cells[-1]
+        e1 = h.live_order(c1, ENTRY)
+        t1 = h.fx.fill(e1.cid, D("2"))          # partial: entry stays live
+        h.tick(6)
+        h.fx.fill(e1.cid, D("1"))
+        h.tick(6)
+        h.restart()
+        h.tick(4)
+        print("\nt1 in committed cache after restart:", t1 in h.engine._committed_trade_ids)
+        # connector replays the old fill of the still-live order after the restart
+        h.engine.wake({"type": "trade", "status": "filled", "client_order_id": str(e1.cid), "trade_id": t1})
+        h.tick(120)
+        print("entry state:", h.engine.leg_by_cid(e1.cid).state.value, "lag:", h.engine.history_lag_s(),
+              "pending:", h.engine.ws_pending)
+        h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.fx.net_position), "note": "x"}, key="a1")
+        h.tick(2)
+        rec = h.engine.store.get_command(idempotency_key="a1")
+        print("baseline audit:", rec.status.value, rec.result)
+    finally:
+        h.close()

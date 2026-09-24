@@ -1,0 +1,150 @@
+"""Mutation probes: each reverts one fix at runtime and asserts that the pinned regression test FAILS."""
+import importlib.util
+import inspect
+import sys
+import textwrap
+from decimal import Decimal as D
+
+import pytest
+
+ENGINE_TEST_DIR = ("/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/"
+                   "executors/neutral_grid_executor/engine")
+sys.path.insert(0, ENGINE_TEST_DIR)
+spec = importlib.util.spec_from_file_location("r1", ENGINE_TEST_DIR + "/test_ng_engine_review1.py")
+r1 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(r1)
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as eng  # noqa: E402
+
+E = eng.NeutralGridEngine
+
+
+def _rewrite(monkeypatch, name, pairs):
+    src = textwrap.dedent(inspect.getsource(getattr(E, name)))
+    for old, new in pairs:
+        assert old in src, (name, old)
+        src = src.replace(old, new)
+    ns = {}
+    exec(compile(src, f"<mut {name}>", "exec"), eng.__dict__, ns)
+    monkeypatch.setattr(E, name, ns[name])
+
+
+def _expect_fail(fn, *args):
+    try:
+        fn(*args)
+    except AssertionError as exc:
+        print(f"KILLED {fn.__name__}: {str(exc)[:160]!r}")
+        return
+    raise AssertionError(f"SURVIVED: {fn.__name__} passed under the mutation")
+
+
+def test_m_d101a_dispatch_each_tp_right_after_commit(tmp_path, monkeypatch):
+    _rewrite(monkeypatch, "_act", [("            ready.append(committed)",
+                                    "            await self._dispatch_intent(*committed)")])
+    _expect_fail(r1.test_r01_every_tp_intent_commits_within_slo_although_each_transport_takes_time, tmp_path)
+
+
+def test_m_d101b_cancels_before_tp_transports(tmp_path, monkeypatch):
+    _rewrite(monkeypatch, "_act", [
+        ("    for cid, outbox_id, req in ready:\n",
+         "    await self._dispatch_cancels(cancels, now)\n    for cid, outbox_id, req in ready:\n")])
+    _expect_fail(r1.test_r01_tp_transports_are_sent_before_entry_cancels, tmp_path)
+
+
+def test_m_d101c_anchor_first_fill(tmp_path, monkeypatch):
+    _rewrite(monkeypatch, "_apply_history", [
+        ("self._cell_fill_commit_ms[fill.cell_id] = _ms(committed_at)",
+         "self._cell_fill_commit_ms.setdefault(fill.cell_id, _ms(committed_at))")])
+    _expect_fail(r1.test_r01_slo_clock_starts_when_the_obligation_becomes_dispatchable, tmp_path)
+
+
+def test_m_d102_invariant_blocks_all_tps(tmp_path, monkeypatch):
+    monkeypatch.setattr(eng, "_FREEZES_BLOCKING_TP", {eng.FREEZE_CID, eng.FREEZE_CONFIG_MISMATCH, eng.FREEZE_INVARIANT})
+    _expect_fail(r1.test_r02_ledger_invariant_freeze_keeps_tps_of_exact_cells_and_outside_bounds_cancels,
+                 tmp_path, monkeypatch)
+
+
+def test_m_d102_conflict_blocks_all_tps(tmp_path, monkeypatch):
+    orig = E._evaluate_state
+
+    def mutated(self, now):
+        orig(self, now)
+        if any(c.kind != "LATE_FILL" for c in self.open_conflicts):
+            self.tp_blockers = list(self.tp_blockers) + ["HISTORY_CONFLICT"]
+    monkeypatch.setattr(E, "_evaluate_state", mutated)
+    _expect_fail(r1.test_r02_one_cells_history_conflict_does_not_withhold_other_cells_tps_or_risk_cancels, tmp_path)
+
+
+def test_m_d103_drift_on_any_fresh_position(tmp_path, monkeypatch):
+    monkeypatch.setattr(E, "_position_fresh_for_ledger",
+                        lambda self, now: self.position is not None and not self._position_stale(now))
+    _expect_fail(r1.test_r03_position_read_before_the_same_ticks_history_commit_is_not_drift, tmp_path)
+
+
+def test_m_d104_no_backoff_no_allowance(tmp_path, monkeypatch):
+    orig = E._refresh_account
+
+    async def mutated(self, now):
+        self._rules_retry_at = None
+        self._rules_weight_log.clear()
+        await orig(self, now)
+    monkeypatch.setattr(E, "_refresh_account", mutated)
+    _expect_fail(r1.test_r04_failing_rules_refresh_backs_off_and_does_not_starve_history, tmp_path)
+
+
+def test_m_d104_no_backoff_only(tmp_path, monkeypatch):
+    orig = E._refresh_account
+
+    async def mutated(self, now):
+        self._rules_retry_at = None
+        await orig(self, now)
+    monkeypatch.setattr(E, "_refresh_account", mutated)
+    try:
+        r1.test_r04_failing_rules_refresh_backs_off_and_does_not_starve_history(tmp_path)
+        print("backoff-only revert SURVIVED (allowance still bounds it)")
+    except AssertionError as exc:
+        print("backoff-only revert KILLED", str(exc)[:100])
+
+
+def test_m_d105_no_arming_min(tmp_path, monkeypatch):
+    monkeypatch.setattr(E, "_arming_min", lambda self, entry: None)
+    _expect_fail(r1.test_r05_runtime_minimum_decrease_never_emergency_cancels_other_cells_entries, tmp_path)
+
+
+def test_m_d106a_no_latch_no_offtick(tmp_path, monkeypatch):
+    monkeypatch.setattr(E, "_latched", lambda self, cell_id, role: None)
+    monkeypatch.setattr(E, "_off_tick", lambda self, price: None)
+    _expect_fail(r1.test_r06_off_tick_prices_latch_a_blocker_instead_of_dead_legs_every_tick, tmp_path)
+
+
+def test_m_d106b_no_latch(tmp_path, monkeypatch):
+    monkeypatch.setattr(E, "_latched", lambda self, cell_id, role: None)
+    _expect_fail(r1.test_r06_definitive_venue_reject_is_latched_with_backoff_not_resent_every_tick, tmp_path)
+
+
+def test_m_d107_wake_without_committed_check(tmp_path, monkeypatch):
+    _rewrite(monkeypatch, "wake", [("if trade_id is not None and str(trade_id) in self._committed_trade_ids:",
+                                    "if False:")])
+    _expect_fail(r1.test_r12_ws_signal_for_an_already_committed_trade_is_not_history_lag, tmp_path)
+
+
+def test_m_d107_no_cid_expiry(tmp_path, monkeypatch):
+    _rewrite(monkeypatch, "_scan_history", [("if at >= started or self._is_trade_label(label)", "if True")])
+    _expect_fail(r1.test_r12_ws_signal_for_an_already_committed_trade_is_not_history_lag, tmp_path)
+
+
+def test_m_d108_no_cell_blocker(tmp_path, monkeypatch):
+    _rewrite(monkeypatch, "_act", [("            self.cell_blockers[int(action.key.split(\":\")[1])] = action.reason\n",
+                                    "")])
+    _expect_fail(r1.test_r13_risk_blocked_tps_name_their_cells_and_every_reason, tmp_path)
+
+
+def test_m_d108_first_reason_only(tmp_path, monkeypatch):
+    _rewrite(monkeypatch, "_act", [("        self.meta.risk_blocked.update(blocked_now)",
+                                    "        self.meta.risk_blocked = self.meta.risk_blocked or dict([sorted(blocked_now.items())[0]])")])
+    _expect_fail(r1.test_r13_risk_blocked_tps_name_their_cells_and_every_reason, tmp_path)
+
+
+def test_m_d109_release_ignores_position(tmp_path, monkeypatch):
+    monkeypatch.setattr(E, "_position_reconciled_now", lambda self, now: bool(self.bootstrapped))
+    _expect_fail(r1.test_r14_release_waits_until_the_account_position_equals_the_ledger, tmp_path)

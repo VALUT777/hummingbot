@@ -1,0 +1,29 @@
+import sys, tempfile
+from pathlib import Path
+from decimal import Decimal as D
+sys.path.insert(0, "test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+from ng_engine_harness import Harness, make_config, start_payload
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind
+
+tmp = Path(tempfile.mkdtemp(dir="/private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify"))
+h = Harness(tmp, order_amount_base=D("10"), max_gross_position=D("1000"))
+try:
+    h.command(CommandKind.START, start_payload(D("0")), key="start-for-config-x")
+    h.tick(2)
+    print("started (X)", h.engine.meta.started, "Q", h.engine.config.order_amount_base)
+    # operator stops process, edits controller YAML to double Q, restarts before bootstrap
+    h.config = make_config(order_amount_base=D("20"), max_gross_position=D("2000"))
+    try:
+        h.restart()
+    except Exception as e:
+        print("restart refused:", type(e).__name__, e); raise SystemExit
+    print("after restart: store", h.engine.store is not None, "fatal", h.engine.fatal_reason, "started", h.engine.meta.started, "Q", h.engine.config.order_amount_base)
+    h.tick(2)
+    snap = h.engine.last_snapshot
+    print("snapshot started", snap["summary"]["started"], "reasons", snap["reasons"])
+    h.run_until(lambda: h.engine.bootstrap_ready(h.clock())[0], max_ticks=60)
+    h.command(CommandKind.CONFIRM_BASELINE, {"expected_initial_position": "0"}, key="confirm-y")
+    h.tick()
+    print("bootstrapped", h.engine.bootstrapped, "Q", h.engine.config.order_amount_base, h.engine.recent_commands[-1])
+finally:
+    h.close()

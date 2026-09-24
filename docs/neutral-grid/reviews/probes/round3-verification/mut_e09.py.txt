@@ -1,0 +1,28 @@
+import os, inspect, textwrap
+MUT = os.environ.get("NG_MUT", "")
+
+
+def _patch(mod, cls, name, old, new):
+    fn = getattr(cls, name)
+    src = textwrap.dedent(inspect.getsource(fn))
+    assert old in src, (name, old)
+    src = src.replace(old, new)
+    ns = {}
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__, ns)
+    setattr(cls, name, ns[name])
+
+
+def pytest_configure(config):
+    if MUT == "engine":
+        from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+        _patch(E, E.NeutralGridEngine, "_cmd_confirm_baseline",
+               "if not self.bootstrapped and self.meta.start_config_fingerprint != self.full_fingerprint:",
+               "if False:")
+    elif MUT == "web":
+        from web.neutral_grid import commands as C
+        cls = [c for c in vars(C).values() if isinstance(c, type) and hasattr(c, "_start_material_blocker")][0]
+        cls._start_material_blocker = lambda self, *a, **k: _none()
+
+
+async def _none():
+    return None

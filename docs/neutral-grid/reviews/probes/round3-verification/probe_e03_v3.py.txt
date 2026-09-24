@@ -1,0 +1,42 @@
+import json, os, stat, sys, tempfile
+from pathlib import Path
+from decimal import Decimal as D
+sys.path.insert(0, "test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import LegRole
+from web.neutral_grid.runtime import health_file_provider
+from web.neutral_grid.views import health_view, freshness, engine_view
+from web.neutral_grid.gateway import StoreGateway
+
+for stale_after in (15.0, 60.0, 5.0):
+    tmp = Path(tempfile.mkdtemp(dir="/private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify3"))
+    h = Harness(tmp)
+    data_dir = h.db_path.parent
+    try:
+        h.bootstrap(D("0")); h.tick(25)   # healthy: heartbeat sidecar written
+        side = data_dir / (h.db_path.name + ".health.json")
+        # healthy steady state: banner?
+        snap = h.engine.latest_committed_snapshot()
+        now = h.clock()
+        v = health_view(health_file_provider(h.db_path)(), freshness(snap, now, stale_after), now)
+        print(f"[stale_after={stale_after}] healthy: known={v['known']} banner={v['banner']!r}")
+        os.chmod(data_dir, stat.S_IRUSR | stat.S_IXUSR)
+        h.hooks.simulate_disk_full()
+        cell = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(cell, LegRole.ENTRY).cid, D("10"))
+        t_fail = h.clock()
+        for step in range(70):
+            h.tick(1)
+            now = h.clock()
+            snap = h.engine.latest_committed_snapshot()
+            fresh = freshness(snap, now, stale_after)
+            v = health_view(health_file_provider(h.db_path)(), fresh, now)
+            ev = engine_view(snap, fresh)
+            if step in (2, 5, 10, 14, 16, 20, 30, 59, 61, 69):
+                print(f"  t+{now - t_fail:.0f}s snap_stale={fresh['stale']} age={fresh['age_s']} display={ev['display_state']} "
+                      f"health_known={v['known']} banner={(v['banner'] or '')[:110]!r}")
+        print("  engine.persistence_error:", (h.engine.persistence_error or "")[:80])
+    finally:
+        os.chmod(data_dir, stat.S_IRWXU)
+        h.hooks.restore_storage()
+        h.close()

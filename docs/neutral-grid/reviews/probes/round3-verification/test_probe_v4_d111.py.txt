@@ -1,0 +1,35 @@
+"""verify3 probe: D1-11 without a crash -- mark_dispatching of a cancel raises PersistenceError; after persistence
+recovers the committed-but-unsent cancel must still be sent (normal path and STOP)."""
+from decimal import Decimal as D
+
+import pytest
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, OrderState
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import PersistenceError
+
+
+def _pending(h):
+    s = h.engine.store
+    return [leg for leg in h.engine.non_final_legs() if leg.state == OrderState.CANCEL_PENDING
+            and any(o.kind == "CANCEL" and o.status == "PENDING" for o in s.outbox_for_cid(leg.cid))]
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_d111_mark_dispatching_persistence_error_then_recovery(tmp_path, stop):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        h.fx.set_book(D("6.2"), D("6.3"))
+        h.hooks.arm("before_dispatch_commit", exc=PersistenceError("disk I/O error"))
+        h.tick(1)
+        pend = _pending(h)
+        print("pending after fault:", [(p.cid, p.state) for p in pend], "persist err", h.engine.persistence_error)
+        assert pend
+        if stop:
+            h.command(CommandKind.STOP, {"note": "x"}, key="stop")
+        h.tick(20)
+        print("state", h.engine.engine_state, [(p.cid, h.fx.order_by_cid(p.cid).is_open) for p in pend])
+        assert all(not h.fx.order_by_cid(p.cid).is_open for p in pend)
+    finally:
+        h.close()

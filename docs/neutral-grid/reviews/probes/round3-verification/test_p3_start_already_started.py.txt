@@ -1,0 +1,47 @@
+"""Probe P3: after a config change, the START that acknowledges the new config is answered APPLIED
+"already_started" without re-binding start_config_fingerprint, so the following CONFIRM_BASELINE is refused."""
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+ENGINE_TESTS = Path("/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/"
+                    "executors/neutral_grid_executor/engine")
+sys.path.insert(0, str(ENGINE_TESTS))
+
+from ng_engine_harness import Harness, make_config, start_payload  # noqa: E402
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, CommandStatus  # noqa: E402
+
+D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _host_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "ng-host"))
+
+
+@pytest.mark.parametrize("source", [None, "launcher"])
+def test_p3(tmp_path, source):
+    h = Harness(tmp_path)
+    try:
+        h.command(CommandKind.START, start_payload(), key="s1")
+        h.tick()
+        assert h.engine.store.get_command(idempotency_key="s1").status == CommandStatus.APPLIED
+        h.config = make_config(order_amount_base=D("20"), max_abs_net_position=D("2000"))
+        h.restart()
+        payload = dict(start_payload(), **({"source": source} if source else {}))
+        h.command(CommandKind.START, payload, key="s2")        # acknowledges the NEW config
+        h.tick()
+        s2 = h.engine.store.get_command(idempotency_key="s2")
+        print("START after config change:", s2.status, s2.result)
+        h.run_until(lambda: h.engine.bootstrap_ready(h.clock())[0], max_ticks=60)
+        h.command(CommandKind.CONFIRM_BASELINE, {"expected_initial_position": "0"}, key="c1")
+        h.tick()
+        c1 = h.engine.store.get_command(idempotency_key="c1")
+        print("CONFIRM_BASELINE:", c1.status, c1.result)
+        assert s2.status == CommandStatus.APPLIED and s2.result.get("already_started")
+        assert c1.status == CommandStatus.REJECTED and c1.result["error"] == "START_CONFIG_CHANGED"
+    finally:
+        h.close()

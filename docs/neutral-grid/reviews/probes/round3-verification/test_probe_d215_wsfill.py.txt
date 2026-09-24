@@ -1,0 +1,50 @@
+from decimal import Decimal as D
+import pytest
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    LegRole, CommandKind, OrderState, CommandStatus)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import SubmitBehavior
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_probe(tmp_path, partial):
+    """The landed TP is filled; the WS fill hint (trade id + our CID) arrives at once, history lags 40 s."""
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0")); h.tick(2); h.tick(8)
+        cell = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("10"))
+        h.fx.script_submit(SubmitBehavior.TIMEOUT_LANDED)
+        h.run_until(lambda: any(t.state == OrderState.SUBMIT_UNKNOWN for t in h.legs(cell, TP)), max_ticks=10)
+        tp = next(t for t in h.legs(cell, TP) if t.state == OrderState.SUBMIT_UNKNOWN)
+        pos0 = h.fx.net_position
+        qty = D("4") if partial else D("10")
+        trade = h.fx.fill(tp.cid, qty, history_lag_s=40, ws=True)
+        print(f"\n[partial={partial}] ws_pending after fill hint:", h.engine.ws_pending,
+              "label->cid:", h.engine._ws_label_cid)
+        t0 = h.clock()
+        applied = None
+        last = None
+        for i in range(40):
+            key = f"res-{i}"
+            h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(tp.cid), "note": "x"}, key=key)
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=key)
+            last = (rec.status.value, (rec.result or {}).get("detail") or (rec.result or {}).get("error"))
+            if rec.status == CommandStatus.APPLIED:
+                applied = h.clock() - t0
+                break
+        print("applied at", applied, "last", last, "history lag", h.engine.history_lag_s())
+        h.tick(10)
+        print("lag 10 s after the resolve:", h.engine.history_lag_s(), "ws_pending:", h.engine.ws_pending,
+              "trade visible in history yet:", h.fx.trade_legs[-1].visible_at <= h.clock())
+        print("TP legs:", [(t.cid, t.state.value, str(t.filled)) for t in h.legs(cell, TP)])
+        print("venue open TPs for cell:", [o.client_order_id for o in h.fx.open_orders(owned=True)
+                                           if h.engine.leg_by_cid(o.client_order_id) is not None
+                                           and h.engine.leg_by_cid(o.client_order_id).identity.cell_id == cell])
+        h.tick(45)
+        print("after history catches up:", h.state.value, h.engine.reasons[:3], "net pos", h.fx.net_position, "was", pos0)
+    finally:
+        h.close()
