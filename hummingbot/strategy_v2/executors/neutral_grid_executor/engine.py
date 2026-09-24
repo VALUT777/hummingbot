@@ -83,6 +83,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.history import (
     STREAM_ORDERS,
     STREAM_TRADES,
     REASON_CONFLICT,
+    AuditedResolution,
     HighWaterMark,
     HistoryScanner,
     ScanRecord,
@@ -186,7 +187,13 @@ def redact(text: Any, limit: int = 500) -> str:
 
 
 def _key_label(key: Tuple) -> str:
-    return json.dumps([str(part) for part in key], separators=(",", ":"))
+    """Exact, JSON-safe encoding of a history dedupe key (ints stay ints, however large)."""
+    return json.dumps([["i", str(p)] if isinstance(p, int) and not isinstance(p, bool) else ["s", str(p)]
+                       for p in key], separators=(",", ":"))
+
+
+def _key_from_label(label: str) -> Tuple:
+    return tuple(int(v) if t == "i" else v for t, v in json.loads(label))
 
 
 def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
@@ -288,6 +295,17 @@ class _CursorView:
     def bootstrap_floor_ms(self, stream: str) -> Optional[int]:
         meta = self._engine.meta
         return meta.history_reset.get(stream, meta.bootstrap_floor_ms)
+
+    def audited_resolutions(self) -> List[AuditedResolution]:
+        """Operator-audited payload verdicts (``ack_history_conflict``, persisted in engine_meta): the committed
+        payload is accepted, the other versions seen at the audit are audited noise (C3)."""
+        out = []
+        for stream, entries in self._engine.meta.audited_payloads.items():
+            for label, entry in entries.items():
+                out.append(AuditedResolution(stream=stream, key=_key_from_label(label),
+                                             accepted_fingerprint=entry.get("accepted"),
+                                             rejected_fingerprints=frozenset(entry.get("noise", []))))
+        return out
 
 
 class NeutralGridEngine:
@@ -1578,17 +1596,14 @@ class NeutralGridEngine:
         Any new or different row keeps the walk incomplete (AC-40)."""
         if result.incomplete_reason != REASON_CONFLICT or not result.conflicts:
             return False
-        if any(c not in self.meta.acknowledged_conflicts for c in result.conflicts):
+        if any(c not in self.meta.acknowledged_conflicts
+               or not c.startswith(f"{REASON_CONFLICT}:trades_exceed_order_cumulative:") for c in result.conflicts):
             return False
         domain = self.port.domain
         for row in self.scanner.last_conflicted_rows.get(STREAM_TRADES, []):
-            if self._audited_row(STREAM_TRADES, row):
-                continue                     # an audited key: accepted payload committed, known other version
             if self.committed[STREAM_TRADES].get(row.dedupe_key(domain)) != trade_payload_fingerprint(row):
                 return False
         for row in self.scanner.last_conflicted_rows.get(STREAM_ORDERS, []):
-            if self._audited_row(STREAM_ORDERS, row):
-                continue
             if self.committed[STREAM_ORDERS].get(c_order_key(domain, row)) != order_payload_fingerprint(row):
                 return False
         return True
