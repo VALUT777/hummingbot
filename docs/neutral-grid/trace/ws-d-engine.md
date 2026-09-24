@@ -300,6 +300,21 @@ position/fill order" kills D2-07; C3's wiring: "serve no audited resolutions" ki
 | E-09 | START stores the full-config fingerprint (all GridConfig fields but `enabled`); CONFIRM_BASELINE before bootstrap refuses a changed config (`START_CONFIG_CHANGED`) and resets `started` | `E test_ng_engine_review3.py::test_e09_confirm_baseline_refuses_a_config_changed_after_start` |
 | E-03 | Health sidecar rewritten at least every `health_heartbeat_s` (10 s) even when healthy; a sidecar older than that is "unknown" (WS-E reader) | `E test_ng_engine_review3.py::test_e03_health_sidecar_heartbeat_even_when_healthy` |
 
+Web round-3 contract (orchestrator follow-ups, red at `f48ed9490`, green at `99cb39468`):
+`summary.colliding_cid` (str|null) and `summary.grid_mutation_blockers` (list[str]: the store's list when the engine
+is durably stopped or opened for a confirmed migration, else a non-empty "stop first" blocker, so a running grid
+never pays the query); the engine accepts exactly the web's extended-audit payloads (`action`, `note`,
+`acknowledge`, typed `confirmation`, and `cid` for `retire_colliding_cid`) and retires **only** the CID it recorded
+as colliding (`NOT_THE_COLLIDING_CID` otherwise); START's `material_id` is persisted with the binding and in the
+start audit (informational; `start_config_fingerprint` is the authority) —
+`E test_ng_engine_review3.py::test_web_retire_payload_is_accepted_only_for_the_recorded_colliding_cid`,
+`::test_web_migrate_payload_and_published_grid_mutation_blockers`, `::test_web_start_material_id_is_persisted_with_the_start_binding`.
+Schema v4 (`m0004_dispatch_owner`, merged `d82942c12`): the launcher's pre-start reads were checked against v1, v2
+and v3 ledgers (`open_ledger_readonly`); the engine records NOT_SENT only for never-dispatched PENDING rows, so the
+store's B-09 owner rule never changes an engine outcome. Ledger corrections (`ledger_correction_required`): an
+engine audit always accepts the committed payload, so it never produces one; should the scanner report one, history
+stays incomplete (entries blocked, reason visible) — a store-audited correction path is requested (R6).
+
 Deviation, recorded: C5's "expire trade-id labels after a covering walk" is applied only to labels that are not
 tied to one of our live orders; expiring our own live order's label would hide genuine history lag (AC-13), which
 the merged web demo test (`test_ngweb_demo_engine.py::test_demo_engine_full_operator_flow`) asserts.
@@ -322,6 +337,8 @@ the merged web demo test (`test_ngweb_demo_engine.py::test_demo_engine_full_oper
 * **R5 (WS-E, optional).** Offer the launcher-path audited actions `retire_colliding_cid` and `migrate_grid`
   (`commands.EXTENDED_AUDIT_ACTIONS`) in the web UI, and a resume flow for `DURABLE_STOP_ACTIVE` (an explicit web
   START already resumes; the launcher needs the `RESUME <grid_id> AFTER STOP <stop_ms>` phrase).
+* **R6 (WS-B, optional).** An audited store API to replace a committed payload/quantity (`LedgerCorrection` from
+  the scanner) in one transaction; until then the engine audits accept only the committed version.
 * **R4 (WS-C, optional).** `LighterExchangePort` does not forward `register/release_history_reconciled_order`; the
   executor calls the connector directly (the fake exchange implements the same names).
 
@@ -367,18 +384,18 @@ the merged web demo test (`test_ngweb_demo_engine.py::test_demo_engine_full_oper
   engine then fails closed, but Hummingbot's generic cancel paths could touch orders of a previous run until the
   connector restores its own tracking marker (logged as an error).
 
-## Commands run (code at `f654952ae`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
+## Commands run (code at `99cb39468`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
 
 | Gate | Command | Result |
 |---|---|---|
-| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 261 passed |
+| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 264 passed |
 | Heavy property sweep | `NG_PROPERTY_SEEDS=60 NG_PROPERTY_STEPS=120 $PY -m pytest .../engine/test_ng_engine_properties.py -q` | 61 passed |
 | Lighter connector | `$PY -m pytest test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_derivative.py -q` | 85 passed, 8 subtests passed |
 | Committed neutral/risk | `$PY -m pytest test/scripts/test_lighter_robinhood_neutral_grid.py test/scripts/test_lighter_robinhood_grid_risk.py -q` | 73 passed |
 | Controller/executor regressions | `$PY -m pytest test/hummingbot/strategy_v2/executors/grid_executor test/controllers/generic test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py test/hummingbot/strategy_v2/executors/test_executor_base.py -q` | 147 passed |
 | Merged WS-A/B/C suites | `$PY -m pytest test/.../neutral_grid_executor/core test/.../neutral_grid_executor/store test/.../neutral_grid_executor/history test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_history_pagination.py -q` | 369 passed, 277 subtests passed |
 | Web suite (WS-E, merged) | `$PY -m pytest test/web/neutral_grid -q` (incl. browser tests) | 138 passed |
-| Round 3 red/green | `$PY -m pytest .../engine/test_ng_engine_review3.py test/controllers/generic/test_neutral_grid.py -q` at the `2fbb338e7` code / at `f654952ae` | 19 failed, 32 passed / 51 passed |
+| Round 3 red/green | `$PY -m pytest .../engine/test_ng_engine_review3.py test/controllers/generic/test_neutral_grid.py -q` at the `2fbb338e7` code / at `f654952ae` | 19 failed, 32 passed / 51 passed (+3 web-contract tests: red at `f48ed9490`, green at `99cb39468`) |
 | Review package 2 red/green | `$PY -m pytest .../engine/test_ng_engine_review2.py test/controllers/generic/test_neutral_grid.py -q` at the `969003ef4` code / at `f96d33c58` | 15 failed, 29 passed / 44 passed |
 | Review package 1 red/green | `$PY -m pytest .../engine/test_ng_engine_review1.py -q` at the `16b837428` engine / at `93c80b299` | 26 failed, 2 passed / 28 passed |
 | Compile/import | `$PY -m py_compile <9 WS-D modules>` + import of engine/executor/fake_exchange/commands/snapshot/data_types/controller/script | OK |
