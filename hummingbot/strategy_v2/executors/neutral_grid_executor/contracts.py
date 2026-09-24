@@ -133,7 +133,8 @@ class GridConfig:
 
     def fingerprint(self) -> str:
         """Stable identity of grid dimensions (bounds, N, Q, pair, account). Implemented by core."""
-        raise NotImplementedError
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.grid import config_fingerprint
+        return config_fingerprint(self)
 
 
 @dataclass(frozen=True)

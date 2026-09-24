@@ -60,6 +60,22 @@ class TestEndpoints(unittest.TestCase):
         h.ledger.confirm_terminal(e, D("4"))
         self.assertEqual(D("4"), risk.endpoints_from_ledgers(D("0"), [h.ledger]).P_max)
 
+    def test_cancel_timeout_keeps_full_remainder_reserved_and_cell_locked(self):
+        # AC-21 (core part): CANCEL_UNKNOWN keeps the order, its whole remainder and its slot; no new cycle.
+        from hummingbot.strategy_v2.executors.neutral_grid_executor import admission
+        h = Harness()
+        e = h.entry()
+        h.fill(e, "3")
+        h.ledger.set_state(e, OrderState.CANCEL_PENDING)
+        h.ledger.set_state(e, OrderState.CANCEL_UNKNOWN)
+        ep = risk.endpoints_from_ledgers(D("0"), [h.ledger])
+        self.assertEqual((D("3"), D("10")), (ep.P, ep.P_max))
+        self.assertIn("ENTRY_NOT_TERMINAL", h.ledger.can_release(True).reasons)
+        self.assertEqual(1, len(h.ledger.non_final_legs()))
+        self.assertGreaterEqual(admission.slot_need_from_ledger(h.ledger, h.rules), 1)
+        with self.assertRaises(Exception):
+            h.ledger.next_entry_identity()
+
     def test_unknown_role_counts_in_net_and_gross(self):
         ep = risk.endpoints(D("0"), D("0"), D("0"), [OpenLeg(Side.SELL, D("7"), role=None,
                                                              state=OrderState.SUBMIT_UNKNOWN)])
