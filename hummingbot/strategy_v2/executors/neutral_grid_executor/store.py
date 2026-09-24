@@ -55,6 +55,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import dataclasses
 from dataclasses import dataclass, field, fields, is_dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -415,6 +416,16 @@ def _row_client_id(row: ExchangeOrderRow) -> Optional[int]:
     if text and text.isdigit():
         return int(text)
     return None
+
+
+def _water_fill(shares: Mapping[int, Decimal], filled: Decimal) -> Dict[int, Decimal]:
+    """Per-generation part of a cumulative aggregate fill, oldest generation first (WS-A ``allocated_filled``)."""
+    left, out = filled, {}
+    for generation in sorted(shares):
+        take = min(shares[generation], left)
+        out[generation] = take
+        left -= take
+    return out
 
 
 def _now_ms() -> int:
@@ -923,6 +934,8 @@ class LegRecord:
     filled: Decimal
     created_at_ms: int
     updated_at_ms: int
+    # aggregate TP only: generation -> exact share of ``amount`` (same cell; WS-A ``Leg.allocation``)
+    allocation: Optional[Dict[int, Decimal]] = None
 
     @property
     def identity(self) -> LegIdentity:
@@ -2394,11 +2407,23 @@ class NeutralGridStore:
             expiry_ms=row["expiry_ms"], state=OrderState(row["state"]), filled=parse_decimal(row["filled"]),
             created_at_ms=row["created_at_ms"], updated_at_ms=row["updated_at_ms"])
 
+    def _with_allocation(self, leg: LegRecord) -> LegRecord:
+        shares = self.leg_allocation(leg.cid)
+        return leg if shares is None else dataclasses.replace(leg, allocation=shares)
+
+    def leg_allocation(self, cid: int) -> Optional[Dict[int, Decimal]]:
+        """``{generation: share}`` of an aggregate TP leg (same shape as WS-A ``Leg.allocation``), else None."""
+        with self._rlock:
+            self._require_open()
+            rows = self._x("SELECT generation, amount FROM allocations WHERE cid = ? ORDER BY generation",
+                           (cid,)).fetchall()
+        return {row[0]: parse_decimal(row[1]) for row in rows} or None
+
     def leg(self, cid: int) -> Optional[LegRecord]:
         with self._rlock:
             self._require_open()
             row = self._x("SELECT * FROM legs WHERE cid = ?", (_require_int(cid, "cid"),)).fetchone()
-        return None if row is None else self._leg(row)
+        return None if row is None else self._with_allocation(self._leg(row))
 
     def legs(self, *, grid_id: Optional[str] = None, cell_id: Optional[int] = None,
              generation: Optional[int] = None, non_final_only: bool = False) -> List[LegRecord]:
@@ -2414,7 +2439,7 @@ class NeutralGridStore:
         with self._rlock:
             self._require_open()
             rows = self._x(f"SELECT * FROM legs WHERE {where} ORDER BY cid", params).fetchall()
-        return [self._leg(row) for row in rows]
+        return [self._with_allocation(self._leg(row)) for row in rows]
 
     @staticmethod
     def _order(row: sqlite3.Row) -> OrderRecord:
@@ -2713,7 +2738,7 @@ class NeutralGridStore:
         if side != expected_side or price != expected_price:
             raise InvalidTransitionError(f"{role.value} must be {expected_side.value} @ {expected_price} "
                                          f"(fixed cell prices; no recenter/clamp)")
-        parts = self._validated_allocations(role, side, price, amount, allocations)
+        parts = self._validated_allocations(role, leg_identity, side, price, amount, allocations)
         if role == LegRole.ENTRY:
             if amount != cycle.planned_amount:
                 raise InvalidTransitionError(f"ENTRY amount {amount} must equal the cycle's planned amount "
@@ -2732,32 +2757,64 @@ class NeutralGridStore:
             return True
         return role == LegRole.TP and cycle.late_evidence == 2 and cycle.entry_filled > cycle.exit_filled
 
-    def _validated_allocations(self, role: LegRole, side: Side, price: Decimal, amount: Decimal,
-                               allocations: Optional[Sequence[Tuple[str, int, int, Decimal]]]
-                               ) -> List[Tuple[str, int, int, Decimal]]:
-        """Aggregation is only for TP remainders with the same TP side and fixed TP price (AC-33/AC-39)."""
+    @staticmethod
+    def _allocation_pairs(leg_identity: LegIdentity, allocations: Any) -> List[Tuple[str, int, int, Any]]:
+        """Accept WS-A's shapes -- ``{generation: share}`` (also ``Leg.to_record`` string keys) or ``(generation,
+        share)`` pairs (``TpDispatchItem.allocation``) -- and the explicit ``(grid_id, cell_id, generation, share)``
+        form. Two-element forms refer to the leg's own cell."""
+        items = allocations.items() if isinstance(allocations, Mapping) else allocations
+        pairs = []
+        for item in items:
+            item = tuple(item)
+            if len(item) == 2:
+                generation, share = item
+                if isinstance(generation, str) and generation.isdigit():
+                    generation = int(generation)
+                if isinstance(share, str):
+                    share = parse_decimal(share)
+                pairs.append((leg_identity.grid_id, leg_identity.cell_id, generation, share))
+            elif len(item) == 4:
+                pairs.append(item)
+            else:
+                raise ValueError(f"allocation item {item!r} is neither (generation, share) nor (grid, cell, gen, share)")
+        return pairs
+
+    def _validated_allocations(self, role: LegRole, leg_identity: LegIdentity, side: Side, price: Decimal,
+                               amount: Decimal, allocations: Any) -> List[Tuple[str, int, int, Decimal]]:
+        """WS-A aggregate TP model (AC-33/AC-39): one TP leg of ONE cell over several of its accepting cycles
+        (``{generation: share}``), same TP side and fixed TP price by construction, shares positive and summing to
+        the order amount, hosted by the newest allocated generation. Per-cycle headroom is checked by the caller."""
         if not allocations:
             return []
         if role != LegRole.TP:
             raise InvalidTransitionError("ENTRY intents cannot carry allocations (no glued physical entries)")
         parts, seen, total = [], set(), Decimal(0)
-        for grid_id, cell_id, generation, part in allocations:
+        for grid_id, cell_id, generation, part in self._allocation_pairs(leg_identity, allocations):
+            _require_int(generation, "allocation generation", 1)
             part_d = _require_positive(part, "allocation amount")
-            if (grid_id, cell_id, generation) in seen:
-                raise ValueError(f"duplicate allocation target {grid_id}/{cell_id}/{generation}")
-            seen.add((grid_id, cell_id, generation))
+            if (grid_id, cell_id) != (leg_identity.grid_id, leg_identity.cell_id):
+                target = self.cycle(grid_id, cell_id, generation)
+                raise InvalidTransitionError(
+                    f"allocation target {grid_id}/{cell_id}/{generation} must be a cycle of the leg's own cell "
+                    f"{leg_identity.grid_id}/{leg_identity.cell_id} (same TP side and price required: "
+                    f"{target.tp_side.value} @ {target.tp_price} vs {side.value} @ {price})")
+            if generation in seen:
+                raise ValueError(f"duplicate allocation generation {generation}")
+            seen.add(generation)
             target = self.cycle(grid_id, cell_id, generation)
             if not self._cycle_accepts(target, LegRole.TP):
                 raise InvalidTransitionError(f"allocation to closed cycle {grid_id}/{cell_id}/{generation}")
             if target.tp_side != side or target.tp_price != price:
-                raise InvalidTransitionError(
-                    f"allocation target {grid_id}/{cell_id}/{generation} must have the same TP side and price "
-                    f"({target.tp_side.value} @ {target.tp_price} != {side.value} @ {price})")
+                raise InvalidTransitionError(f"allocation target {grid_id}/{cell_id}/{generation} must have the same "
+                                             f"TP side and price")
             total += part_d
             parts.append((grid_id, cell_id, generation, part_d))
         if total != amount:
             raise ValueError(f"allocations sum {total} != order amount {amount}")
-        return parts
+        if max(seen) != leg_identity.generation:
+            raise InvalidTransitionError(f"an aggregate TP is hosted by its newest allocated generation {max(seen)}, "
+                                         f"not {leg_identity.generation}")
+        return sorted(parts, key=lambda part: part[2])
 
     @staticmethod
     def _outbox(row: sqlite3.Row) -> OutboxRecord:
@@ -3293,9 +3350,18 @@ class NeutralGridStore:
                  None if row.is_maker is None else int(row.is_maker), row.timestamp_ms, inbox_id, int(late), now))
         self._x("UPDATE legs SET filled = ?, updated_at_ms = ? WHERE cid = ?",
                 (canonical_decimal(leg.filled + row.size), now, cid))
-        has_allocations = self._x("SELECT 1 FROM allocations WHERE cid = ?", (cid,)).fetchone() is not None
-        if not has_allocations:
+        shares = self.leg_allocation(cid)
+        if shares is None:
             self._credit_cycle(leg.grid_id, leg.cell_id, leg.generation, leg.role, row.size)
+        else:  # aggregate TP: split by water-filling the cumulative fill in generation order (WS-A model)
+            before, after = _water_fill(shares, leg.filled), _water_fill(shares, leg.filled + row.size)
+            for generation in sorted(shares):
+                delta = after[generation] - before[generation]
+                if delta > 0:
+                    self._x("INSERT INTO fill_allocations(dedupe_key, grid_id, cell_id, generation, amount) "
+                            "VALUES (?, ?, ?, ?, ?)", (key, leg.grid_id, leg.cell_id, generation,
+                                                       canonical_decimal(delta)))
+                    self._credit_cycle(leg.grid_id, leg.cell_id, generation, leg.role, delta)
         if late:
             self._x("UPDATE cycles SET late_evidence = 1 WHERE grid_id = ? AND cell_id = ? AND generation = ?",
                     (leg.grid_id, leg.cell_id, leg.generation))
@@ -3420,7 +3486,10 @@ class NeutralGridStore:
 
     def allocate_fill(self, tx: Optional[Transaction], dedupe_key: str,
                       parts: Sequence[Tuple[str, int, int, Decimal]]) -> None:
-        """Split one fill of an aggregated (same side + target) order across its cell allocations (AC-39)."""
+        """Assert the split of one aggregate-TP fill. Since the WS-A alignment, fills are split automatically at
+        history time by water-filling the leg's cumulative fill over ``{generation: share}``; this call is an
+        idempotent check (identical split -> no-op, anything else -> InvalidTransitionError). Only a fill that has
+        no split at all (pre-alignment rows) is split here explicitly."""
         with self._scope(tx):
             self._require_writer()
             fill = self._fill_by_key(dedupe_key)
