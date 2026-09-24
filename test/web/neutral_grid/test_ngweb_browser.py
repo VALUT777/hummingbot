@@ -377,3 +377,58 @@ async def test_browser_round3_redaction_and_extended_audits(make_web, tmp_path):
         assert "МИГРАЦИЯ СЕТКИ ng-test" in await page.eval("document.getElementById('f-confirmation-hint').textContent")
     finally:
         await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_history_conflict_ack_bound_to_viewed_set(make_web, tmp_path):
+    """M1: conflict versions rendered exactly; the ack sends the viewed set id + explicit pick; a changed set
+    shows the fresh set and needs a new operator click (never re-sent)."""
+    from test_ngweb_conflicts import ORDER_ID, TRADE_ID, conflict_snapshot
+
+    web = await make_web(conflict_snapshot())
+    web.gateway.live_clock = True
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("!document.getElementById('conflicts-card').hidden")
+        card = await page.eval("document.getElementById('conflicts-card').textContent")
+        assert TRADE_ID in card and ORDER_ID in card and "set-000000000001" in card and "зафиксирована" in card
+        await page.eval("document.querySelector('[data-cmd=baseline_audit]').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        await page.eval("{ const s = document.getElementById('f-action'); s.value = 'ack_history_conflict';"
+                        "s.dispatchEvent(new Event('change')); }")
+        radios = await page.eval("[...document.querySelectorAll('#f-conflicts input[type=radio]')].map(r => r.value)")
+        assert radios == ["c" * 16, "d" * 16]  # only the key without a committed version needs a pick
+        assert "ПРИНЯТЬ НАБОР set-000000000001" in await page.eval(
+            "document.getElementById('f-confirmation-hint').textContent")
+        await page.eval(f"document.getElementById('acc-1-{'d' * 16}').checked = true;"
+                        "document.getElementById('f-note').value = 'сверено';"
+                        "document.getElementById('f-ack').checked = true;"
+                        "document.getElementById('f-confirmation').value = 'ПРИНЯТЬ НАБОР set-000000000001'")
+        # a new contradiction appears before the click
+        web.gateway.snapshot = conflict_snapshot(set_id="set-000000000002", extra_version=True)
+        await page.eval("document.getElementById('cmd-submit').click()")
+        await page.wait_for("document.getElementById('cmd-error').textContent.includes('409')")
+        assert web.gateway.commands == []
+        assert "set-000000000002" in await page.eval("document.getElementById('f-conflicts').textContent")
+        assert await page.eval("document.querySelectorAll('#f-conflicts input[type=radio]:checked').length") == 0
+        assert await page.eval("document.getElementById('f-confirmation').value") == ""
+        await page.eval("new Promise(r => setTimeout(r, 2500))")
+        assert web.gateway.commands == []  # never re-sent on its own
+        await page.eval(f"document.getElementById('acc-1-{'e' * 16}').checked = true;"
+                        "document.getElementById('f-confirmation').value = 'ПРИНЯТЬ НАБОР set-000000000002';"
+                        "document.getElementById('cmd-submit').click()")
+        await page.wait_for("!document.getElementById('cmd-dialog').open")
+        [row] = web.gateway.commands
+        assert row["payload"]["conflict_set_id"] == "set-000000000002"
+        assert row["payload"]["accepted"] == {f"order:{ORDER_ID}": "e" * 16}
+        # engine-side refusal is shown as such
+        web.gateway.apply(row["id"], "REJECTED", {"error": "CONFLICT_SET_CHANGED"})
+        await page.wait_for("document.getElementById('pending-command').textContent.includes('аудит НЕ выполнен')")
+        # drill-down shows the conflict versions for a trade id beyond 2**53
+        await page.eval("document.getElementById('tab-lookup').click();"
+                        f"document.getElementById('lookup-id').value = '{TRADE_ID}';"
+                        "document.getElementById('lookup-form').requestSubmit()")
+        await page.wait_for("document.getElementById('lookup-result').textContent.includes('Конфликт истории')")
+        assert TRADE_ID in await page.eval("document.getElementById('lookup-result').textContent")
+    finally:
+        await browser.close()

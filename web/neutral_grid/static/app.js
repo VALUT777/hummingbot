@@ -66,6 +66,7 @@
   }
   function confirmationPhrase(action, cid) {
     if (action === "retire_colliding_cid") return "СПИСАТЬ CID " + (cid || "");
+    if (action === "ack_history_conflict") return "ПРИНЯТЬ НАБОР " + txt(S.dialogConflict && S.dialogConflict.id);
     return "МИГРАЦИЯ СЕТКИ " + txt(S.state && S.state.engine_identity && S.state.engine_identity.grid_id);
   }
   var COMMAND_HELP = {
@@ -355,6 +356,7 @@
     renderErrors(st.errors || []);
     renderRecentCommands(st.recent_commands || []);
     renderUnmatched(st.unmatched_evidence || []);
+    renderConflicts(st.summary || {});
   }
 
   function renderSummary(s) {
@@ -514,6 +516,39 @@
     if (!rows.length) { ul.appendChild(el("li", { text: "Команд ещё не было." })); return; }
     rows.forEach(function (c) { ul.appendChild(commandLine(c)); });
   }
+  // History conflicts: every version of a key side by side, exact strings, committed one marked (AC-40).
+  function conflictTable(conflict, pick) {
+    var versions = conflict.versions || [];
+    var fields = [];
+    versions.forEach(function (v) { Object.keys(v.summary || {}).forEach(function (k) { if (fields.indexOf(k) < 0) fields.push(k); }); });
+    var head = el("tr", {}, [el("th", { scope: "col", text: "Версия" }), el("th", { scope: "col", text: "Статус" })]
+      .concat(fields.map(function (f) { return el("th", { scope: "col", text: f }); })));
+    var body = el("tbody");
+    versions.forEach(function (v) {
+      var first = [el("code", { text: txt(v.fingerprint) })];
+      if (pick) {
+        var id = "acc-" + pick.index + "-" + v.fingerprint;
+        first = [el("label", { cls: "check", for: id }, [el("input", { type: "radio", name: "acc-" + pick.index, id: id,
+          value: String(v.fingerprint), "data-key": String(conflict.key) }), el("code", { text: txt(v.fingerprint) })])];
+      }
+      body.appendChild(el("tr", {}, [td("Версия", first), td("Статус", [v.committed ? "зафиксирована" : "не зафиксирована"])]
+        .concat(fields.map(function (f) { return td(f, [el("span", { cls: "mono", text: txt((v.summary || {})[f]) })]); }))));
+    });
+    return el("div", { cls: "table-wrap" }, [el("table", { cls: "plain" }, [el("thead", {}, [head]), body])]);
+  }
+  function renderConflicts(summary) {
+    var list = summary.history_conflicts || [];
+    $("conflicts-card").hidden = !list.length;
+    var box = $("conflicts-list");
+    clear(box);
+    $("conflicts-set").textContent = list.length ? "Набор: " + txt(summary.conflict_set_id) +
+      ". Аудит («Аудит / ручная сверка…» → конфликт истории) подтверждает ровно этот набор." : "";
+    list.forEach(function (c) {
+      box.appendChild(el("h3", { text: txt(c.stream) + " · " + txt(c.key) }));
+      box.appendChild(conflictTable(c, null));
+    });
+  }
+
   function renderUnmatched(items) {
     $("unmatched-card").hidden = !items.length;
     var ul = $("unmatched-list");
@@ -567,12 +602,26 @@
       var obs = el("input", { id: "f-observed", inputmode: "decimal", spellcheck: "false" });
       var cidLabel = el("label", { for: "f-cid", text: "Client order ID" });
       var cid = el("input", { id: "f-cid", inputmode: "numeric", spellcheck: "false", maxlength: "20" });
+      // M1: bind the ack to the conflict set on screen now; keys without a committed version need an explicit pick
+      S.dialogConflict = { id: summaryNow.conflict_set_id || null, conflicts: summaryNow.history_conflicts || [] };
+      var conflictBox = el("div", { id: "f-conflicts", cls: "stack" });
+      conflictBox.appendChild(el("p", { cls: "hint", text: "Набор конфликтов: " + txt(S.dialogConflict.id) }));
+      S.dialogConflict.conflicts.forEach(function (c, i) {
+        var committed = (c.versions || []).filter(function (v) { return v.committed; })[0];
+        conflictBox.appendChild(el("h3", { text: txt(c.stream) + " · " + txt(c.key) }));
+        conflictBox.appendChild(el("p", { cls: "hint", text: committed ? "Зафиксирована версия " + committed.fingerprint +
+          "; остальные будут записаны в аудит как шум." : "Зафиксированной версии нет — выберите принимаемую версию:" }));
+        conflictBox.appendChild(conflictTable(c, committed ? null : { index: i }));
+      });
+      fields.appendChild(conflictBox);
       var confLabel = el("label", { for: "f-confirmation", text: "Фраза подтверждения" });
       var conf = el("input", { id: "f-confirmation", spellcheck: "false", maxlength: "80", autocomplete: "off" });
       var confHint = el("p", { cls: "hint", id: "f-confirmation-hint" });
       [obsLabel, obs, cidLabel, cid, confLabel, conf, confHint].forEach(function (n) { fields.appendChild(n); });
       var sync = function () {
-        var extended = sel.value === "retire_colliding_cid" || sel.value === "migrate_grid";
+        var extended = sel.value === "retire_colliding_cid" || sel.value === "migrate_grid" ||
+          sel.value === "ack_history_conflict";
+        conflictBox.hidden = sel.value !== "ack_history_conflict";
         obsLabel.hidden = obs.hidden = sel.value !== "baseline";
         cidLabel.hidden = cid.hidden = sel.value !== "resolve_unknown_submit" && sel.value !== "retire_colliding_cid";
         confLabel.hidden = conf.hidden = confHint.hidden = !extended;
@@ -617,8 +666,16 @@
       if (payload.action === "baseline") payload.observed_position = $("f-observed").value.trim();
       if (payload.action === "resolve_unknown_submit" || payload.action === "retire_colliding_cid")
         payload.cid = $("f-cid").value.trim();
-      if (payload.action === "retire_colliding_cid" || payload.action === "migrate_grid")
+      if (payload.action === "retire_colliding_cid" || payload.action === "migrate_grid" ||
+          payload.action === "ack_history_conflict")
         payload.confirmation = $("f-confirmation").value.trim();
+      if (payload.action === "ack_history_conflict") {
+        payload.conflict_set_id = S.dialogConflict && S.dialogConflict.id;   // the set the operator looked at
+        payload.accepted = {};
+        document.querySelectorAll("#f-conflicts input[type=radio]:checked").forEach(function (r) {
+          payload.accepted[r.getAttribute("data-key")] = r.value;
+        });
+      }
       return payload;
     }
     var reason = $("f-reason") ? $("f-reason").value.trim() : "";
@@ -669,6 +726,9 @@
     box.appendChild(el("span", { cls: "status", text: COMMAND_STATUS[c.status] || txt(c.status) }));
     if (replay) box.appendChild(el("span", { text: " (повтор: возвращена та же команда)" }));
     if (c.result) box.appendChild(el("div", { cls: "hint", text: "Результат движка: " + (typeof c.result === "string" ? c.result : JSON.stringify(c.result)) }));
+    if (c.result && c.result.error === "CONFLICT_SET_CHANGED")
+      box.appendChild(el("div", { cls: "form-error", text: "Набор конфликтов изменился до применения: аудит НЕ выполнен. " +
+        "Проверьте свежий набор выше и подтвердите заново (новой командой)." }));
   }
   async function pollCommand(id, attempt) {
     if (!S.pendingCommand || String(S.pendingCommand.id) !== String(id) || attempt > 120) return;
@@ -698,6 +758,10 @@
         // Never auto-applied and never re-sent by itself: the dialog shows the fresh state and revisions,
         // keeps the operator's inputs, and one explicit click re-issues with a brand-new key.
         var prev = commandPayload(S.dialogKind);
+        if (res.code === "conflict_set_changed" || res.code === "conflict_set_unavailable") {
+          // a different conflict set is a different decision: picks and the phrase naming the old set are dropped
+          delete prev.confirmation; delete prev.accepted; delete prev.conflict_set_id;
+        }
         var fresh = res.current ? { cfg: res.current.config_revision, eng: res.current.engine_revision } : null;
         openCommand(S.dialogKind, prev, fresh);
         $("cmd-error").textContent = "Команда НЕ поставлена в очередь (409). " + res.message +
@@ -989,6 +1053,11 @@
       if (d.truncated) out.appendChild(el("p", { cls: "form-error", text: "Внимание: поиск ордеров охватил не все записи " +
         "журнала (ограниченное окно). «Не найдено» здесь не доказывает отсутствие." }));
       d.snapshot_matches.forEach(function (m) {
+        if (m.source === "history_conflict") {
+          out.appendChild(el("article", { cls: "card" }, [el("h3", { text: "Конфликт истории " + txt(m.stream) + " · " + txt(m.key) }),
+            conflictTable(m, null)]));
+          return;
+        }
         var title = m.source === "snapshot_leg" ? "Нога " + m.role + " ячейки " + m.cell_id + " (поколение " + txt(m.generation) + ")" : "Несопоставленные данные";
         out.appendChild(el("article", { cls: "card" }, [el("h3", { text: title }), objectDl(m.leg || m.evidence)]));
       });

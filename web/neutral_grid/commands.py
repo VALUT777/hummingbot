@@ -44,6 +44,7 @@ EXTENDED_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid")
 FREEZE_CID = "CID_ALLOCATION"
 COMMAND_KINDS = {k.value: k.value for k in CommandKind}
 MAX_CID = (1 << 48) - 1
+_OPAQUE_RE = re.compile(r"[A-Za-z0-9_:.\-]{1,160}\Z")   # conflict set id / version fingerprints / conflict keys
 
 
 @dataclass(frozen=True)
@@ -212,6 +213,33 @@ class CommandService:
                                    "(grid_mutation_blockers пуст и опубликован движком).", blockers=blockers)
         return None
 
+    def _conflict_set_blocker(self, normalized: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[CommandOutcome]:
+        """M1: the ack names the published conflict set; every key without a committed version has an explicit pick."""
+        summary = snapshot.get("summary") or {}
+        current = summary.get("conflict_set_id")
+        conflicts = summary.get("history_conflicts")
+        if not current or not isinstance(conflicts, list):
+            return self._error(409, "conflict_set_unavailable",
+                               "Движок не опубликовал набор конфликтов истории; подтверждение привязать не к чему.")
+        if normalized["conflict_set_id"] != current:
+            return self._error(409, "conflict_set_changed",
+                               "Набор конфликтов изменился после просмотра (появились новые версии). Проверьте "
+                               "свежий набор и подтвердите заново.",
+                               conflict_set_id=current, history_conflicts=conflicts)
+        accepted = normalized["accepted"]
+        keys = {str(c.get("key")): c for c in conflicts}
+        unknown = sorted(set(accepted) - set(keys))
+        if unknown:
+            raise ValueError(f"accepted: ключи не из набора конфликтов: {unknown}.")
+        for key, conflict in keys.items():
+            versions = conflict.get("versions") or []
+            fingerprints = {str(v.get("fingerprint")) for v in versions}
+            if key in accepted and accepted[key] not in fingerprints:
+                raise ValueError(f"accepted[{key}]: такой версии нет среди показанных.")
+            if not any(v.get("committed") for v in versions) and key not in accepted:
+                raise ValueError(f"Для {key} нет зафиксированной версии: выберите принимаемую версию явно.")
+        return None
+
     async def _start_material_blocker(self, snapshot: Dict[str, Any], cur_cfg: int,
                                       cur_eng: int) -> Optional[CommandOutcome]:
         """E-09: the baseline is confirmed only for the grid/rules the applied Start acknowledged."""
@@ -275,6 +303,20 @@ class CommandService:
                 if not isinstance(cid, str) or not cid.isdigit() or int(cid) > MAX_CID:
                     raise ValueError("cid: строка с 48-битным client order ID.")
                 normalized["cid"] = cid
+            if action == "ack_history_conflict":
+                # M1 (AC-40): bound to the exact conflict set the operator reviewed; accepted versions explicit.
+                set_id = payload.get("conflict_set_id")
+                if not isinstance(set_id, str) or not _OPAQUE_RE.fullmatch(set_id):
+                    raise ValueError("conflict_set_id: нужен идентификатор просмотренного набора конфликтов.")
+                accepted = payload.get("accepted") or {}
+                if not isinstance(accepted, dict) or not all(
+                        isinstance(k, str) and _OPAQUE_RE.fullmatch(k) and isinstance(v, str) and _OPAQUE_RE.fullmatch(v)
+                        for k, v in accepted.items()):
+                    raise ValueError("accepted: объект {ключ конфликта: отпечаток выбранной версии}.")
+                expected = f"ПРИНЯТЬ НАБОР {set_id}"
+                if payload.get("confirmation") != expected:
+                    raise ValueError(f"Введите точную фразу подтверждения: «{expected}».")
+                normalized.update(conflict_set_id=set_id, accepted=dict(accepted), confirmation=expected)
             if action in EXTENDED_AUDIT_ACTIONS:
                 expected = self.confirmation_phrase(action, normalized.get("cid"))
                 if payload.get("confirmation") != expected:
@@ -299,6 +341,8 @@ class CommandService:
                     "baseline подтверждается только после применённого старта.")
             if kind == CommandKind.CONFIRM_BASELINE.value:
                 return normalized, await self._start_material_blocker(snapshot, cur_cfg, cur_eng)
+            if kind == CommandKind.BASELINE_AUDIT.value and normalized.get("action") == "ack_history_conflict":
+                return normalized, self._conflict_set_blocker(normalized, snapshot)
             if kind == CommandKind.BASELINE_AUDIT.value:
                 return normalized, self._extended_audit_blocker(normalized, snapshot)
             return normalized, None

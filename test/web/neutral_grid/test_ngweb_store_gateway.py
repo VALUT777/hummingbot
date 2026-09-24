@@ -160,10 +160,10 @@ async def test_audit_action_reaches_store_queue(make_web, store_pair):
     web = await make_web(gateway=gateway)
     await web.login()
     resp = await web.command("baseline_audit", "store-audit-000001",
-                             {"action": "ack_history_conflict", "note": "проверено", "acknowledge": True}, cfg=0, eng=0)
+                             {"action": "ack_risk_blocked", "note": "проверено", "acknowledge": True}, cfg=0, eng=0)
     assert resp.status == 202, await resp.text()
     [row] = writer.list_commands()
-    assert row.kind == "baseline_audit" and row.payload["action"] == "ack_history_conflict"
+    assert row.kind == "baseline_audit" and row.payload["action"] == "ack_risk_blocked"
 
 
 @pytest.mark.asyncio

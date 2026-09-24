@@ -197,3 +197,14 @@ collects 655 tests with 0 errors, and the combined run gives 655 passed, 230 sub
 Fields the web reads that the engine snapshot does not publish yet (WS-D):
 - `summary.colliding_cid`. Without it, retire needs a typed CID while the CID freeze is present.
 - `summary.grid_mutation_blockers`. Without it, migrate stays unavailable (fail-closed).
+
+
+## Round 4: M1, audit bound to the reviewed conflict set (AC-40, NG-UI-002)
+
+| Item | Fix | Tests (red → green) |
+|---|---|---|
+| Rendering | Overview card «Конфликты истории»: for each key, every version side by side (fingerprint, committed / not committed, all summary fields as exact strings), plus the `conflict_set_id`. The drill-down (`/api/lookup`) matches keys, fingerprints and summary values and renders the same table. | `test_ngweb_conflicts.py::test_conflict_set_rendered_exactly_and_in_drilldown` (int id beyond 2^53 served as an exact string) |
+| Bound ack | `ack_history_conflict` requires `conflict_set_id` (captured when the dialog opens from the snapshot on screen), `accepted` {key → fingerprint}, a note, `acknowledge` and the typed phrase «ПРИНЯТЬ НАБОР <set id>». The server checks: the set id equals the published `summary.conflict_set_id` (409 `conflict_set_changed` with the fresh set; unpublished → 409 `conflict_set_unavailable`); every key without a committed version has an explicit pick; picks name only shown versions of shown keys (422 otherwise). The UI shows radios only where no version is committed. | `::test_ack_payload_carries_set_id_and_accepted_versions`, `::test_ack_payload_validation[*]`, `::test_changed_set_is_409_with_fresh_set_never_enqueued`, `::test_engine_accepts_the_web_payload_shape` |
+| Changed set | On a 409 the dialog re-opens with the fresh set; picks and the phrase naming the old set are dropped, and a new operator click is required (nothing auto-resent). An engine-side REJECTED `CONFLICT_SET_CHANGED` is shown as «аудит НЕ выполнен». | B: `test_ngweb_browser.py::test_browser_history_conflict_ack_bound_to_viewed_set` |
+
+Coded against WS-D's announced fields `summary.history_conflicts` and `summary.conflict_set_id`. They are not in `codex/ng-engine` yet (checked `5f266ca83`), so until they land the web refuses the ack (409, fail-closed).
