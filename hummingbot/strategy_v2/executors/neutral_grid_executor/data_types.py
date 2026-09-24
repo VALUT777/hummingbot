@@ -119,7 +119,7 @@ class EngineMeta:
     seq: int = 0
     ever_normal: bool = False
     bootstrap_floor_ms: Optional[int] = None
-    history_reset_floor_ms: Optional[int] = None                # audited retention-gap reconciliation
+    history_reset: Dict[str, int] = field(default_factory=dict)  # stream -> floor ms after audited retention gap
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)
