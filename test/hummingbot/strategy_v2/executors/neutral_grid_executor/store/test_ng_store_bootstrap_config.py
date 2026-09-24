@@ -126,7 +126,7 @@ def test_changed_dimensions_are_rejected_at_open_and_revision(env):
 
 
 def _migration(new_grid_id="grid-b", n=40):
-    prices, cells = build_grid(n=n)
+    prices, cells = build_grid(n=n, anchor=Decimal("5.5"))
     return GridMigration(new_grid_id=new_grid_id, config_fingerprint=f"fp-5-6-{n}-10", config={"cell_count": n},
                          lower_price=Decimal("5"), upper_price=Decimal("6"), order_amount_base=Q, prices=prices,
                          cells=cells, anchor=Decimal("5.5"), actor="operator", reason="resize grid")
