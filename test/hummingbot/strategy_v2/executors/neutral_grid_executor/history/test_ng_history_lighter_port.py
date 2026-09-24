@@ -1,5 +1,6 @@
 """LighterExchangePort field mapping and transport classification (AC-22, AC-56, NG-HIST-001, NG-ORD-002)."""
 import json
+import traceback
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
@@ -20,7 +21,11 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     SubmitRequest,
     TransportOutcome,
 )
-from hummingbot.strategy_v2.executors.neutral_grid_executor.history import HistorySchemaError
+from hummingbot.strategy_v2.executors.neutral_grid_executor.history import (
+    HistorySchemaError,
+    HistoryScanner,
+    InMemoryHistoryCursorView,
+)
 from hummingbot.strategy_v2.executors.neutral_grid_executor.lighter_port import (
     LighterExchangePort,
     order_row_from_raw,
@@ -343,6 +348,51 @@ class LighterPortTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(expected, rules.supports_post_only)
                 self.assertEqual(Decimal("0.0001"), rules.tick_size)
         self.assertEqual(len(cases), self.connector._update_trading_rules.await_count)  # always refreshed
+
+    @staticmethod
+    def leaky_content_type_error():
+        """The real aiohttp error whose text carries the request URL, including ``auth=`` (critic C1)."""
+        import aiohttp
+        import yarl
+        from multidict import CIMultiDict, CIMultiDictProxy
+        url = yarl.URL("https://api.rh.lighter.xyz/api/v1/accountActiveOrders?account_index=1&auth=tok-SECRET-123")
+        info = aiohttp.RequestInfo(url, "GET", CIMultiDictProxy(CIMultiDict()), url)
+        return aiohttp.ContentTypeError(info, (), message="Attempt to decode JSON with unexpected mimetype: text/html")
+
+    async def test_port_errors_carry_only_the_exception_type_never_its_text(self):
+        leak = self.leaky_content_type_error()
+        self.assertIn("SECRET", str(leak))
+        self.connector.fetch_active_orders = AsyncMock(side_effect=leak)
+        self.connector.fetch_account_position = AsyncMock(side_effect=leak)
+        self.connector.fetch_inactive_orders_page = AsyncMock(side_effect=leak)
+        self.connector.fetch_trades_page = AsyncMock(side_effect=leak)
+        self.connector._update_trading_rules = AsyncMock(side_effect=leak)
+        calls = {
+            "active_orders": self.port.active_orders,
+            "position": self.port.position,
+            "inactive_orders_page": lambda: self.port.inactive_orders_page(None),
+            "trades_page": lambda: self.port.trades_page(None),
+            "trading_rules": self.port.trading_rules,
+        }
+        for name, call in calls.items():
+            with self.subTest(name):
+                with self.assertRaises(Exception) as ctx:
+                    await call()
+                error = ctx.exception
+                rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+                self.assertNotIn("SECRET", rendered)
+                self.assertNotIn("auth=", rendered)
+                self.assertNotIn("SECRET", repr(error))
+                self.assertIsNone(error.__cause__)
+                self.assertIsNone(error.__context__)
+                self.assertIn("ContentTypeError", str(error))
+                self.assertEqual("ContentTypeError", getattr(error, "original_type", None))
+
+    async def test_scanner_reason_keeps_only_the_original_error_type(self):
+        self.connector.fetch_inactive_orders_page = AsyncMock(side_effect=self.leaky_content_type_error())
+        scanner = HistoryScanner(self.port, InMemoryHistoryCursorView(self.port.domain), Decimal("60"), 700)
+        result = await scanner.scan()
+        self.assertEqual("page_fetch_error:inactive_orders:ContentTypeError", result.incomplete_reason)
 
     async def test_position_scope_is_checked(self):
         self.connector.fetch_account_position = AsyncMock(return_value={

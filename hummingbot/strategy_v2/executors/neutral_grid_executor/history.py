@@ -52,7 +52,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Callable, Deque, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Deque, Dict, FrozenSet, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     ExchangeOrderRow,
@@ -87,6 +87,7 @@ REASON_OVERSIZED_PAGE = "oversized_page"
 REASON_ORDERING_VIOLATION = "ordering_violation"
 REASON_CONFLICT = "conflict"
 REASON_RETENTION_GAP = "retention_gap"
+REASON_LEDGER_CORRECTION = "ledger_correction_required"
 
 OPEN_ORDER_STATUSES = frozenset({"open", "pending", "in-progress"})
 FILLED_ORDER_STATUS = "filled"
@@ -221,6 +222,48 @@ class HistoryCursorView(Protocol):
         """Without a high-water mark: optional lower boundary (ms); None means walk to the natural end."""
         ...
 
+    # Optional (read with getattr, absent = no resolutions): ``audited_resolutions() -> Iterable[AuditedResolution]``
+    # returns the operator-audited verdicts the engine persisted (see ``AuditedResolution``).
+
+
+@dataclass(frozen=True)
+class AuditedResolution:
+    """Operator-audited verdict for one contradicted history key (AC-40/AC-12, NG-OPS-003).
+
+    The engine persists these (e.g. from ``ack_history_conflict``) and serves them through the optional
+    ``HistoryCursorView.audited_resolutions()``. For the key:
+
+    * a row whose fingerprint equals ``accepted_fingerprint`` is normal evidence (offered/idempotent);
+    * a row whose fingerprint is in ``rejected_fingerprints`` is audited noise: it is skipped and does not
+      make the walk incomplete;
+    * any other (new, unaudited) fingerprint is still a conflict;
+    * if the accepted payload differs from the committed one, and the committed one is audited as rejected,
+      the walk reports an explicit :class:`LedgerCorrection` (reason ``ledger_correction_required``) that
+      the engine must apply in one transaction; it is never applied through ``new_*``. A committed payload
+      that is neither accepted nor rejected stays a conflict.
+
+    ``accepted_fingerprint=None`` accepts no version (only the rejected ones become noise).
+    """
+    stream: str
+    key: Tuple
+    accepted_fingerprint: Optional[str]
+    rejected_fingerprints: FrozenSet[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class LedgerCorrection:
+    """An audited accepted payload that differs from the committed one; the engine applies it explicitly."""
+    stream: str
+    key: Tuple
+    committed_fingerprint: str
+    accepted_fingerprint: str
+    row: object          # the served row carrying the accepted payload
+
+
+def history_row_fingerprint(stream: str, row: object) -> str:
+    """Payload fingerprint of a trade or order row (the value audited resolutions refer to)."""
+    return trade_payload_fingerprint(row) if stream == STREAM_TRADES else order_payload_fingerprint(row)
+
 
 class InMemoryHistoryCursorView:
     """Reference HistoryCursorView (tests, offline demo). ``commit`` mimics the engine's atomic commit."""
@@ -233,6 +276,22 @@ class InMemoryHistoryCursorView:
         self._rows: Dict[str, Dict[Tuple, object]] = {STREAM_TRADES: {}, STREAM_ORDERS: {}}
         self.unresolved_ms = oldest_unresolved_ms
         self.floor_ms = bootstrap_floor_ms
+        self._resolutions: Dict[Tuple[str, Tuple], AuditedResolution] = {}
+
+    def audited_resolutions(self) -> List[AuditedResolution]:
+        return list(self._resolutions.values())
+
+    def record_resolution(self, resolution: AuditedResolution) -> None:
+        self._resolutions[(resolution.stream, tuple(resolution.key))] = resolution
+
+    def apply_ledger_corrections(self, corrections: Iterable[LedgerCorrection]) -> None:
+        """Explicit, audited replacement of committed payloads (the engine does this in one transaction)."""
+        for correction in corrections:
+            key = tuple(correction.key)
+            if self._payloads[correction.stream].get(key) != correction.committed_fingerprint:
+                raise HistorySchemaError(f"ledger correction for {key} does not match the committed payload")
+            self._payloads[correction.stream][key] = correction.accepted_fingerprint
+            self._rows[correction.stream][key] = correction.row
 
     def high_water(self, stream: str) -> Optional[str]:
         return self._high_water.get(stream)
@@ -311,6 +370,8 @@ class _StreamProgress:
     pages_read: int = 0
     duplicate_rows: int = 0
     saw_previous_high_water_row: bool = False
+    audited_noise: int = 0
+    corrections: Dict[Tuple, LedgerCorrection] = field(default_factory=dict)
 
 
 class HistoryScanner:
@@ -377,6 +438,10 @@ class HistoryScanner:
         self.last_result: Optional[HistoryScanResult] = None
         # Every version of every row withheld from the last finished walk (audit / manual review).
         self.last_conflicted_rows: Dict[str, List[object]] = {STREAM_TRADES: [], STREAM_ORDERS: []}
+        # Audited resolutions (loaded from the view at each walk start) and their effects on the last walk.
+        self._resolutions: Dict[Tuple[str, Tuple], AuditedResolution] = {}
+        self.last_ledger_corrections: List[LedgerCorrection] = []
+        self.last_audited_noise: Dict[str, int] = {STREAM_TRADES: 0, STREAM_ORDERS: 0}
         self.coalesced_calls = 0
 
     # ------------------------------------------------------------------ cadence / coalescing
@@ -457,8 +522,27 @@ class HistoryScanner:
             self._inflight = None
 
     # ------------------------------------------------------------------ scan machinery
+    def _load_resolutions(self) -> Dict[Tuple[str, Tuple], AuditedResolution]:
+        source = getattr(self._view, "audited_resolutions", None)
+        if source is None:
+            return {}
+        resolutions: Dict[Tuple[str, Tuple], AuditedResolution] = {}
+        for resolution in source() or ():
+            if (
+                not isinstance(resolution, AuditedResolution)
+                or resolution.stream not in (STREAM_TRADES, STREAM_ORDERS)
+                or not isinstance(resolution.key, (tuple, list))
+                or not (resolution.accepted_fingerprint is None or isinstance(resolution.accepted_fingerprint, str))
+                or not all(isinstance(fp, str) for fp in resolution.rejected_fingerprints)
+                or resolution.accepted_fingerprint in resolution.rejected_fingerprints
+            ):
+                raise HistorySchemaError("malformed audited resolution")
+            resolutions[(resolution.stream, tuple(resolution.key))] = resolution
+        return resolutions
+
     def _begin(self, now: float) -> Dict[str, _StreamProgress]:
         self._scan_started_at = now
+        self._resolutions = self._load_resolutions()
         unresolved_ms = self._view.oldest_unresolved_ms()
         progress = {}
         for stream, endpoint in ((STREAM_ORDERS, ENDPOINT_INACTIVE_ORDERS), (STREAM_TRADES, ENDPOINT_TRADES)):
@@ -573,7 +657,8 @@ class HistoryScanner:
         except HistorySchemaError as exc:
             return f"{REASON_SCHEMA_ERROR}:{progress.stream}:{exc}"
         except Exception as exc:  # noqa: BLE001 - any transport failure is a missing page
-            return f"{REASON_PAGE_FETCH_ERROR}:{progress.stream}:{type(exc).__name__}"
+            error_type = getattr(exc, "original_type", None) or type(exc).__name__  # type only, never text
+            return f"{REASON_PAGE_FETCH_ERROR}:{progress.stream}:{error_type}"
         progress.pages_read += 1
         if not isinstance(page, HistoryPage) or not isinstance(page.rows, list):
             return f"{REASON_SCHEMA_ERROR}:{progress.stream}:not a HistoryPage"
@@ -639,7 +724,17 @@ class HistoryScanner:
                 if progress.last_numeric_id is not None and numeric_id > progress.last_numeric_id:
                     return f"{REASON_ORDERING_VIOLATION}:{progress.stream}:trade id increased"
                 progress.last_numeric_id = numeric_id
-        elif not is_terminal_order_status(row.status):
+        resolution = self._resolutions.get((progress.stream, tuple(key)))
+        if resolution is not None and fingerprint in resolution.rejected_fingerprints:
+            # Audited noise: the operator rejected exactly this payload. It still counts for the walk
+            # boundary and proves the key is served, but it is never evidence and never a conflict.
+            progress.audited_noise += 1
+            progress.oldest_ts_ms = timestamp_ms
+            previous = progress.previous_high_water
+            if previous is not None and tuple(previous.key) == tuple(key):
+                progress.saw_previous_high_water_row = True
+            return None
+        if progress.stream == STREAM_ORDERS and not is_terminal_order_status(row.status):
             self._add_conflict(progress, f"{REASON_CONFLICT}:inactive_order_not_terminal:{_key_label(key)}")
             self._withhold(progress, key, row)
         if progress.newest is None:
@@ -663,8 +758,17 @@ class HistoryScanner:
         progress.rows[key] = row
         committed = self._view.committed_payload(progress.stream, key)
         if committed is not None and committed != fingerprint:
-            self._add_conflict(progress, f"{REASON_CONFLICT}:committed_payload_mismatch:{_key_label(key)}")
-            self._withhold(progress, key, row)
+            if (
+                resolution is not None
+                and fingerprint == resolution.accepted_fingerprint
+                and committed in resolution.rejected_fingerprints
+            ):
+                progress.corrections[key] = LedgerCorrection(
+                    stream=progress.stream, key=key, committed_fingerprint=committed,
+                    accepted_fingerprint=fingerprint, row=row)
+            else:
+                self._add_conflict(progress, f"{REASON_CONFLICT}:committed_payload_mismatch:{_key_label(key)}")
+                self._withhold(progress, key, row)
         return None
 
     @staticmethod
@@ -714,15 +818,26 @@ class HistoryScanner:
             for name, progress in self._progress.items()
         }
         stream_conflicts = [c for p in self._progress.values() for c in p.conflicts]
+        corrections = [
+            correction for progress in self._progress.values() for key, correction in progress.corrections.items()
+            if key not in progress.conflicted_keys
+        ]
         if retention_gap:
             reason = REASON_RETENTION_GAP
         elif conflicts or stream_conflicts:
             reason = REASON_CONFLICT
+        elif corrections:
+            reason = REASON_LEDGER_CORRECTION
         else:
             reason = None
+        conflicts.extend(
+            f"{REASON_LEDGER_CORRECTION}:{correction.stream}:{_key_label(correction.key)}" for correction in corrections
+        )
         complete = reason is None
         result = self._result(complete, reason, pages, weight_used, conflicts=conflicts, high_water=high_water,
                               emit_rows=True)
+        self.last_ledger_corrections = corrections
+        self.last_audited_noise = {name: progress.audited_noise for name, progress in self._progress.items()}
         self.last_conflicted_rows = {
             name: [version for versions in progress.conflicted_keys.values() for version in versions]
             for name, progress in self._progress.items()

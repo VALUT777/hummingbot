@@ -29,7 +29,7 @@ processes).
 | Append-only / immutable | triggers abort UPDATE/DELETE of `cid_map`, `dedupe_keys`, `fills`, `audit_events`, `schema_migrations`, `config_revisions`, `baseline_adjustments`, delete of legs/cycles/cells/grids/outbox/inbox/conflicts; bootstrap fields, grid dimensions/Q/anchor, cell prices/sides and leg requests are immutable | no reset path exists even through a bug; baseline cannot be recaptured. |
 | Single writer | `flock` on `~/.hummingbot/neutral_grid/locks/neutral_grid.<domain>.<account>.<pair>.lock` (host-wide, independent of the checkout's `data_path`; `$HUMMINGBOT_NEUTRAL_GRID_HOST_DIR` overrides) **and** `<db>.lock`, plus `engine_owner` row re-checked inside every write transaction (fencing). Foreign-host owner row refused unless `takeover_foreign_host=True` (audited). **Not a distributed lock** (module + class docstrings). | NG-DB-001. |
 | Other processes | `open_readonly` (`mode=ro` + `query_only`), `open_command_client` (SQLite authorizer: INSERT into `commands` only) | UI reads committed snapshots, writes only commands. |
-| Schema | v2 = `m0001_initial` + `m0002_attempts_and_gaps` (`outbox_attempts`, `cursors.retention_gap_open`); `schema_migrations` (version, name, sha256) + `user_version` + `application_id`; unknown/newer/edited/gapped history refused; pending migrations applied one tx each with audit **after** identity/marker/fingerprint checks | fail-closed migrations. `m0001` is frozen; add `m0002_*`. |
+| Schema | v4 = `m0001_initial` + `m0002_attempts_and_gaps` (`outbox_attempts`, `cursors.retention_gap_open`) + `m0003_drilldown_indexes` + `m0004_dispatch_owner`; `schema_migrations` (version, name, sha256) + `user_version` + `application_id`; unknown/newer/edited/gapped history refused; pending migrations applied one tx each with audit **after** identity/marker/fingerprint checks | fail-closed migrations. `m0001` is frozen; add `m0002_*`. |
 | CID | `cid = cid_epoch << 40 | seq` (< 2**48); `cid_map` append-only, identity UNIQUE; exhaustion -> `CidExhaustedError`; own-map or foreign collision (`foreign_cids`, history, caller check) -> `CidCollisionError`, cleared only by audited `retire_cid` | AC-43; a database recreated after loss gets `epoch+1` so lost CIDs are never reused. |
 | Outbox protocol | intent tx -> `mark_dispatching` tx -> transport -> `record_transport_result` tx. A result other than NOT_SENT for a never-dispatched row is refused. PENDING after restart = provably unsent; DISPATCHED = unknown (leg SUBMIT_UNKNOWN). | narrows the ambiguous window without claiming exactly-once placement (NG-DB-002). |
 | History | `apply_history_batch` = inbox rows + canonical dedupe keys + exact-ID fill attribution + ledger transitions + cursors in the caller's tx; conflicts are durable rows (`history_conflicts`) | NG-HIST-002, AC-19/40. |
@@ -175,6 +175,19 @@ The tests cover ids above 2**53 / 2**63 round-tripping as exact strings (float-r
 match), paging through 6000 commands and 6000+ audit events down to id 1 on all three handle types, and a recursive
 no-float assertion over every returned record. Backward compatible: nothing existing changed; `OrderMatch` and
 `AuditEvent` are exported.
+
+## Round 3: B-09 restart variant (NG-DB-005, AC-56)
+
+Branch fast-forwarded to `codex/neutral-grid-implementation` @ `203e31370` first. Red test in `2e388477b` (tests only),
+fix in the next commit; schema v4 = `m0004_dispatch_owner` (`outbox_attempts.dispatch_owner`).
+
+| Finding | Fix | Test node ids | Failure at `2e388477b` | At tip |
+|---|---|---|---|---|
+| B-09 restart: DISPATCHED row (attempts 1) left by a dead process accepted NOT_SENT / zero-fill after reopen -> REJECTED_*, reservation released | `mark_dispatching` stores the store's owner token per attempt; `record_transport_result` finalises only if the attempt's `dispatch_owner` equals the current owner token, otherwise effective outcome UNKNOWN (detail names "another process"), leg SUBMIT_UNKNOWN, reservation kept, the attempt's own outcome recorded in `outbox_attempts`; NULL owners (pre-m0004 rows) count as another process | `test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_review_fixes.py::test_b09_restart_release_outcome_for_row_dispatched_by_dead_process_keeps_unknown` (NOT_SENT, DEFINITIVE_REJECT_ZERO_FILL)<br>`test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_review_fixes.py::test_b09_same_process_dispatch_may_still_release_on_proven_pre_send_failure` (control) | `REJECTED_UNSENT` / `REJECTED_ZERO_FILL` instead of `SUBMIT_UNKNOWN` (2 failed; control passed) | pass |
+
+For WS-D: a pre-send NOT_SENT must be recorded by the same process (store instance) that committed the dispatch mark.
+After a restart, every DISPATCHED row stays SUBMIT_UNKNOWN until history/active evidence or an audited manual
+reconciliation (`record_manual_reconciliation(leg_resolutions=...)`).
 
 ## Handoff to WS-D (engine)
 

@@ -258,13 +258,24 @@ def health_view(health: Optional[Dict[str, Any]], fresh: Dict[str, Any], now: fl
     errors = [health.get("persistence_error"), health.get("fatal_reason")]
     errors = [str(e) for e in errors if e]
     at = health.get("at")
+    stale_bound = fresh.get("stale_after_s")
+    outdated = (known and health.get("source") == "health_file" and isinstance(at, (int, float))
+                and isinstance(stale_bound, (int, float)) and now - at > stale_bound)
+    if outdated:
+        # E-03: an engine that cannot write (full/read-only disk) leaves an old "healthy" sidecar behind.
+        # A heartbeat older than the snapshot staleness bound proves nothing about the store now.
+        known = False
+        health["detail"] = f"файл здоровья движка устарел ({now - at:.0f} с)"
     view = {"known": known, "uncommitted": True, "source": health.get("source"),
             "persistence_error": health.get("persistence_error"), "fatal_reason": health.get("fatal_reason"),
             "at": at, "age_s": round(max(0.0, now - at), 3) if isinstance(at, (int, float)) else None,
             "engine_revision": health.get("engine_revision"), "detail": health.get("detail"), "banner": None}
+    view["known"] = known
+    view["detail"] = health.get("detail")
     if errors:
         view["banner"] = ("Сбой хранилища движка (не зафиксировано в снимке): " + "; ".join(errors) +
-                          ". Новые submit/cancel без зафиксированного намерения не отправляются.")
+                          ". Новые submit/cancel без зафиксированного намерения не отправляются." +
+                          (" Данные о здоровье устарели." if outdated else ""))
     elif not known and health.get("source") and fresh.get("stale"):
         view["banner"] = ("Снимок устарел, а состояние хранилища неизвестно (" + str(health.get("detail") or
                           "нет данных о здоровье движка") + ").")

@@ -17,7 +17,7 @@ lost-order paths never cancel them. The only stop path for those orders is the e
 import asyncio
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional
 
@@ -84,6 +84,30 @@ def validate_profile(controller) -> List[str]:
 def profile_warnings(controller) -> List[str]:
     return [f"{field} {getattr(controller, field)} differs from the profile default {value} LIT"
             for field, value in DEFAULT_CAPS.items() if getattr(controller, field) != value]
+
+
+@dataclass
+class LedgerPreflight:
+    db_path: Optional[str] = None
+    stop_ms: Optional[int] = None
+    cids: List[int] = dc_field(default_factory=list)
+    refusal: Optional[str] = None
+
+
+def ledger_preflight(ccfg, connector) -> LedgerPreflight:
+    """Before the connector's polling loops start: read the durable ledger (read-only, any schema this build can
+    upgrade) for its durable STOP and the engine-owned CIDs to register. An unreadable ledger refuses the start
+    with a clear message: never a silent continue without CID ownership or the stop state (C6)."""
+    result = LedgerPreflight()
+    try:
+        result.db_path = engine_db_path(ccfg.db_path, ccfg.connector_name, ccfg.trading_pair, connector)
+        result.cids = register_durable_cids(connector, result.db_path)
+        result.stop_ms = durable_stop_ms(result.db_path)
+    except Exception as exc:  # noqa: BLE001 - reported as a refusal, the engine never starts on guesses
+        result.cids, result.stop_ms = [], None
+        result.refusal = (f"the durable ledger {result.db_path} could not be read before start "
+                          f"({type(exc).__name__}): fix or restore it; start refused")
+    return result
 
 
 @dataclass
@@ -167,18 +191,15 @@ class LighterRobinhoodFixedNeutralGrid(V2WithControllers):
         connector = connectors.get(CONNECTOR_NAME)
         for controller in self.controllers.values():
             ccfg = controller.config
-            db_path = None
-            stop_ms = None
+            ledger = LedgerPreflight()
             if connector is not None:
-                try:
-                    db_path = engine_db_path(ccfg.db_path, ccfg.connector_name, ccfg.trading_pair, connector)
-                    # Before the connector's polling loops start: engine-owned CIDs of any previous run (even a
-                    # refused start protects them from Hummingbot's generic cancel paths).
-                    self.registered_cids += register_durable_cids(connector, db_path)
-                    stop_ms = durable_stop_ms(db_path)
-                except Exception as exc:  # noqa: BLE001 - the engine itself fails closed on an unreadable ledger
-                    self.logger().error(f"Neutral grid: could not read the durable ledger: {type(exc).__name__}: {exc}")
-            decision = evaluate_launch(ccfg, config, connector, stop_ms)
+                # Before the connector's polling loops start: engine-owned CIDs of any previous run (even a refused
+                # start protects them from Hummingbot's generic cancel paths) and the durable stop state.
+                ledger = ledger_preflight(ccfg, connector)
+                self.registered_cids += ledger.cids
+            decision = evaluate_launch(ccfg, config, connector, ledger.stop_ms)
+            if decision.refusal is None and ledger.refusal is not None:
+                decision.refusal = ledger.refusal
             for warning in profile_warnings(ccfg):
                 self.logger().warning(f"Neutral grid profile: {warning}")
             if decision.notice:
@@ -235,10 +256,15 @@ class LighterRobinhoodFixedNeutralGrid(V2WithControllers):
                     self.last_drain_outcome = self._durable_stop_outcome(executor)
                     if not executor.is_closed:
                         clean = False
-                        self.logger().warning(
-                            f"Neutral grid did not prove a clean stop in time; durable engine state: "
-                            f"{self.last_drain_outcome}. Engine-owned orders stay under engine control and are "
-                            f"reconciled on the next start (a durable STOP is never resumed automatically).")
+                        if self.last_drain_outcome == "STOP_NOT_APPLIED":
+                            self.logger().error(
+                                "Neutral grid STOP was NOT applied (no durable stop): its orders stay live and the "
+                                "grid resumes trading on its next start unless a STOP is applied first.")
+                        else:
+                            self.logger().warning(
+                                f"Neutral grid did not prove a clean stop in time; durable engine state: "
+                                f"{self.last_drain_outcome}. Its orders stay under engine control and are reconciled "
+                                f"on the next start (a durable STOP is never resumed automatically).")
                         executor.stop()
                     executors.remove(executor)
         return clean

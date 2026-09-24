@@ -2885,8 +2885,8 @@ class NeutralGridStore:
             now = self._clock_ms()
             self._x("UPDATE outbox SET status = 'DISPATCHED', attempts = attempts + 1, dispatched_at_ms = ?, "
                     "outcome = NULL, outcome_detail = NULL, result_at_ms = NULL WHERE id = ?", (now, outbox_id))
-            self._x("INSERT INTO outbox_attempts(outbox_id, attempt, dispatched_at_ms) VALUES (?, ?, ?)",
-                    (outbox_id, entry.attempts + 1, now))
+            self._x("INSERT INTO outbox_attempts(outbox_id, attempt, dispatched_at_ms, dispatch_owner) "
+                    "VALUES (?, ?, ?, ?)", (outbox_id, entry.attempts + 1, now, self._owner_token))
             if entry.kind == KIND_SUBMIT:
                 self._x("UPDATE orders SET submission_state = 'DISPATCHED', updated_at_ms = ? WHERE cid = ?",
                         (now, leg.cid))
@@ -2936,7 +2936,8 @@ class NeutralGridStore:
 
         Every dispatched attempt keeps its own outcome in ``outbox_attempts``. For a SUBMIT, NOT_SENT (proven: no
         transport call) and DEFINITIVE_REJECT_ZERO_FILL release the intent only when the CID cannot be at the venue:
-        the first attempt of a row that was never resent, no earlier UNKNOWN, no fills and no venue evidence
+        the first attempt of a row that was never resent, dispatched by THIS store instance (same owner token; after
+        a restart the dead process may have called transport), no earlier UNKNOWN, no fills and no venue evidence
         (acceptance, exchange order id, a recorded venue row, a LIVE leg). In every other case the CID may already be
         resting on the venue, so the leg stays SUBMIT_UNKNOWN (or its evidenced state), the reservation is kept and
         the row's effective outcome is UNKNOWN. UNKNOWN never releases anything.
@@ -3030,6 +3031,13 @@ class NeutralGridStore:
         """Why a NOT_SENT / zero-fill reject may NOT finalise this submit (None = it may)."""
         if entry.attempts > 1:
             return "the CID was resent after an unknown outcome"
+        if entry.attempts == 1:
+            owner = self._x("SELECT dispatch_owner FROM outbox_attempts WHERE outbox_id = ? AND attempt = 1",
+                            (entry.id,)).fetchone()
+            if owner is None or owner[0] is None or owner[0] != self._owner_token:
+                # B-09: only the process that committed the dispatch mark can know transport was not invoked; after a
+                # restart (new owner token) the dead process may have called it
+                return "dispatched by another process (restart); transport may have been invoked"
         earlier = self._x("SELECT count(*) FROM outbox_attempts WHERE outbox_id = ? AND attempt < ? "
                           "AND (outcome IS NULL OR outcome != 'NOT_SENT')", (entry.id, max(entry.attempts, 1))
                           ).fetchone()[0]

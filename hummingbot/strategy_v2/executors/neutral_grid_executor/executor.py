@@ -50,12 +50,34 @@ def engine_db_path(db_path: Optional[str], connector_name: str, trading_pair: st
                                               account_index=connector.account_index, trading_pair=trading_pair)))
 
 
+def open_ledger_readonly(db_path: str):
+    """Read-only handle for pre-start reads. A ledger written by an earlier build (older schema, e.g. v2 before
+    ``m0003``) is read with the migrations it already has: the executor's writer upgrades it on start, but the
+    launcher must see its durable stop and CIDs BEFORE that (C6). Anything else fails loudly."""
+    import sqlite3
+
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MIGRATIONS
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore, SchemaVersionError
+    try:
+        return NeutralGridStore.open_readonly(db_path)
+    except SchemaVersionError as exc:
+        if "older than" not in str(exc):
+            raise
+        raw = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True)
+        try:
+            version = int(raw.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            raw.close()
+        if not 1 <= version < len(MIGRATIONS):
+            raise
+        return NeutralGridStore.open_readonly(db_path, migrations=MIGRATIONS[:version])
+
+
 def durable_stop_ms(db_path: Optional[str]) -> Optional[int]:
     """``stop_requested_ms`` of a durable STOP in an existing ledger (read-only, no lock), else None."""
     if not db_path or not Path(db_path).exists():
         return None
-    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
-    store = NeutralGridStore.open_readonly(db_path)
+    store = open_ledger_readonly(db_path)
     try:
         meta = store.kv_get("engine_meta") or {}
     finally:
@@ -77,8 +99,7 @@ def register_durable_cids(owner: Any, db_path: Optional[str]) -> List[int]:
     if not has_cid_ownership(owner) or not db_path or not Path(db_path).exists():
         return []
     from hummingbot.strategy_v2.executors.neutral_grid_executor.engine import transport_cids_of
-    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
-    store = NeutralGridStore.open_readonly(db_path)
+    store = open_ledger_readonly(db_path)
     try:
         cids = transport_cids_of(store)
     finally:
@@ -128,6 +149,7 @@ class NeutralGridExecutor(ExecutorBase):
         self._stop_command_sent = False     # ... and a STOP row was APPLIED by the engine (only then durable)
         self._stop_keys: List[str] = []
         self._start_key: Optional[str] = None
+        self._start_attempts = 0
         self._start_refused = False
         self._migration_key: Optional[str] = None
         self._migration_attempts = 0
@@ -175,7 +197,10 @@ class NeutralGridExecutor(ExecutorBase):
         self._subscribe_wakeups(port)
         if self.config.operator_confirmed_start:
             self._start_key = f"launcher-start-{self.config.id}"
-            self._enqueue(CommandKind.START, launcher_start_payload(self.config), key=self._start_key)
+            try:
+                self._enqueue(CommandKind.START, launcher_start_payload(self.config), key=self._start_key)
+            except Exception as exc:  # noqa: BLE001 - _track_start re-sends a START whose row does not exist
+                self.logger().warning(f"Neutral grid START could not be enqueued ({type(exc).__name__}); retrying")
 
     def _resolve_cid_owner(self, port) -> Any:
         if self._cid_owner is not None:
@@ -256,7 +281,12 @@ class NeutralGridExecutor(ExecutorBase):
                 or engine.store.closed or not self._stop_keys:
             return
         record = engine.store.get_command(idempotency_key=self._stop_keys[-1])
-        if record is None or record.status == CommandStatus.QUEUED:
+        if record is None:
+            # The STOP insert itself failed (SQLITE_BUSY past the busy timeout, disk full, I/O): no row exists, so
+            # the stop is re-sent instead of being lost (D2-01).
+            self._send_stop()
+            return
+        if record.status == CommandStatus.QUEUED:
             return
         if record.status == CommandStatus.APPLIED:
             self._stop_command_sent = True
@@ -267,15 +297,31 @@ class NeutralGridExecutor(ExecutorBase):
     def _send_stop(self) -> None:
         key = f"executor-stop-{self.config.id}-{os.getpid()}-{len(self._stop_keys) + 1}"
         self._stop_keys.append(key)
-        self._enqueue(CommandKind.STOP, {"reason": "hummingbot stop (executor early_stop)", "keep_position": True},
-                      key=key)
+        try:
+            self._enqueue(CommandKind.STOP, {"reason": "hummingbot stop (executor early_stop)", "keep_position": True},
+                          key=key)
+        except Exception as exc:  # noqa: BLE001 - retried by _track_stop until a STOP row is APPLIED
+            self.logger().warning(f"Neutral grid STOP could not be enqueued ({type(exc).__name__}); retrying")
 
     def _track_start(self) -> None:
+        """The launcher START (incl. a confirmed resume) is the operator's own intent: a CONFLICT (another command
+        applied first, state changed) is re-sent with fresh revisions and a new key; a REJECTED is surfaced."""
         engine = self.engine
         if self._start_key is None or self._start_refused or engine.store is None or engine.store.closed:
             return
         record = engine.store.get_command(idempotency_key=self._start_key)
-        if record is not None and record.status == CommandStatus.REJECTED:
+        if record is None or record.status == CommandStatus.CONFLICT:
+            self._start_attempts += 1
+            self._start_key = f"launcher-start-{self.config.id}-{self._start_attempts}"
+            try:
+                self._enqueue(CommandKind.START, launcher_start_payload(self.config), key=self._start_key)
+            except Exception as exc:  # noqa: BLE001 - retried next tick
+                self.logger().warning(f"Neutral grid START could not be enqueued ({type(exc).__name__}); retrying")
+            return
+        if record.status == CommandStatus.APPLIED:
+            self._start_key = None
+            return
+        if record.status == CommandStatus.REJECTED:
             self._start_refused = True
             error = (record.result or {}).get("error")
             self.start_error = f"launcher START refused: {error}"
@@ -355,7 +401,15 @@ class NeutralGridExecutor(ExecutorBase):
 
     # ------------------------------------------------------------------ WS wake-ups (not proof)
     def _wake(self, event_type: str, status: str, event: Any) -> None:
+        """Only this market's grid orders are hints: ExecutorBase listens on the whole connector (other pairs,
+        other controllers, manual orders), and a foreign trade id would never clear from the lag bookkeeping."""
         if self.engine is None:
+            return
+        pair = getattr(event, "trading_pair", None)
+        if pair is not None and pair != self.config.trading_pair:
+            return
+        order_id = str(getattr(event, "order_id", "") or "")
+        if not order_id.isdigit() or int(order_id) not in self.engine.order_meta:
             return
         self.engine.wake({"type": event_type, "status": status, "client_order_id": getattr(event, "order_id", None),
                           "trade_id": getattr(event, "exchange_trade_id", None)})

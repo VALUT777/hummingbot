@@ -171,6 +171,9 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
         "engine_config": dict(grid_config_to_json(engine.config), fingerprint=engine.fingerprint),
         "dust_total": str(dust_total),
         "freezes": dict(engine.meta.freezes),
+        # web D2-17 gates (the engine re-verifies at apply time)
+        "colliding_cid": _s(engine.meta.colliding_cid),
+        "grid_mutation_blockers": engine.grid_mutation_blockers(),
         "store_blockers": list(engine.store_entry_blockers),
         "open_conflicts": [{"id": c.id, "kind": c.kind, "cid": _s(c.cid), "detail": c.detail}
                            for c in engine.open_conflicts],

@@ -32,5 +32,7 @@ poll_interval_s: '5'
 entry_order_type: LIMIT_MAKER
 tp_order_type: LIMIT
 tp_gtt_seconds: 2419200
-# Optional; default is <hummingbot data path>/neutral_grid_<grid_id>.sqlite
+# Optional; default (null) is the per account/market ledger
+# <hummingbot data path>/neutral_grid/neutral_grid.<domain>.<account>.<pair>.sqlite3
+# (a new grid on that market is an audited migration of this ledger, never a new file)
 db_path: null

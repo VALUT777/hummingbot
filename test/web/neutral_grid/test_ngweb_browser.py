@@ -318,3 +318,62 @@ async def test_browser_409_is_reissued_by_one_operator_click_never_automatically
         assert web.gateway.commands == []
     finally:
         await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_round3_redaction_and_extended_audits(make_web, tmp_path):
+    """C1: no auth token in the DOM; D2-17: extended audits offered only when applicable, with typed phrase."""
+    from test_ngweb_round3 import SECRET, _cid_frozen_snapshot, _leaky_snapshot
+
+    leaky = _leaky_snapshot()
+    web = await make_web(leaky)
+    web.gateway.live_clock = True
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'DEGRADED'")
+        for tab in TABS[:3]:
+            await page.eval(f"document.getElementById('tab-{tab}').click()")
+            await page.eval("new Promise(r => setTimeout(r, 400))")
+            assert SECRET not in await page.eval("document.body.innerText")
+        # no CID freeze and unpublished mutation blockers: extended actions are not offered
+        await page.eval("document.getElementById('tab-overview').click();"
+                        "document.querySelector('[data-cmd=baseline_audit]').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        options = await page.eval("[...document.querySelectorAll('#f-action option')].map(o => o.value)")
+        assert "retire_colliding_cid" not in options and "migrate_grid" not in options
+        await page.eval("document.getElementById('cmd-dialog').close()")
+        # CID freeze published: retire offered, CID prefilled, exact phrase required and shown
+        web.gateway.snapshot = _cid_frozen_snapshot()
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'FROZEN'")
+        await page.eval("document.querySelector('[data-cmd=baseline_audit]').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        options = await page.eval("[...document.querySelectorAll('#f-action option')].map(o => o.value)")
+        assert "retire_colliding_cid" in options and "migrate_grid" not in options
+        await page.eval("{ const s = document.getElementById('f-action'); s.value = 'retire_colliding_cid';"
+                        "s.dispatchEvent(new Event('change')); }")
+        assert await page.eval("document.getElementById('f-cid').value") == "281474976710655"
+        assert "СПИСАТЬ CID 281474976710655" in await page.eval(
+            "document.getElementById('f-confirmation-hint').textContent")
+        await page.eval("document.getElementById('f-note').value = 'чужой ордер';"
+                        "document.getElementById('f-ack').checked = true;"
+                        "document.getElementById('f-confirmation').value = 'СПИСАТЬ CID 281474976710655';"
+                        "document.getElementById('cmd-submit').click()")
+        await page.wait_for("!document.getElementById('cmd-dialog').open")
+        [row] = web.gateway.commands
+        assert row["payload"]["action"] == "retire_colliding_cid" and row["payload"]["cid"] == "281474976710655"
+        web.gateway.apply(row["id"], "APPLIED", {"retired_cid": "281474976710655", "cleared": "CID_ALLOCATION"})
+        await page.wait_for("document.getElementById('pending-command').textContent.includes('retired_cid')")
+        # quiescent grid published: migrate offered with its own phrase
+        snap = _cid_frozen_snapshot()
+        snap["summary"]["grid_mutation_blockers"] = []
+        web.gateway.snapshot = snap
+        await page.eval("new Promise(r => setTimeout(r, 2500))")
+        await page.eval("document.querySelector('[data-cmd=baseline_audit]').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        options = await page.eval("[...document.querySelectorAll('#f-action option')].map(o => o.value)")
+        assert "migrate_grid" in options
+        await page.eval("{ const s = document.getElementById('f-action'); s.value = 'migrate_grid';"
+                        "s.dispatchEvent(new Event('change')); }")
+        assert "МИГРАЦИЯ СЕТКИ ng-test" in await page.eval("document.getElementById('f-confirmation-hint').textContent")
+    finally:
+        await browser.close()

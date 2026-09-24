@@ -548,3 +548,146 @@ def test_b_e_launcher_confirmations_bind_resume_and_migration_to_explicit_phrase
     script = LighterRobinhoodFixedNeutralGridConfig(live_start_confirmation=phrase,
                                                     migrate_grid_confirmation=migration_phrase("g1"))
     assert evaluate_launch(cfg, script, connector, durable_stop_ms=None).migrate is True
+
+
+# ------------------------------------------------------------------------------------------ round 3
+def _stopped_ledger(tmp_path, clock, fx):
+    """A first process: bootstrap, trade, then a durable STOP; returns the stop time recorded in the ledger."""
+    first = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(first.on_start())
+        _run(loop, first, clock, 25)
+        first.early_stop()
+        for _ in range(60):
+            _run(loop, first, clock, 1)
+            if first.close_type is not None:
+                break
+        stop_ms = first.engine.meta.stop_requested_ms
+        assert stop_ms is not None and first.engine.is_stopped
+        first.on_stop()
+        return stop_ms
+    finally:
+        loop.close()
+
+
+def test_c4_launcher_start_that_turns_conflict_is_resent_and_the_resume_applies(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, CommandStatus
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    stop_ms = _stopped_ledger(tmp_path, clock, fx)
+    client = NeutralGridStore.open_command_client(str(tmp_path / "ng.sqlite3"))
+    try:
+        eng = client.engine()
+        client.enqueue_command("web-pause-while-down", CommandKind.PAUSE, eng.config_revision, eng.engine_revision,
+                               {"reason": "clicked while Hummingbot was down"})
+    finally:
+        client.close()
+    second = _executor(tmp_path, clock, fx, operator_resume_stop_ms=stop_ms)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(second.on_start())
+        _run(loop, second, clock, 12)
+        starts = [c for c in second.engine.store.list_commands(limit=50) if c.kind == "start"]
+        assert any(c.status == CommandStatus.CONFLICT for c in starts)               # the race happened
+        assert any(c.status == CommandStatus.APPLIED and (c.payload or {}).get("resume_stop_ms") == stop_ms
+                   for c in starts), [(c.status, c.result) for c in starts]
+        assert second.engine.meta.stop_requested_ms is None                         # the resume took effect
+    finally:
+        second.engine.store.close()
+        loop.close()
+
+
+def test_c5_executor_forwards_only_this_markets_grid_fills_as_hints(tmp_path):
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    executor = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(executor.on_start())
+        _run(loop, executor, clock, 25)
+        engine = executor.engine
+        grid_cid = next(iter(engine.order_meta))
+        foreign_pair = MagicMock(trading_pair="ETH-USDG", order_id=str(grid_cid), exchange_trade_id="t-eth-1")
+        foreign_order = MagicMock(trading_pair="LIT-USDG", order_id="12345", exchange_trade_id="t-lit-manual")
+        ours = MagicMock(trading_pair="LIT-USDG", order_id=str(grid_cid), exchange_trade_id="t-lit-grid")
+        executor.process_order_filled_event(None, None, foreign_pair)
+        executor.process_order_filled_event(None, None, foreign_order)
+        assert engine.ws_pending == {}
+        executor.process_order_filled_event(None, None, ours)
+        assert "t-lit-grid" in engine.ws_pending
+    finally:
+        executor.engine.store.close()
+        loop.close()
+
+
+def test_c6_launcher_reads_an_older_schema_ledger_before_the_engine_upgrades_it(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import durable_stop_ms, register_durable_cids
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MIGRATIONS
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import EngineIdentity, NeutralGridStore
+    db = tmp_path / "old.sqlite3"
+    identity = EngineIdentity(connector_name="lighter_perpetual_robinhood", connector_domain="lighter_perpetual_robinhood",
+                              account_index=4242, trading_pair="LIT-USDG")
+    old = NeutralGridStore.open(db, identity, create_if_missing=True, migrations=MIGRATIONS[:-1],
+                                lock_dir=tmp_path / "locks")
+    try:
+        with old.transaction() as tx:
+            old.kv_set(tx, "engine_meta", {"stop_requested_ms": 1790000123000, "stop_outcome": "STOPPED"})
+    finally:
+        old.close()
+    assert durable_stop_ms(str(db)) == 1790000123000                     # older schema still readable
+    clock = FakeClock()
+    assert register_durable_cids(FakeExchange(clock), str(db)) == []
+
+
+def test_c6_launcher_refuses_to_start_when_the_ledger_cannot_be_read(tmp_path):
+    from scripts.lighter_robinhood_fixed_neutral_grid import ledger_preflight
+    db = tmp_path / "corrupt.sqlite3"
+    db.write_bytes(b"not a sqlite database at all" * 8)
+    clock = FakeClock()
+    connector = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    result = ledger_preflight(controller_config(enabled=True, db_path=str(db)), connector)
+    assert result.refusal and "ledger" in result.refusal                 # never a silent continue
+    assert result.stop_ms is None and result.cids == []
+    fresh = ledger_preflight(controller_config(enabled=True, db_path=str(tmp_path / "none.sqlite3")), connector)
+    assert fresh.refusal is None and fresh.stop_ms is None                # no ledger yet: first run
+
+
+def test_c7_example_config_documents_the_real_default_ledger_path():
+    text = EXAMPLE_CONTROLLER.read_text()
+    assert "neutral_grid_<grid_id>" not in text
+    assert "neutral_grid/neutral_grid.<domain>.<account>.<pair>.sqlite3" in text
+
+
+def test_d201_stop_whose_insert_failed_is_resent_until_applied(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import PersistenceError
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    executor = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(executor.on_start())
+        _run(loop, executor, clock, 25)
+        engine = executor.engine
+        real = engine.enqueue
+        failures = {"left": 2}
+
+        def flaky(kind, payload=None, *, key, expected=None):
+            if failures["left"] > 0:
+                failures["left"] -= 1
+                raise PersistenceError("database is locked (SQLITE_BUSY past the busy timeout)")
+            return real(kind, payload, key=key, expected=expected)
+
+        engine.enqueue = flaky
+        executor.early_stop()                                 # the STOP insert fails
+        for _ in range(80):
+            _run(loop, executor, clock, 1)
+            if executor.close_type is not None:
+                break
+        assert engine.meta.stop_requested_ms is not None
+        assert executor.close_type == CloseType.EARLY_STOP and fx.open_orders(owned=True) == []
+    finally:
+        if executor.engine.store is not None and not executor.engine.store.closed:
+            executor.engine.store.close()
+        loop.close()

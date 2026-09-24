@@ -7,6 +7,7 @@ import io
 import logging
 import socket
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
@@ -136,7 +137,7 @@ async def test_attach_mode_serves_store_and_never_logs_token(tmp_path, caplog):
         body.pop(key)
     writer.write_snapshot(None, body)
     (tmp_path / "ng.sqlite3.health.json").write_text(
-        '{"persistence_error": null, "fatal_reason": null, "at": "1", "engine_revision": 0}')
+        '{"persistence_error": null, "fatal_reason": null, "at": "%s", "engine_revision": 0}' % time.time())
     port = _free_port()
     args = launcher.parse_args(["--attach-db", str(db), "--port", str(port)])
     ready, stop, out = asyncio.Event(), asyncio.Event(), io.StringIO()
