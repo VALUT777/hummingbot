@@ -232,6 +232,19 @@ def trade_rows_from_raw(raw: Any, *, account_index: int) -> List[ExchangeTradeRo
     return rows
 
 
+def market_is_tradable(raw_info: Any) -> bool:
+    """Fail-closed market state from an ``orderBookDetails`` row (status, hidden, force_reduce_only)."""
+    if not isinstance(raw_info, dict):
+        return False
+    config = raw_info.get("market_config")
+    return (
+        raw_info.get("status") == "active"
+        and isinstance(config, dict)
+        and config.get("hidden") is False
+        and config.get("force_reduce_only") is False
+    )
+
+
 def _decimal_from_book_price(value: Any) -> Optional[Decimal]:
     # Hummingbot's in-memory order book stores prices as float; this is a reference price for
     # anchor/bounds checks only (never an id, quantity or ledger value).
@@ -288,8 +301,16 @@ class LighterExchangePort:
 
     # reads -----------------------------------------------------------------------------------
     async def trading_rules(self) -> TradingRules:
+        """Fresh rules; limit/post-only availability comes from the refreshed market state.
+
+        A market is tradable only if ``status == "active"`` and ``market_config`` carries boolean
+        ``hidden is False`` and ``force_reduce_only is False`` (the same rule as the legacy grid
+        snapshot). Anything else - including missing fields - reports both flags False so the engine
+        blocks new exposure (NG-GRID-003, NG-RISK-004). A market absent after refresh raises.
+        """
         await self._connector._update_trading_rules()
         market = self._connector.market_info_for_trading_pair(self._trading_pair)
+        tradable = market_is_tradable(getattr(market, "raw_info", None))
         max_leverage = market.max_leverage
         return TradingRules(
             tick_size=market.min_price_increment,
@@ -298,8 +319,8 @@ class LighterExchangePort:
             min_notional=market.min_quote_amount,
             max_base=None,
             max_leverage=max_leverage if max_leverage > 0 else None,
-            supports_limit=True,
-            supports_post_only=True,
+            supports_limit=tradable,
+            supports_post_only=tradable,
             fetched_at=self._clock(),
         )
 
