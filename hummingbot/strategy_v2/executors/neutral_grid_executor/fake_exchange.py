@@ -25,7 +25,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
-from typing import Callable, Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     ExchangeOrderRow,
@@ -288,6 +288,9 @@ class FakeExchange:
         self.weight_log: List[Tuple[float, str, int]] = []
         self.page_log: List[Tuple[float, str, Optional[str], int]] = []
         self.violations: List[str] = []
+        # Connector CID ownership (lighter_perpetual_derivative): engine-owned CIDs / CIDs no longer tracked.
+        self.history_reconciled: Set[int] = set()
+        self.released_tracking: Set[int] = set()
         self._ws_listeners: List[Callable[[Dict[str, object]], None]] = []
         self.ws_events: List[Dict[str, object]] = []
 
@@ -336,6 +339,22 @@ class FakeExchange:
     def remove_ws_listener(self, callback: Callable[[Dict[str, object]], None]) -> None:
         if callback in self._ws_listeners:
             self._ws_listeners.remove(callback)
+
+    # ------------------------------------------------------------------ connector CID ownership (same names)
+    def register_history_reconciled_order(self, client_order_id: int) -> None:
+        self.history_reconciled.add(int(client_order_id))
+
+    def release_history_reconciled_order(self, client_order_id: int) -> None:
+        self.released_tracking.add(int(client_order_id))
+
+    def hummingbot_cancel_all(self) -> List[int]:
+        """What a generic Hummingbot stop/exit ``cancel_all`` would cancel: own open orders the engine does NOT own
+        (the real connector skips history-reconciled CIDs). Returns the cancelled CIDs."""
+        victims = [o.client_order_id for o in self.open_orders(owned=True)
+                   if o.client_order_id not in self.history_reconciled]
+        for cid in victims:
+            self.venue_cancel(cid)
+        return victims
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -671,6 +690,7 @@ class FakeExchange:
 
     async def submit(self, req: SubmitRequest) -> TransportResult:
         behavior = self._next_behavior(self._submit_script, req.client_order_id, SubmitBehavior.ACCEPT)
+        self.history_reconciled.add(req.client_order_id)   # like submit_with_client_id: CID orders are engine-owned
         if req.reduce_only:
             self.violations.append(f"reduce_only submit cid={req.client_order_id}")
         record = CallRecord(at=self.clock.now(), kind="submit", client_order_id=req.client_order_id,

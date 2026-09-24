@@ -373,7 +373,8 @@ def test_ac43_cid_collision_fails_closed_without_new_id(tmp_path):
         h.tick(6)
         assert len(h.fx.submits()) == submits                                 # nothing sent
         assert "CID_ALLOCATION" in h.engine.meta.freezes                      # fail closed
-        assert h.state == EngineState.FROZEN or h.state == EngineState.RISK_BLOCKED
+        assert h.state == EngineState.DEGRADED, h.engine.reasons              # latched CID failure: system fault
+        assert "FROZEN:CID_ALLOCATION" in h.engine.tp_blockers                 # no TP with an unusable allocator
         assert all(c.client_order_id != next_cid for c in h.fx.submits())     # never reused / truncated
         assert not [v for v in h.fx.violations if "duplicate client order id" in v]
     finally:
@@ -479,5 +480,33 @@ def test_ac45_observed_position_must_equal_confirmed_b(tmp_path):
         cmd = _last_command(h)
         assert cmd["status"] == CommandStatus.REJECTED.value and cmd["result"]["error"] == "BASELINE_MISMATCH"
         assert cmd["result"]["observed_position"] == "12" and not h.engine.bootstrapped
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("rules, blocker, tp_blocked", [
+    ({"supports_limit": False, "supports_post_only": False}, "MARKET_NOT_TRADABLE", True),
+    ({"supports_post_only": False}, "POST_ONLY_UNSUPPORTED", False),      # LIMIT_MAKER entries, LIMIT TPs
+])
+def test_untradable_market_blocks_new_exposure_and_presend(tmp_path, rules, blocker, tp_blocked):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+    h = Harness(tmp_path, options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0))
+    try:
+        _started(h)
+        cell = h.buy_cells()[-1]
+        h.fx.set_rules(**rules)                     # the connector reports the market as not (fully) tradable
+        h.fx.fill(h.live_order(cell, LegRole.ENTRY).cid, D("10"))
+        entries = [c for c in h.fx.submits() if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.ENTRY]
+        h.tick(12)
+        assert blocker in h.engine.entry_blockers and h.state == EngineState.DEGRADED, h.engine.reasons
+        assert (blocker in h.engine.tp_blockers) is tp_blocked
+        assert [c for c in h.fx.submits()
+                if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.ENTRY] == entries
+        tps = [c for c in h.fx.submits() if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.TP]
+        assert bool(tps) is not tp_blocked                          # a LIMIT TP still closes the obligation
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import SubmitRequest
+        req = SubmitRequest(client_order_id=1, side=Side.BUY, price=D("5.3"), amount=D("10"),
+                            order_type=OrderTypePolicy.LIMIT_MAKER, reduce_only=False, expiry_ms=None)
+        assert h.engine._pre_send_blocker(req) == blocker                # nothing reaches transport
     finally:
         h.close()

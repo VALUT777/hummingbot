@@ -9,17 +9,22 @@ never a 64-hex wallet key) and never logged.
 Live start needs ``enabled: true`` in the controller config AND an explicit confirmation phrase that binds the
 grid id and the signed initial position; ``enabled: false`` (the example default) refuses to start. Stopping
 never flattens: the engine drains its own orders and reports STOPPED / STOPPED_WITH_INVENTORY / STOP_UNCERTAIN.
+
+CID orders are engine-owned: at construction (before the connector's polling loops start) every durable CID that
+may have reached transport is registered with the connector, so Hummingbot's generic stop/exit ``cancel_all`` and
+lost-order paths never cancel them. The only stop path for those orders is the engine drain (``on_stop``).
 """
 import asyncio
 import os
 import time
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from pydantic import model_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import PositionMode
+from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import register_durable_cids
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
 from scripts.v2_with_controllers import V2WithControllers, V2WithControllersConfig
 
@@ -118,6 +123,15 @@ class LighterRobinhoodFixedNeutralGrid(V2WithControllers):
                 ccfg.enabled = False                   # the controller then creates no executor at all
         if self.refusal:
             self.logger().error(f"Fixed neutral grid refused to start: {self.refusal}")
+        self.registered_cids: List[int] = []
+        connector = connectors.get(CONNECTOR_NAME)
+        for controller in self.controllers.values():
+            # Even a refused start protects the orders of a previous run from Hummingbot's generic cancel paths.
+            try:
+                self.registered_cids += register_durable_cids(connector, controller.config.resolved_db_path())
+            except Exception as exc:  # noqa: BLE001 - the engine itself fails closed on an unreadable ledger
+                self.logger().error(f"Neutral grid: could not read durable CIDs for connector ownership: "
+                                    f"{type(exc).__name__}: {exc}")
 
     def apply_initial_setting(self):
         if self.refusal is None:
@@ -126,32 +140,46 @@ class LighterRobinhoodFixedNeutralGrid(V2WithControllers):
                 self.connectors[CONNECTOR_NAME].set_leverage(TRADING_PAIR, int(controller.config.leverage))
 
     def neutral_executors(self):
-        return [e for e in self.get_all_executors() if e.type == EXECUTOR_TYPE]
+        """Live executor objects (not the cached controller reports, which go stale during on_stop)."""
+        return [e for executors in self.executor_orchestrator.active_executors.values() for e in executors
+                if e.config.type == EXECUTOR_TYPE]
 
     async def on_stop(self):
         """NG-OPS-003: durable STOP (cancel own orders, keep position), then leave the engine ledger authoritative.
 
-        The executor is detached before the V2 orchestrator persists executors: its durable state lives in the
-        engine's SQLite ledger (and its config type is not part of the V2 executor registry, see trace).
+        The connector no longer cancels engine-owned CID orders on stop/exit, so this engine drain is their only
+        stop path. The executor is detached before the V2 orchestrator persists executors: its durable state lives
+        in the engine's SQLite ledger (and its config type is not part of the V2 executor registry, see trace).
         """
+        await self.drain_neutral_executors()
+        await super().on_stop()
+
+    async def drain_neutral_executors(self, timeout_s: float = STOP_DRAIN_TIMEOUT_S, poll_s: float = 1.0,
+                                      clock: Callable[[], float] = time.time) -> bool:
+        """Send the durable STOP through the orchestrator (-> executor.early_stop -> engine STOP command), wait until
+        the engine proves the drain (executor closes after STOPPED / STOPPED_WITH_INVENTORY) and detach the
+        executors. Returns True when every neutral executor closed within ``timeout_s``."""
         for controller in self.controllers.values():
             controller.stop()
-        actions = [StopExecutorAction(executor_id=e.id, controller_id=e.controller_id, keep_position=True)
+        actions = [StopExecutorAction(executor_id=e.config.id, controller_id=e.config.controller_id,
+                                      keep_position=True)
                    for e in self.neutral_executors() if e.is_active]
         if actions:
             self.executor_orchestrator.execute_actions(actions)
-        deadline = time.time() + STOP_DRAIN_TIMEOUT_S
-        while time.time() < deadline and any(e.is_active for e in self.neutral_executors()):
-            await asyncio.sleep(1.0)
+        deadline = clock() + timeout_s
+        while clock() < deadline and any(e.is_active for e in self.neutral_executors()):
+            await asyncio.sleep(poll_s)
+        clean = True
         for controller_id, executors in list(self.executor_orchestrator.active_executors.items()):
             for executor in list(executors):
                 if executor.config.type == EXECUTOR_TYPE:
                     if not executor.is_closed:
+                        clean = False
                         self.logger().warning("Neutral grid did not prove a clean stop in time; its durable state "
                                               "(STOP_UNCERTAIN) will be reconciled on the next start.")
                         executor.stop()
                     executors.remove(executor)
-        await super().on_stop()
+        return clean
 
     def format_status(self) -> str:
         lines = []

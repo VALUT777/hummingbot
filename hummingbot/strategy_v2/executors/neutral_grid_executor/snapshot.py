@@ -39,6 +39,9 @@ def _leg_view(engine, leg) -> Dict[str, Any]:
         "late_evidence": bool(leg.late_evidence),
         "cancel_reason": meta.cancel_reason if meta else None,
         "transport_detail": meta.transport_detail if meta else None,
+        # additive: aggregate TP shares (generation -> qty) and the operator-audited cumulative after late evidence
+        "allocation": None if not leg.allocation else {str(g): str(q) for g, q in sorted(leg.allocation.items())},
+        "audited_cumulative": meta.audited_cumulative if meta else None,
     }
 
 

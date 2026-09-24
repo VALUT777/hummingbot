@@ -239,3 +239,26 @@ def test_status_states_are_honest_during_bootstrap_and_reconcile(h):
     h.run_until(lambda: h.state == EngineState.NORMAL, max_ticks=10)
     assert h.engine.legs if hasattr(h.engine, "legs") else True
     assert all(leg.state != OrderState.INTENT for leg in h.engine.non_final_legs())
+
+
+def test_command_failing_after_a_store_write_is_rolled_back_then_rejected(h, monkeypatch):
+    """A store guard that fails after writing poisons the transaction: the engine never catch-and-commits. The
+    whole command transaction rolls back, memory is rebuilt from disk and the command is REJECTED in a new one."""
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import InvalidTransitionError
+    _started(h)
+    engine = h.engine
+
+    def poisoned(action, payload, now, tx):
+        engine.store.kv_set(tx, "poison", {"written": True})
+        engine.meta.operator_paused = True                         # memory ahead of the failing transaction
+        raise InvalidTransitionError("guard refused after a write")
+
+    monkeypatch.setattr(engine, "_cmd_reconcile", poisoned)
+    h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_risk_blocked"}, key="poison-cmd")
+    h.tick()
+    record = _cmd(h, "poison-cmd")
+    assert record.status == CommandStatus.REJECTED and "InvalidTransitionError" in record.result["detail"]
+    assert engine.store.kv_get("poison") is None                   # nothing of the failed command committed
+    assert engine.meta.operator_paused is False and engine.persistence_error is None
+    h.tick(2)
+    assert h.state == EngineState.NORMAL, h.engine.reasons

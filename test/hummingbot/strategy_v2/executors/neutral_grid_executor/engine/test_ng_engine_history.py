@@ -264,7 +264,7 @@ def test_ac42_release_waits_delay_and_repeat_scans(h):
     assert len(completed) >= h.config.settlement_scans
 
 
-def test_ac42_super_delayed_fill_after_reuse_goes_to_old_cycle_and_freezes(tmp_path):
+def test_ac42_super_delayed_fill_after_reuse_freezes_and_goes_to_old_cycle_only_by_audit(tmp_path):
     h = Harness(tmp_path, fx_kwargs={"min_base": D("1")})
     try:
         _started(h)
@@ -280,23 +280,42 @@ def test_ac42_super_delayed_fill_after_reuse_goes_to_old_cycle_and_freezes(tmp_p
         h.clock.advance(200)
         h.fx.set_position_external(D("3"))
         h.tick(10)
+        # The execution contradicts the settled order row (cumulative 0): the scanner withholds the key, the engine
+        # applies NO quantity for it (AC-40) and freezes the market for an operator audit.
         old = h.cell(cell).cycles[1]
-        assert old.generation == 1 and old.E == D("3")                  # assigned to the OLD cycle
+        assert old.generation == 1 and old.E == D("0")
+        assert not h.engine.store.fills(entry.cid)
         assert h.state == EngineState.FROZEN, (h.state, h.engine.reasons)
-        assert any(c.kind == "LATE_FILL" for c in h.engine.open_conflicts)
-        assert h.engine.last_snapshot["cells"][cell]["late_evidence"] is True
-        assert h.engine.endpoints.P == h.fx.net_position == D("3")          # obligation visible, not guessed
+        assert [r.size for r in h.engine._withheld_late_trades()] == [D("3")]
         entries = len([c for c in h.fx.submits()
                        if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.ENTRY])
         h.tick(5)
+        assert h.cell(cell).cycles[1].E == D("0")
         assert len([c for c in h.fx.submits()
                     if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.ENTRY]) == entries
+        # Operator audit: in ONE transaction the withheld execution is committed to the OLD cycle, WS-A
+        # acknowledge_late_evidence corrects the leg, the audited cumulative is persisted and the conflicts resolved.
         h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_late_evidence", "note": "venue export reviewed"})
         h.tick()
-        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict", "note": "stale order row"})
+        old = h.cell(cell).cycles[1]
+        assert old.generation == 1 and old.E == D("3")                  # assigned to the OLD cycle
+        leg = h.engine.leg_by_cid(entry.cid)
+        assert leg.state == OrderState.TERMINAL and leg.terminal_cumulative == D("3") and not leg.late_evidence
+        assert h.engine.order_meta[entry.cid].audited_cumulative == "3"
+        assert h.engine.store.cycle(h.engine.grid_id, cell, 1).late_evidence == 2
+        assert not h.engine.open_conflicts
+        audit = h.engine.store.audit_events(kind="manual_reconcile")[0]                   # newest first
+        evidence = audit.payload["evidence"]
+        assert evidence["corrected_legs"][0]["cid"] == str(entry.cid)
+        assert evidence["corrected_legs"][0]["audited_cumulative"] == "3"
+        assert evidence["corrected_legs"][0]["venue_terminal_filled"] == "0"
+        assert [t["size"] for t in evidence["accepted_trades"]] == ["3"]
         h.tick(12)
         assert h.state != EngineState.FROZEN, h.engine.reasons                # audit unfreezes the market
-        assert h.cell(cell).cycles[1].E == D("3")                             # old cycle keeps its obligation
+        # The stale order row still contradicts the audited executions in every walk, but it carries no new
+        # evidence: history is complete again (no endless RECONCILING after an audit).
+        assert h.engine.history_complete and h.state == EngineState.NORMAL, h.engine.reasons
+        assert h.engine.endpoints.P == h.fx.net_position == D("3")          # obligation visible, not guessed
         # After the audit an ordinary TP of the OLD cycle closes the late obligation at the fixed target.
         old_tp = next(t for t in h.legs(cell, LegRole.TP) if t.identity.generation == 1)
         assert (old_tp.side, old_tp.price, old_tp.requested) == (Side.SELL, D("5.4"), D("3"))
@@ -305,6 +324,80 @@ def test_ac42_super_delayed_fill_after_reuse_goes_to_old_cycle_and_freezes(tmp_p
         old = h.cell(cell).cycles[1]
         assert old.E == old.X == D("3") and not h.engine.open_conflicts          # resolved, no re-latch
         assert h.state != EngineState.FROZEN
+        h.restart()                                                              # the audit survives a restart
+        h.tick(3)
+        leg = h.engine.leg_by_cid(entry.cid)
+        assert leg.terminal_cumulative == D("3") and not leg.late_evidence
+        assert h.cell(cell).cycles[1].E == h.cell(cell).cycles[1].X == D("3")
+    finally:
+        h.close()
+
+
+def _audited_late_fill(h, late_qty=D("3")):
+    """Settled entry (stale venue row: cumulative 0) whose execution shows up after the cell was reused, then the
+    operator audit. Returns (cell, entry leg)."""
+    _started(h)
+    cell = h.buy_cells()[-1]
+    entry = _entry(h, cell)
+    h.fx.order_by_cid(entry.cid).history_override = {"filled_base_amount": "0", "remaining_base_amount": "0"}
+    h.fx.fill(entry.cid, late_qty, history_lag_s=200)
+    h.fx.set_position_external(-late_qty)
+    h.fx.venue_cancel(entry.cid)
+    h.run_until(lambda: h.cell(cell).generation == 2 and h.live_order(cell, LegRole.ENTRY) is not None,
+                max_ticks=60)
+    h.clock.advance(200)
+    h.fx.set_position_external(late_qty)
+    h.tick(10)
+    assert h.state == EngineState.FROZEN and h.cell(cell).cycles[1].E == 0
+    h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_late_evidence", "note": "venue export reviewed"})
+    h.tick(8)
+    assert h.cell(cell).cycles[1].E == late_qty
+    return cell, entry
+
+
+def test_ac40_new_contradiction_after_late_audit_is_never_masked_or_applied(tmp_path):
+    h = Harness(tmp_path, fx_kwargs={"min_base": D("5")})
+    try:
+        cell, entry = _audited_late_fill(h)
+        assert h.engine.history_complete and h.state == EngineState.NORMAL, h.engine.reasons
+        audited = h.engine.store.fills(entry.cid)[0]
+        h.fx.inject_conflicting_trade(audited.trade_id_str, D("4"))       # same trade id, other payload
+        h.tick(8)
+        assert h.state == EngineState.FROZEN, h.engine.reasons
+        assert any("payload_mismatch" in r for r in h.engine.reasons)
+        assert h.cell(cell).cycles[1].E == D("3") and h.engine.store.fills(entry.cid)[0].size == D("3")
+        assert h.engine._withheld_late_trades() == []                   # a payload conflict is not late evidence
+    finally:
+        h.close()
+
+
+def test_ac39_aggregate_tp_over_audited_late_and_current_cycle_is_exact_and_durable(tmp_path):
+    h = Harness(tmp_path, fx_kwargs={"min_base": D("5")})
+    try:
+        cell, _ = _audited_late_fill(h)
+        assert not h.legs(cell, LegRole.TP)                                 # 3 < min_base: DUST alone
+        gen2 = h.live_order(cell, LegRole.ENTRY)
+        h.fx.fill(gen2.cid, D("4"))                                         # gen2 obligation 4: below min too
+        h.fx.venue_cancel(gen2.cid)                                         # both entries final -> aggregate
+        h.run_until(lambda: h.legs(cell, LegRole.TP), max_ticks=40)
+        tp = h.legs(cell, LegRole.TP)[0]
+        # One aggregate TP at the fixed target, hosted by the newest generation, with exact shares (AC-39).
+        assert (tp.side, tp.price, tp.requested, tp.identity.generation) == (Side.SELL, D("5.4"), D("7"), 2)
+        assert tp.allocation == {1: D("3"), 2: D("4")}
+        assert h.engine.store.leg_allocation(tp.cid) == {1: D("3"), 2: D("4")}
+        h.fx.fill(tp.cid, D("5"))                                            # water-fill: oldest generation first
+        h.tick(8)
+        assert (h.cell(cell).cycles[1].X, h.cell(cell).cycles[2].X) == (D("3"), D("2"))
+        h.crash_restart()
+        h.tick(3)
+        tp = h.engine.leg_by_cid(tp.cid)
+        assert tp.allocation == {1: D("3"), 2: D("4")} and tp.filled == D("5")
+        assert (h.cell(cell).cycles[1].X, h.cell(cell).cycles[2].X) == (D("3"), D("2"))
+        h.fx.fill(tp.cid, D("2"))
+        h.tick(12)
+        assert (h.cell(cell).cycles[1].E, h.cell(cell).cycles[1].X) == (D("3"), D("3"))
+        assert (h.cell(cell).cycles[2].E, h.cell(cell).cycles[2].X) == (D("4"), D("4"))
+        assert h.engine.store.verify_ledger() == []
     finally:
         h.close()
 

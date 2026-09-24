@@ -11,6 +11,7 @@ import logging
 import os
 import time
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from hummingbot.logger import HummingbotLogger
@@ -23,6 +24,30 @@ from hummingbot.strategy_v2.models.executors import CloseType
 
 EXECUTOR_TYPE = "neutral_grid_executor"
 _TRANSIENT_BASELINE_ERRORS = {"BOOTSTRAP_NOT_READY", None}
+
+
+def has_cid_ownership(owner: Any) -> bool:
+    return owner is not None and callable(getattr(owner, "register_history_reconciled_order", None)) \
+        and callable(getattr(owner, "release_history_reconciled_order", None))
+
+
+def register_durable_cids(owner: Any, db_path: Optional[str]) -> List[int]:
+    """Before the connector's polling loops start: mark every durable CID that may have reached transport as
+    engine-owned (``register_history_reconciled_order``) so Hummingbot's generic stop/exit/lost-order paths never
+    cancel, poll or re-send it. Reads the ledger read-only (takes no lock); a missing database registers nothing
+    (the engine itself fails closed on a missing DB with prior-run evidence)."""
+    if not has_cid_ownership(owner) or not db_path or not Path(db_path).exists():
+        return []
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.engine import transport_cids_of
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
+    store = NeutralGridStore.open_readonly(db_path)
+    try:
+        cids = transport_cids_of(store)
+    finally:
+        store.close()
+    for cid in cids:
+        owner.register_history_reconciled_order(cid)
+    return cids
 
 
 def register_executor_type() -> None:
@@ -48,7 +73,7 @@ class NeutralGridExecutor(ExecutorBase):
     def __init__(self, strategy, config: NeutralGridExecutorConfig, update_interval: float = 1.0,
                  max_retries: int = 10, *, port: Any = None, store: Any = None,
                  clock: Optional[Callable[[], float]] = None, options: Optional[EngineOptions] = None,
-                 offline_demo: bool = False):
+                 offline_demo: bool = False, cid_owner: Any = None):
         super().__init__(strategy=strategy, connectors=[config.connector_name], config=config,
                          update_interval=update_interval, max_retries=max_retries)
         self.config: NeutralGridExecutorConfig = config
@@ -57,6 +82,8 @@ class NeutralGridExecutor(ExecutorBase):
         self._clock = clock
         self._options = options
         self._offline_demo = offline_demo
+        self._cid_owner = cid_owner
+        self.registered_cids: List[int] = []
         self.engine = None
         self.start_error: Optional[str] = None
         self._stop_command_sent = False
@@ -98,9 +125,32 @@ class NeutralGridExecutor(ExecutorBase):
             self.start_error = self.engine.fatal_reason
             self.logger().error(f"Neutral grid engine is fail-closed: {self.start_error}")
             return
+        self._take_cid_ownership(port)
         self._subscribe_wakeups(port)
         if self.config.operator_confirmed_start:
             self._enqueue(CommandKind.START, {"source": "launcher"}, key=f"launcher-start-{self.config.id}")
+
+    def _resolve_cid_owner(self, port) -> Any:
+        if self._cid_owner is not None:
+            return self._cid_owner
+        candidates = [port]
+        connectors = getattr(self, "connectors", None) or {}
+        if isinstance(connectors, dict):
+            candidates.append(connectors.get(self.config.connector_name))
+        return next((c for c in candidates if has_cid_ownership(c)), None)
+
+    def _take_cid_ownership(self, port) -> None:
+        """CID orders are engine-owned: every durable CID that may have reached transport is registered with the
+        connector (idempotent; the launcher already did it before polling started) and connector tracking of a
+        CID stops once the engine proves its leg final (``release_history_reconciled_order``)."""
+        owner = self._resolve_cid_owner(port)
+        if owner is None:
+            return
+        self.registered_cids = self.engine.transport_cids()
+        for cid in self.registered_cids:
+            owner.register_history_reconciled_order(cid)
+        self.engine.leg_final_hook = owner.release_history_reconciled_order
+        self.engine.release_final_cids()
 
     def _subscribe_wakeups(self, port) -> None:
         """Private-stream activity only hints the history poller (coalesced); it is never evidence."""

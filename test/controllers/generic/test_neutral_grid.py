@@ -20,6 +20,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import Ne
 from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import (
     EXECUTOR_TYPE,
     NeutralGridExecutor,
+    register_durable_cids,
     register_executor_type,
 )
 from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeClock, FakeExchange
@@ -27,6 +28,7 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from scripts.lighter_robinhood_fixed_neutral_grid import (
     CONTROLLER_CONFIG_NAME,
+    LighterRobinhoodFixedNeutralGrid,
     LighterRobinhoodFixedNeutralGridConfig,
     confirmation_phrase,
     validate_api_credentials,
@@ -37,6 +39,12 @@ D = Decimal
 ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_CONTROLLER = ROOT / "conf/controllers/lighter_robinhood_fixed_neutral_grid.yml.example"
 EXAMPLE_SCRIPT = ROOT / "conf/scripts/lighter_robinhood_fixed_neutral_grid.yml.example"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_neutral_grid_host_dir(tmp_path, monkeypatch):
+    # Never touch the real host-wide lock/marker directory (~/.hummingbot/neutral_grid).
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "ng-host"))
 
 
 def controller_config(**updates):
@@ -272,4 +280,122 @@ def test_executor_wires_live_history_wakeups_as_hints_only(tmp_path):
         store_mod.default_lock_dir = original
         if executor.engine.store is not None and not executor.engine.store.closed:
             executor.engine.store.close()
+        loop.close()
+
+
+# ------------------------------------------------------------------------------------------ CID ownership / stop
+def test_durable_cids_are_registered_before_polling_and_released_once_final(tmp_path):
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    first = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(first.on_start())
+        _run(loop, first, clock, 25)
+        engine = first.engine
+        cell = max(c for c, ledger in engine.cells.items() if ledger.spec.entry_side.value == "BUY")
+        entry = next(leg for leg in engine.cells[cell].legs() if leg.state == OrderState.LIVE)
+        fx.fill(entry.cid, D("10"))                                     # entry final, its TP now live
+        for _ in range(40):
+            _run(loop, first, clock, 1)
+            if engine.leg_by_cid(entry.cid).state == OrderState.TERMINAL:
+                break
+        assert engine.leg_by_cid(entry.cid).state == OrderState.TERMINAL
+        assert entry.cid in fx.released_tracking                        # connector stops tracking it (no events)
+        live = {o.client_order_id for o in fx.open_orders(owned=True)}
+        assert live <= fx.history_reconciled                            # submitted CIDs are engine-owned
+        first.on_stop()                                                 # process exit: orders stay on the venue
+        assert fx.open_orders(owned=True)
+        # Next process: a fresh connector knows nothing; the launcher registers every durable CID that may have
+        # reached transport BEFORE the connector's polling loops start (read-only ledger access, no lock).
+        fx.history_reconciled.clear()
+        fx.released_tracking.clear()
+        cids = register_durable_cids(fx, first.config.db_path)
+        assert live <= set(cids) and entry.cid in cids and fx.history_reconciled == set(cids)
+        # Hummingbot's generic stop/exit cancel path skips engine-owned CIDs (the real connector filters them).
+        assert fx.hummingbot_cancel_all() == [] and fx.open_orders(owned=True)
+        second = _executor(tmp_path, clock, fx)
+        loop.run_until_complete(second.on_start())                    # idempotent re-registration + release
+        assert set(second.registered_cids) == set(cids) <= fx.history_reconciled
+        assert entry.cid in fx.released_tracking and not (live & fx.released_tracking)
+        second.on_stop()
+    finally:
+        loop.close()
+
+
+def test_register_durable_cids_needs_an_owner_and_an_existing_ledger(tmp_path):
+    clock = FakeClock()
+    assert register_durable_cids(FakeExchange(clock), str(tmp_path / "missing.sqlite3")) == []
+    assert register_durable_cids(object(), str(tmp_path / "missing.sqlite3")) == []
+
+
+def test_launcher_stop_drives_the_engine_drain(tmp_path):
+    """on_stop of the launcher is the ONLY stop path of engine-owned CID orders: StopExecutorAction ->
+    executor.early_stop -> durable STOP command -> engine cancels its own orders -> proven drain -> executor
+    closes -> detached. The running executor control loop does the work (nothing is cancelled by the launcher)."""
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    values = dict(connector_name="lighter_perpetual_robinhood", trading_pair="LIT-USDG", grid_id="g-stop",
+                  lower_price=D("5"), upper_price=D("6"), cell_count=10, order_amount_base=D("10"),
+                  leverage=D("5"), expected_initial_position=D("0"), max_abs_net_position=D("1000"),
+                  max_gross_position=D("1000"), max_active_orders=120, enabled=True,
+                  db_path=str(tmp_path / "ng.sqlite3"), operator_confirmed_start=True,
+                  operator_confirmed_baseline=True, timestamp=clock(), controller_id="ng-ctl")
+    executor = NeutralGridExecutor(_strategy(clock), NeutralGridExecutorConfig(**values), update_interval=0.001,
+                                   port=fx, clock=clock)
+    orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)   # no strategy/recorder side effects
+    orchestrator.active_executors = {"ng-ctl": [executor]}
+    orchestrator.cached_performance = {"ng-ctl": object()}
+    orchestrator.positions_held = {"ng-ctl": []}
+    launcher = LighterRobinhoodFixedNeutralGrid.__new__(LighterRobinhoodFixedNeutralGrid)
+    launcher.controllers = {}
+    launcher.executor_orchestrator = orchestrator
+
+    async def scenario():
+        running = True
+
+        async def advance_clock():
+            while running:
+                clock.advance(0.5)
+                await asyncio.sleep(0.002)
+
+        advancer = asyncio.ensure_future(advance_clock())
+        executor.start()
+        for _ in range(5000):
+            if executor.engine is not None and executor.engine.engine_state == EngineState.NORMAL \
+                    and len(fx.open_orders(owned=True)) == 10:
+                break
+            await asyncio.sleep(0.002)
+        engine = executor.engine
+        assert engine.engine_state == EngineState.NORMAL
+        cell = max(c for c, ledger in engine.cells.items() if ledger.spec.entry_side.value == "BUY")
+        fx.fill(next(leg for leg in engine.cells[cell].legs() if leg.state == OrderState.LIVE).cid, D("10"))
+        await asyncio.sleep(0.05)
+        cancels_before = len(fx.cancels())
+        clean = await launcher.drain_neutral_executors(timeout_s=30.0, poll_s=0.005)
+        running = False
+        await advancer
+        return engine, clean, cancels_before
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        engine, clean, cancels_before = loop.run_until_complete(scenario())
+        assert clean and executor.is_closed and executor.close_type == CloseType.EARLY_STOP
+        assert orchestrator.active_executors["ng-ctl"] == []                # detached before V2 persistence
+        assert engine.meta.stop_outcome == EngineState.STOPPED_WITH_INVENTORY.value
+        assert fx.open_orders(owned=True) == [] and fx.net_position == D("10")   # drained, never flattened
+        assert len(fx.cancels()) > cancels_before                            # the engine sent the cancels
+        assert engine.store.closed                                           # lock released by executor.on_stop
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
+        ro = NeutralGridStore.open_readonly(values["db_path"])
+        try:
+            cancelled = {c.client_order_id for c in fx.cancels()}
+            intents = {o.cid for cid in cancelled for o in ro.outbox_for_cid(cid) if o.kind == "CANCEL"}
+            assert cancelled == intents                                      # every cancel had a durable intent
+            assert [c.kind for c in ro.list_commands() if c.kind == "stop"]
+        finally:
+            ro.close()
+    finally:
+        asyncio.set_event_loop(None)
         loop.close()

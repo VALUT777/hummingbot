@@ -94,6 +94,7 @@ class OrderMeta:
     cancel_reason: Optional[str] = None
     cancel_requested_ms: Optional[int] = None
     cancel_sent_ms: Optional[int] = None
+    audited_cumulative: Optional[str] = None     # operator-audited cumulative after late evidence (exact decimal)
     transport_detail: Optional[str] = None
 
     def to_json(self) -> Dict[str, Any]:

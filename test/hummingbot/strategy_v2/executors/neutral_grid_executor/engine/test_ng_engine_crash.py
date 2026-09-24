@@ -417,3 +417,25 @@ def test_crash_at_every_persistence_window_restarts_consistently(tmp_path, point
         assert buys <= venue_side[Side.BUY] and sells <= venue_side[Side.SELL]   # never more than executed
     finally:
         h.close()
+
+
+def test_crash_after_cancel_dispatch_mark_resends_the_same_cancel(tmp_path):
+    """A cancel row left DISPATCHED by a dead process is re-sent for the SAME order (explicit resend_same_cid;
+    cancelling a known order is idempotent), never refused into a ledger freeze and never a new CID."""
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        h.command(CommandKind.STOP, key="stop-crash")
+        h.hooks.arm("before_transport")               # first STOP cancel: dispatch mark committed, venue never hit
+        assert h.tick_crashing(1)
+        store = h.engine.store
+        rows = [o for leg in h.engine.all_legs() for o in store.outbox_for_cid(leg.cid)
+                if o.kind == "CANCEL" and o.status == "DISPATCHED"]
+        assert len(rows) == 1 and h.fx.order_by_cid(rows[0].cid).is_open
+        h.run_until(lambda: h.engine.is_stopped, max_ticks=80)
+        assert h.fx.open_orders(owned=True) == []
+        assert len(store.outbox_attempts(rows[0].id)) == 2          # same row (same order) dispatched again
+        assert "LEDGER_INVARIANT" not in h.engine.meta.freezes
+        _assert_no_phantoms_and_no_new_cid(h)
+    finally:
+        h.close()
