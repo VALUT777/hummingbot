@@ -262,9 +262,12 @@ class TestLateEvidenceResolution(unittest.TestCase):
             h.fill(leg, q)
             h.ledger.confirm_terminal(leg, D(q))
         self.assertTrue(h.ledger.can_release(True).ok)
+        self.assertEqual([], h.ledger.check_invariants())
         h.ledger.release(True)
         e2 = h.entry()
         self.assertEqual((2, Side.BUY, D("10")), (e2.generation, h.leg(e2).side, h.leg(e2).requested))
+        self.assertEqual([], h.ledger.check_invariants())
+        self.assertEqual(frozenset({CellState.ENTRY_LIVE}), h.ledger.state_flags())
 
     def test_audited_execution_of_a_rejected_leg_becomes_terminal(self):
         h = Harness(BUY_CELL, r=rules(min_base="1", min_notional="0"))

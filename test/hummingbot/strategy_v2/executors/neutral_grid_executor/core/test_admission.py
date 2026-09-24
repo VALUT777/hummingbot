@@ -95,6 +95,25 @@ class TestSlotFormula(unittest.TestCase):
         self.assertEqual((2, 1), (plan.reservations[BUY_CELL.cell_id], plan.slots.free))
 
 
+class TestHeadOfLine(unittest.TestCase):
+    def test_head_needing_more_slots_blocks_cells_behind_and_arms_first(self):
+        # Review #7: min_notional 27 gives heterogeneous needs. SELL cell 23 (entry 5.4363, closest to 5.44)
+        # has TP 5.4181 -> min_valid 4.99 -> 4 slots; BUY cell 21 has TP 5.4 -> min_valid 5 -> 3 slots.
+        cells = sample_cells()
+        r = rules(min_base="0", min_notional="27")
+        self.assertEqual((4, 3), (admission.required_slots(Q, r, cells[23].tp_price),
+                                  admission.required_slots(Q, r, cells[21].tp_price)))
+        idle = [CellAdmission(cells[21], open_cycle=False), CellAdmission(cells[23], open_cycle=False)]
+        busy = CellAdmission(cells[30], open_cycle=True, actual_orders=1, reserved_slots=4, slot_need=4)
+        plan = admission.plan(idle + [busy], cap=7, mid=D("5.44"), rules=r, order_amount_base=Q)
+        self.assertEqual(3, plan.slots.free)
+        self.assertEqual(((), (23, 21)), (plan.newly_armed, plan.queued))  # 21 would fit, but must not skip
+        plan = admission.plan(idle, cap=6, mid=D("5.44"), rules=r, order_amount_base=Q)   # cell 30 released
+        self.assertEqual(((23,), (21,)), (plan.newly_armed, plan.queued))  # the head arms first
+        plan = admission.plan(idle, cap=7, mid=D("5.44"), rules=r, order_amount_base=Q)
+        self.assertEqual(((23, 21), ()), (plan.newly_armed, plan.queued))
+
+
 class TestCapReduction(unittest.TestCase):
     def test_cap_drop_trims_stale_reservations_and_tp_goes_to_emergency_path(self):
         # Review #2: cap 3 -> venue cap 1 with one live entry: no unused reservation may survive, a TP for a
@@ -182,6 +201,22 @@ class TestRuntimeMinimumChange(unittest.TestCase):
         plan = admission.plan(views, cap=5, mid=D("5.4"), rules=lower, order_amount_base=Q)
         self.assertEqual(({21: 1}, "EXIT_RESERVATION_SHORTFALL"), (plan.shortfall, plan.blocker))
         self.assertEqual((5, 0), (plan.reservations[21], plan.slots.free))
+
+    def test_ac34_runtime_floor_invalid_only_at_tp_price_blocks_arming(self):
+        # Review #6: min_notional 54.8 -> SELL cell 26 entry 5.4909 (10 x = 54.909, valid) but TP 5.4727
+        # (54.727 < 54.8): arming it would guarantee permanent DUST, so admission and the ledger both refuse.
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import CellLedger, LedgerError
+        cells = sample_cells()
+        floor = rules(min_base="0", min_notional="54.8")
+        self.assertEqual((D("5.4909"), D("5.4727")), (cells[26].entry_price, cells[26].tp_price))
+        plan = admission.plan([CellAdmission(c, open_cycle=False) for c in cells], cap=120, mid=D("5.4"),
+                              rules=floor, order_amount_base=Q)
+        self.assertTrue(plan.blocked[26].startswith("FULL_Q_INVALID_TP"), plan.blocked.get(26))
+        self.assertTrue(plan.blocked[25].startswith("FULL_Q_INVALID_ENTRY"), plan.blocked.get(25))
+        self.assertNotIn(26, plan.newly_armed + plan.queued)
+        self.assertIn(28, plan.newly_armed)                          # entry 5.5272, TP 5.5090: valid
+        with self.assertRaisesRegex(LedgerError, "tp price 5.4727"):
+            CellLedger("g1", cells[26], Q).begin_entry(1, floor)
 
     def test_invalid_rules_never_arm(self):
         plan = admission.plan([CellAdmission(c, open_cycle=False) for c in sample_cells()], cap=120,
