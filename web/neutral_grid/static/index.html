@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Нейтральная сетка</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Перейти к содержимому</a>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <div class="brand-title">Нейтральная сетка</div>
+      <div class="brand-sub" id="identity">—</div>
+    </div>
+  </div>
+  <div class="status-strip" aria-live="polite">
+    <span class="chip chip-mode" id="mode-chip" hidden></span>
+    <span class="state-badge" id="state-badge" data-state="UNKNOWN">
+      <span class="state-dot" aria-hidden="true"></span>
+      <span class="state-text" id="state-text">Нет данных</span>
+      <code class="state-code" id="state-code"></code>
+    </span>
+    <span class="fresh" id="freshness" data-stale="true">снимок: —</span>
+    <span class="revs" id="revisions">config r— · engine r—</span>
+  </div>
+  <button type="button" class="btn btn-ghost" id="logout" hidden>Выйти</button>
+</header>
+
+<div class="banner banner-warn" id="stale-banner" role="alert" hidden></div>
+
+<nav class="tabs" role="tablist" aria-label="Разделы" id="tabs" hidden>
+  <button type="button" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true">Обзор</button>
+  <button type="button" role="tab" id="tab-preview" aria-controls="panel-preview" aria-selected="false" tabindex="-1">Превью и старт</button>
+  <button type="button" role="tab" id="tab-cells" aria-controls="panel-cells" aria-selected="false" tabindex="-1">Ячейки</button>
+  <button type="button" role="tab" id="tab-lookup" aria-controls="panel-lookup" aria-selected="false" tabindex="-1">Поиск по ID</button>
+  <button type="button" role="tab" id="tab-journal" aria-controls="panel-journal" aria-selected="false" tabindex="-1">Журнал</button>
+  <button type="button" role="tab" id="tab-access" aria-controls="panel-access" aria-selected="false" tabindex="-1">Ключи</button>
+</nav>
+
+<main id="main" tabindex="-1">
+  <!-- Login -->
+  <section class="panel login" id="panel-login" hidden aria-labelledby="login-title">
+    <h1 id="login-title">Вход в локальную панель</h1>
+    <p>Откройте ссылку с токеном, которую напечатал лаунчер в терминале, или вставьте токен сюда.
+       Токен не является ключом биржи и действует только для этого процесса.</p>
+    <form id="login-form" class="stack" autocomplete="off">
+      <label for="login-token">Токен доступа</label>
+      <input id="login-token" name="token" type="password" autocomplete="off" spellcheck="false" required>
+      <button type="submit" class="btn btn-primary">Войти</button>
+      <p class="form-error" id="login-error" role="alert"></p>
+    </form>
+  </section>
+
+  <!-- Overview -->
+  <section class="panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" hidden>
+    <div class="grid-2">
+      <article class="card" aria-labelledby="h-engine">
+        <h2 id="h-engine">Состояние движка</h2>
+        <p class="lede" id="engine-note"></p>
+        <ul class="reasons" id="engine-reasons"></ul>
+        <div class="actions" id="command-buttons">
+          <button type="button" class="btn" data-cmd="pause">Пауза</button>
+          <button type="button" class="btn" data-cmd="resume">Продолжить</button>
+          <button type="button" class="btn btn-danger" data-cmd="stop">Стоп</button>
+          <button type="button" class="btn" data-cmd="confirm_baseline">Подтвердить baseline</button>
+          <button type="button" class="btn" data-cmd="baseline_audit">Аудит baseline</button>
+        </div>
+        <p class="hint">Команды записываются в очередь единственного движка. Статус «в очереди» не означает,
+          что биржа что-то исполнила: результат появится после применения движком.</p>
+        <div id="pending-command" class="pending" aria-live="polite"></div>
+      </article>
+
+      <article class="card" aria-labelledby="h-risk">
+        <h2 id="h-risk">Позиция и лимиты</h2>
+        <div class="gauge" id="net-gauge" hidden>
+          <div class="gauge-track"><div class="gauge-range" id="net-range"></div><div class="gauge-mark" id="net-mark"></div><div class="gauge-zero"></div></div>
+          <div class="gauge-scale"><span id="net-cap-neg">−cap</span><span>0</span><span id="net-cap-pos">+cap</span></div>
+        </div>
+        <dl class="kv" id="risk-kv"></dl>
+      </article>
+    </div>
+
+    <div class="grid-3">
+      <article class="card" aria-labelledby="h-orders"><h2 id="h-orders">Ордера и слоты</h2><dl class="kv" id="orders-kv"></dl></article>
+      <article class="card" aria-labelledby="h-history"><h2 id="h-history">История биржи</h2><dl class="kv" id="history-kv"></dl></article>
+      <article class="card" aria-labelledby="h-margin"><h2 id="h-margin">Маржа и правила</h2><dl class="kv" id="margin-kv"></dl></article>
+    </div>
+
+    <article class="card" aria-labelledby="h-map">
+      <div class="card-head">
+        <h2 id="h-map">Карта ячеек</h2>
+        <p class="hint">Состояние каждой ячейки берётся из зафиксированного снимка, а не из текущей цены.</p>
+      </div>
+      <div class="cellmap" id="cell-map" role="list" aria-label="Ячейки по состоянию"></div>
+      <div class="legend" id="cell-legend"></div>
+    </article>
+
+    <div class="grid-2">
+      <article class="card" aria-labelledby="h-errors"><h2 id="h-errors">Последние ошибки</h2><ul class="log" id="errors-list"></ul></article>
+      <article class="card" aria-labelledby="h-commands"><h2 id="h-commands">Последние команды</h2><ul class="log" id="commands-list"></ul></article>
+    </div>
+    <article class="card" aria-labelledby="h-unmatched" id="unmatched-card" hidden>
+      <h2 id="h-unmatched">Несопоставленные данные истории</h2>
+      <ul class="log" id="unmatched-list"></ul>
+    </article>
+    <article class="card demo-card" aria-labelledby="h-demo" id="demo-card" hidden>
+      <h2 id="h-demo">Демо: сценарии fake exchange</h2>
+      <p class="hint">Эти кнопки управляют только офлайн-симулятором биржи. Состояние движка меняется
+        лишь после того, как движок сам прочитает «историю» симулятора.</p>
+      <div class="actions" id="demo-actions"></div>
+      <p class="hint" id="demo-result" aria-live="polite"></p>
+    </article>
+  </section>
+
+  <!-- Preview & start -->
+  <section class="panel" id="panel-preview" role="tabpanel" aria-labelledby="tab-preview" hidden>
+    <div class="card-head">
+      <h2>Превью конфигурации</h2>
+      <button type="button" class="btn" id="preview-refresh">Обновить превью</button>
+    </div>
+    <div id="preview-errors" class="banner banner-error" role="alert" hidden></div>
+    <div id="preview-warnings" class="banner banner-warn" hidden></div>
+    <div class="grid-3" id="preview-cards"></div>
+    <article class="card">
+      <h3>Цены границ</h3>
+      <p class="hint" id="prices-caption"></p>
+      <div class="prices" id="preview-prices"></div>
+    </article>
+    <article class="card">
+      <h3>Конфигурация</h3>
+      <dl class="kv kv-wide" id="preview-config"></dl>
+    </article>
+    <div class="actions sticky-actions">
+      <button type="button" class="btn btn-primary" id="start-open">Старт…</button>
+      <span class="hint" id="start-hint"></span>
+    </div>
+  </section>
+
+  <!-- Cells -->
+  <section class="panel" id="panel-cells" role="tabpanel" aria-labelledby="tab-cells" hidden>
+    <div class="card-head">
+      <h2>Ячейки</h2>
+      <form class="filters" id="cell-filters">
+        <label><input type="checkbox" id="cells-active"> только не простаивающие</label>
+        <label for="cells-state">Состояние</label>
+        <select id="cells-state"><option value="">все</option></select>
+      </form>
+    </div>
+    <p class="hint">Цены, стороны и объёмы — точные строки из снимка. ID никогда не преобразуются в числа.</p>
+    <div class="table-wrap">
+      <table class="cells" id="cells-table">
+        <caption class="sr-only">Ячейки сетки</caption>
+        <thead><tr>
+          <th scope="col">Ячейка</th><th scope="col">Цены</th><th scope="col">Вход</th><th scope="col">Пок.</th>
+          <th scope="col">Состояние</th><th scope="col">Вход: запр. / исп. / ост.</th>
+          <th scope="col">TP: запр. / исп. / ост.</th><th scope="col">Живые ноги</th>
+          <th scope="col">ID (client / exchange)</th><th scope="col">Обязательство</th>
+          <th scope="col">Пыль</th><th scope="col">Блокер</th><th scope="col">Очередь</th>
+        </tr></thead>
+        <tbody id="cells-body"></tbody>
+      </table>
+    </div>
+    <div class="actions"><button type="button" class="btn" id="cells-more" hidden>Показать ещё</button>
+      <span class="hint" id="cells-count"></span></div>
+  </section>
+
+  <!-- Lookup -->
+  <section class="panel" id="panel-lookup" role="tabpanel" aria-labelledby="tab-lookup" hidden>
+    <h2>Поиск по ID ордера или сделки</h2>
+    <form id="lookup-form" class="inline-form" autocomplete="off">
+      <label for="lookup-id">Client order ID, exchange order ID или trade ID</label>
+      <div class="row">
+        <input id="lookup-id" name="id" inputmode="text" spellcheck="false" required maxlength="96">
+        <button type="submit" class="btn btn-primary">Найти</button>
+      </div>
+    </form>
+    <div id="lookup-result" aria-live="polite"></div>
+  </section>
+
+  <!-- Journal -->
+  <section class="panel" id="panel-journal" role="tabpanel" aria-labelledby="tab-journal" hidden>
+    <article class="card">
+      <h2>Команды</h2>
+      <div class="table-wrap"><table class="plain" id="journal-commands">
+        <thead><tr><th scope="col">ID</th><th scope="col">Команда</th><th scope="col">Статус</th>
+          <th scope="col">Ревизии</th><th scope="col">Создана</th><th scope="col">Применена</th><th scope="col">Результат</th></tr></thead>
+        <tbody></tbody></table></div>
+      <div class="actions"><button type="button" class="btn" id="journal-commands-more" hidden>Ещё</button></div>
+    </article>
+    <article class="card">
+      <h2>Аудит</h2>
+      <div class="table-wrap"><table class="plain" id="journal-audit">
+        <thead><tr><th scope="col">ID</th><th scope="col">Время</th><th scope="col">Событие</th><th scope="col">Детали</th></tr></thead>
+        <tbody></tbody></table></div>
+      <div class="actions"><button type="button" class="btn" id="journal-audit-more" hidden>Ещё</button></div>
+    </article>
+  </section>
+
+  <!-- Access -->
+  <section class="panel" id="panel-access" role="tabpanel" aria-labelledby="tab-access" hidden>
+    <h2>Профиль ключей</h2>
+    <p class="hint" id="keystore-note">Используется существующий зашифрованный keystore Hummingbot. Значения ключей
+      никогда не показываются и не передаются в браузер — только признак «задано».</p>
+    <div class="grid-2">
+      <article class="card">
+        <h3>Статус</h3>
+        <dl class="kv" id="keystore-status"></dl>
+      </article>
+      <article class="card">
+        <h3>Профили</h3>
+        <form id="profile-form" class="stack" autocomplete="off">
+          <label for="profile-select">Профиль</label>
+          <select id="profile-select"></select>
+          <button type="submit" class="btn">Выбрать профиль</button>
+        </form>
+        <dl class="kv" id="profile-fields"></dl>
+      </article>
+    </div>
+    <article class="card">
+      <h3>Разблокировать</h3>
+      <form id="unlock-form" class="stack" autocomplete="off">
+        <label for="unlock-password">Пароль keystore</label>
+        <input id="unlock-password" type="password" autocomplete="off" spellcheck="false">
+        <button type="submit" class="btn btn-primary">Разблокировать</button>
+        <p class="hint">Пароль уходит только на локальный backend в теле запроса, не сохраняется в браузере и не
+          попадает в журналы. Его можно также ввести в терминале при запуске (--unlock-tty).</p>
+        <p class="form-error" id="unlock-error" role="alert"></p>
+      </form>
+    </article>
+  </section>
+</main>
+
+<dialog id="start-dialog" aria-labelledby="start-title">
+  <form method="dialog" id="start-form" class="stack" autocomplete="off">
+    <h2 id="start-title">Подтверждение старта</h2>
+    <p id="start-mode-note" class="banner banner-warn"></p>
+    <dl class="kv" id="start-summary"></dl>
+    <label for="start-baseline">expected_initial_position (B), LIT, со знаком</label>
+    <input id="start-baseline" inputmode="decimal" spellcheck="false" required aria-describedby="start-baseline-help">
+    <p class="hint" id="start-baseline-help">Фактическая позиция на бирже до старта: «0», «330» или «-120». Бот не
+      покупает и не закрывает её, только учитывает. После сверки её нужно будет подтвердить ещё раз.</p>
+    <button type="button" class="btn" id="start-recalc">Пересчитать диапазон для B</button>
+    <p class="hint" id="start-range" aria-live="polite"></p>
+    <label class="check"><input type="checkbox" id="start-ack-baseline"> Подтверждаю, что позиция на бирже равна B.</label>
+    <label class="check"><input type="checkbox" id="start-ack-risk"> Понимаю риск: движок будет выставлять ордера
+      в пределах показанных лимитов, без стоп-лосса и без автоматического закрытия позиции.</label>
+    <p class="form-error" id="start-error" role="alert"></p>
+    <div class="actions">
+      <button type="button" class="btn" id="start-cancel">Отмена</button>
+      <button type="button" class="btn btn-primary" id="start-submit" disabled>Поставить старт в очередь</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="cmd-dialog" aria-labelledby="cmd-title">
+  <form method="dialog" id="cmd-form" class="stack" autocomplete="off">
+    <h2 id="cmd-title">Команда</h2>
+    <p id="cmd-desc"></p>
+    <dl class="kv" id="cmd-context"></dl>
+    <div id="cmd-fields" class="stack"></div>
+    <p class="form-error" id="cmd-error" role="alert"></p>
+    <div class="actions">
+      <button type="button" class="btn" id="cmd-cancel">Отмена</button>
+      <button type="button" class="btn btn-primary" id="cmd-submit">Отправить в очередь</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
