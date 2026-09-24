@@ -141,6 +141,7 @@ class EngineMeta:
     start_preview_id: Optional[str] = None                        # preview the applied START acknowledged
     colliding_cid: Optional[int] = None                           # CID a foreign order owns (retire_colliding_cid)
     start_config_fingerprint: Optional[str] = None                # full config the applied START acknowledged
+    start_material_id: Optional[str] = None                       # web preview config+rules digest (informational)
     audited_payloads: Dict[str, Dict[str, str]] = field(default_factory=dict)   # stream -> key -> accepted fp
 
     def to_json(self) -> Dict[str, Any]:

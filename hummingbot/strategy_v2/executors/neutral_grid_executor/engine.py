@@ -642,6 +642,19 @@ class NeutralGridEngine:
         self._mirror_cycle(leg.identity.cell_id, leg.identity.generation)
         self._notify_final(leg)
 
+    def grid_mutation_blockers(self) -> List[str]:
+        """Why the current grid cannot be migrated now (published for the web's migrate gate; the engine re-checks
+        at apply time). Only a durably stopped engine or one opened for a confirmed migration queries the store;
+        a running grid is never quiescent."""
+        if self.store is None or self.store.closed or not self.bootstrapped:
+            return ["NOT_BOOTSTRAPPED"]
+        if not self.is_stopped and FREEZE_CONFIG_MISMATCH not in self.meta.freezes:
+            return ["ENGINE_NOT_STOPPED: stop the grid (STOPPED / STOPPED_WITH_INVENTORY) first"]
+        try:
+            return [redact(b, 300) for b in self.store.grid_mutation_blockers()]
+        except (StoreError, PersistenceError) as exc:
+            return [redact(f"UNKNOWN: {type(exc).__name__}", 300)]
+
     def transport_cids(self) -> List[int]:
         """Every durable CID whose submit may have reached transport: all legs except a never-dispatched INTENT
         (PENDING outbox, dispatched later with the same CID) and a proven-unsent REJECTED_UNSENT. The connector
@@ -987,12 +1000,16 @@ class NeutralGridEngine:
             self.meta.started = True
             self.meta.start_preview_id = preview_id
             self.meta.start_config_fingerprint = self.full_fingerprint
+            material = payload.get("material_id")
+            self.meta.start_material_id = str(material)[:128] if material not in (None, "") else None
             self.meta.stop_requested_ms = None
             self.meta.stop_outcome = None
             self.meta.stop_reason = None
             return CommandOutcome(CommandStatus.APPLIED, {"started": True, "grid_id": self.grid_id},
                                   audit=("start", dict({"grid_id": self.grid_id, "preview_id": preview_id,
                                                         "risk_acknowledged": True,
+                                                        "config_fingerprint": self.full_fingerprint,
+                                                        "material_id": self.meta.start_material_id,
                                                         "source": payload.get("source") or "operator"},
                                                        **resumed)))
         if kind == CommandKind.PAUSE.value:
@@ -1383,10 +1400,13 @@ class NeutralGridEngine:
             return CommandOutcome(CommandStatus.APPLIED, {"history_reset_floor_ms": floor,
                                                           "resolved_retention_gaps": gaps}, reload=True)
         if action == "retire_colliding_cid":
-            cid = payload.get("cid", self.meta.colliding_cid)
-            if cid is None or FREEZE_CID not in self.meta.freezes:
+            if FREEZE_CID not in self.meta.freezes or self.meta.colliding_cid is None:
                 return CommandOutcome(CommandStatus.REJECTED, {"error": "NO_CID_COLLISION"})
-            cid = int(cid)
+            cid = int(payload.get("cid", self.meta.colliding_cid))
+            if cid != int(self.meta.colliding_cid):
+                # only the CID the engine itself recorded as colliding may be retired (never an arbitrary one)
+                return CommandOutcome(CommandStatus.REJECTED, {"error": "NOT_THE_COLLIDING_CID",
+                                                               "colliding_cid": str(self.meta.colliding_cid)})
             s.retire_cid(tx, cid, actor, note)                 # audited; never allocated from now on (AC-43)
             detail = self.meta.freezes.pop(FREEZE_CID, None)
             self.meta.colliding_cid = None
