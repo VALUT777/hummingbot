@@ -516,3 +516,85 @@ def test_l1_start_before_bootstrap_rebinds_a_changed_config(tmp_path, source):
         assert _cmd(h, "l1-confirm").status == CommandStatus.APPLIED, _cmd(h, "l1-confirm").result
     finally:
         h.close()
+
+
+# ------------------------------------------------------------------------------------------ M1 web parity
+def _web_ack(summary, accepted, set_id=None):
+    """The ack exactly as WS-E builds, normalizes and gates it (real web code: test_ngweb_conflicts.ack_payload)."""
+    from web.neutral_grid.commands import CommandService
+    set_id = summary["conflict_set_id"] if set_id is None else set_id
+    body = {"action": "ack_history_conflict", "note": "сверено по истории биржи", "acknowledge": True,
+            "conflict_set_id": set_id, "accepted": accepted, "confirmation": f"ПРИНЯТЬ НАБОР {set_id}"}
+    service = CommandService.__new__(CommandService)
+    normalized = service._normalize_only("baseline_audit", body)
+    assert normalized == body, normalized
+    return normalized, service._conflict_set_blocker(normalized, {"summary": summary})
+
+
+def test_m1_web_parity_keys_fingerprints_and_the_normalized_ack_apply(tmp_path):
+    from web.neutral_grid.commands import _OPAQUE_RE
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        a, b = h.buy_cells()[-1], h.buy_cells()[-2]
+        ea, eb = h.live_order(a, ENTRY), h.live_order(b, ENTRY)
+        trade = h.fx.fill(ea.cid, D("3"))                                  # never committed: two versions at once
+        h.fx.fill(eb.cid, D("10"))
+        h.fx.inject_conflicting_trade(trade, D("1"), persistent=True)
+        h.tick(6)
+        h.fx.order_by_cid(eb.cid).history_override = {"nonce": 901}        # committed row contradicted
+        h.tick(6)
+        summary = _seen(h)
+        conflicts = summary["history_conflicts"]
+        assert _OPAQUE_RE.fullmatch(summary["conflict_set_id"])
+        for c in conflicts:
+            assert _OPAQUE_RE.fullmatch(c["key"]), c["key"]
+            assert all(_OPAQUE_RE.fullmatch(v["fingerprint"]) for v in c["versions"]), c
+        assert len({c["key"] for c in conflicts}) == len(conflicts)
+        keys = {c["key"] for c in conflicts}
+        assert f"trade:{trade}:BUY:{h.fx.order_by_cid(ea.cid).order_index}" in keys, keys      # canonical form
+        assert f"order:{h.fx.order_by_cid(eb.cid).order_index}" in keys, keys
+        pick = {c["key"]: next(v["fingerprint"] for v in c["versions"] if v["summary"]["size"] == "3")
+                for c in conflicts if not any(v["committed"] for v in c["versions"])}   # the web's rule
+        assert len(pick) == 1
+        normalized, blocker = _web_ack(summary, pick)
+        assert blocker is None, blocker.body
+        h.command(CommandKind.BASELINE_AUDIT, normalized, key="parity-ack")
+        h.tick()
+        record = _cmd(h, "parity-ack")
+        assert record.status == CommandStatus.APPLIED, record.result
+        h.tick(10)
+        assert h.engine.history_complete, h.engine.history_incomplete_reason
+        assert h.cell(a).cycles[-1].E == D("3") and h.state != EngineState.FROZEN
+    finally:
+        h.close()
+
+
+def test_m1_web_parity_changed_set_and_empty_set_are_refused_by_the_engine(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        _started(h)
+        normalized, blocker = _web_ack(_seen(h), {})                       # nothing to audit: the web lets it through
+        assert blocker is None and _seen(h)["history_conflicts"] == []
+        h.command(CommandKind.BASELINE_AUDIT, normalized, key="parity-empty")
+        h.tick()
+        assert _cmd(h, "parity-empty").result["error"] == "NOTHING_TO_AUDIT"
+        a = h.buy_cells()[-1]
+        _conflict_on(h, a)
+        h.run_until(lambda: h.state == EngineState.FROZEN, max_ticks=10)
+        viewed = _seen(h)
+        normalized, blocker = _web_ack(viewed, {})
+        assert blocker is None
+        b = h.buy_cells()[-2]
+        eb = h.live_order(b, ENTRY)
+        h.fx.fill(eb.cid, D("10"))
+        h.tick(6)
+        h.fx.order_by_cid(eb.cid).history_override = {"nonce": 902}         # appears after the operator's view
+        h.tick(6)
+        h.command(CommandKind.BASELINE_AUDIT, normalized, key="parity-stale")   # enqueued before the web re-read
+        h.tick()
+        record = _cmd(h, "parity-stale")
+        assert record.status == CommandStatus.REJECTED and record.result["error"] == "CONFLICT_SET_CHANGED"
+        assert h.engine.meta.audited_payloads == {} and h.state == EngineState.FROZEN
+    finally:
+        h.close()
