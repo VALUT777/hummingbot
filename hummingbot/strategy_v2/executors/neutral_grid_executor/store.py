@@ -86,14 +86,14 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MI
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "APPLICATION_ID", "CID_EPOCH_SHIFT", "FAULT_POINTS", "FINAL_ORDER_STATES", "STREAM_INACTIVE_ORDERS",
+    "APPLICATION_ID", "AuditEvent", "CID_EPOCH_SHIFT", "FAULT_POINTS", "FINAL_ORDER_STATES", "STREAM_INACTIVE_ORDERS",
     "STREAM_TRADES", "BootstrapError", "BootstrapRecord", "CellRecord", "CellStateChange", "CidAllocationError",
     "CidCollisionError", "CidExhaustedError", "CommandRecord", "ConfigMutationError", "CursorRecord",
     "CursorUpdate", "CycleChange", "CycleRecord", "EngineIdentity", "EngineRecord", "EngineStateChange",
     "EntryBlockedError", "FaultHooks", "FillAllocation", "FillRecord", "GridMigration", "GridRecord",
     "HistoryBatchResult", "HistoryConflictRecord", "IdentityMismatchError", "InboxRecord", "IntentRecord",
     "InvalidTransitionError", "LedgerState", "LegRecord", "LegStateChange", "ManualRecovery",
-    "NeutralGridStore", "OrderRecord", "OutboxRecord", "OwnershipLostError", "PersistenceError",
+    "NeutralGridStore", "OrderMatch", "OrderRecord", "OutboxRecord", "OwnershipLostError", "PersistenceError",
     "PositionLedger", "PriorRunEvidenceError", "ReadOnlyStoreError", "Reservation", "ReservationRecord",
     "ReservationRelease", "SchemaVersionError", "SimulatedCrash", "StoreClosedError", "StoreCorruptError",
     "StoreError", "StoreIntegrityError", "StoreLockedError", "StoreMissingError", "StoredSnapshot",
@@ -1142,6 +1142,14 @@ class AuditEvent:
     actor: str
     engine_revision: Optional[int]
     payload: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OrderMatch:
+    """Drill-down hit of :meth:`NeutralGridStore.find_orders_by_id`; ``matched_on`` names the exact columns."""
+    leg: LegRecord
+    order: OrderRecord
+    matched_on: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -3795,6 +3803,69 @@ class NeutralGridStore:
             else:
                 rows = self._x("SELECT * FROM audit_events WHERE kind = ? ORDER BY id DESC LIMIT ?",
                                (kind, limit)).fetchall()
+        return [self._audit_event(row) for row in rows]
+
+    # ---------------------------------------------------------------------------------------------- UI drill-down
+    # Read-only and indexed; available on the writer, the command client and the read-only store. Ids are matched
+    # as exact TEXT (never parsed through float); pages are keyset pages (``id < before_id`` ORDER BY id DESC), so
+    # every row is reachable no matter how many exist.
+
+    _MAX_PAGE = 1000
+
+    @staticmethod
+    def _id_text(id_str: Any, name: str) -> str:
+        if not isinstance(id_str, str) or not id_str or id_str != id_str.strip() or len(id_str) > 128:
+            raise TypeError(f"{name} must be a non-empty exact id string (never a number)")
+        return id_str
+
+    def _page_args(self, before_id: Optional[int], limit: int) -> Tuple[int, int]:
+        _require_int(limit, "limit", 1)
+        if limit > self._MAX_PAGE:
+            raise ValueError(f"limit must be <= {self._MAX_PAGE}")
+        if before_id is None:
+            return (1 << 62), limit
+        return _require_int(before_id, "before_id", 1), limit
+
+    def find_orders_by_id(self, id_str: str) -> List[OrderMatch]:
+        """Owned orders whose exchange order id, venue order index or client order id equals ``id_str`` exactly."""
+        text = self._id_text(id_str, "id_str")
+        hits: Dict[int, List[str]] = {}
+        with self._rlock:
+            self._require_open()
+            for column, sql in (("exchange_order_id", "SELECT cid FROM orders WHERE exchange_order_id = ?"),
+                                ("order_index", "SELECT cid FROM orders WHERE order_index = ?")):
+                for row in self._x(sql, (text,)).fetchall():
+                    hits.setdefault(row[0], []).append(column)
+            if text.isdigit() and text == str(int(text)) and 0 < int(text) <= MAX_CLIENT_ORDER_ID:
+                for row in self._x("SELECT cid FROM orders WHERE cid = ?", (int(text),)).fetchall():
+                    hits.setdefault(row[0], []).append("client_order_id")
+        return [OrderMatch(leg=self.leg(cid), order=self.order(cid), matched_on=tuple(columns))
+                for cid, columns in sorted(hits.items())]
+
+    def find_fills_by_trade_id(self, trade_id_str: str) -> List[FillRecord]:
+        """Fills with exactly this trade id (a self-trade has two own legs, so up to two rows)."""
+        text = self._id_text(trade_id_str, "trade_id_str")
+        with self._rlock:
+            self._require_open()
+            rows = self._x("SELECT * FROM fills WHERE trade_id_str = ? ORDER BY own_side, dedupe_key",
+                           (text,)).fetchall()
+        return [self._fill(row) for row in rows]
+
+    def commands_page(self, before_id: Optional[int] = None, limit: int = 100) -> List[CommandRecord]:
+        """Commands newest first with ``id < before_id``; pass the last id of a page to get the next one."""
+        before, limit = self._page_args(before_id, limit)
+        with self._rlock:
+            self._require_open()
+            rows = self._x("SELECT * FROM commands WHERE id < ? ORDER BY id DESC LIMIT ?", (before, limit)).fetchall()
+        return [self._command(row) for row in rows]
+
+    def audit_page(self, before_id: Optional[int] = None, limit: int = 100) -> List[AuditEvent]:
+        """Audit events newest first with ``id < before_id`` (keyset pagination)."""
+        before, limit = self._page_args(before_id, limit)
+        with self._rlock:
+            self._require_open()
+            rows = self._x("SELECT * FROM audit_events WHERE id < ? ORDER BY id DESC LIMIT ?",
+                           (before, limit)).fetchall()
         return [self._audit_event(row) for row in rows]
 
     def state_transitions(self, entity: Optional[str] = None, key: Optional[str] = None) -> List[Dict[str, Any]]:

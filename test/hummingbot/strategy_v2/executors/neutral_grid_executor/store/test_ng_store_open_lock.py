@@ -289,8 +289,8 @@ def test_v1_database_is_upgraded_to_v2_with_attempt_and_gap_backfill(env):
     raw.commit()
     raw.close()
     upgraded = env.open()
-    assert upgraded._conn.raw.execute("PRAGMA user_version").fetchone()[0] == LATEST_VERSION == 2
-    assert [e.payload["version"] for e in upgraded.audit_events("migration")] == [2]
+    assert upgraded._conn.raw.execute("PRAGMA user_version").fetchone()[0] == LATEST_VERSION
+    assert sorted(e.payload["version"] for e in upgraded.audit_events("migration")) == list(range(2, LATEST_VERSION + 1))
     assert upgraded.outbox_attempts(1) == [{"outbox_id": 1, "attempt": 1, "dispatched_at_ms": 2, "outcome": "UNKNOWN",
                                             "outcome_detail": None, "result_at_ms": None}]
     assert upgraded.cursor("TRADES").retention_gap_open and not upgraded.cursor("INACTIVE_ORDERS").retention_gap_open
