@@ -252,3 +252,21 @@ def test_static_assets_are_local_and_js_never_stores_or_numbers_ids():
     assert not re.search(r"\b(Number|parseInt|parseFloat)\s*\(", js)
     assert ".innerHTML" not in js and "insertAdjacentHTML" not in js
     assert 'lang="ru"' in html
+
+
+@pytest.mark.asyncio
+async def test_demo_mode_never_touches_keystore(make_web, monkeypatch):
+    from hummingbot.client.config.security import Security
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("demo must not read or unlock the keystore")
+    monkeypatch.setattr(Security, "login", forbidden)
+    monkeypatch.setattr(Security, "new_password_required", forbidden)
+    web = await make_web(sample_snapshot(), mode="demo")
+    await web.login()
+    body = await (await web.get("/api/keystore")).json()
+    assert body["profiles"] == [] and body["status"]["demo"] is True and body["status"]["keystore_exists"] is None
+    for path, payload in (("/api/keystore/select", {"profile": "lighter_perpetual_robinhood"}),
+                          ("/api/keystore/unlock", {"password": "whatever"})):
+        resp = await web.post(path, payload)
+        assert resp.status == 422 and "Демо" in (await resp.json())["message"]

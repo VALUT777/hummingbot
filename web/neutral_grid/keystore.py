@@ -19,6 +19,7 @@ LOGGER = logging.getLogger("web.neutral_grid.keystore")
 
 ROBINHOOD_PROFILE = "lighter_perpetual_robinhood"
 ROBINHOOD_KEY_FIELD = "lighter_perpetual_robinhood_api_private_key"
+_DEMO_REFUSAL = "Демо-режим работает на офлайн fake exchange: ключи не используются и не читаются."
 _MAX_FAILURES = 5
 _FAILURE_WINDOW_S = 300.0
 
@@ -48,6 +49,8 @@ class KeystoreService:
     def profiles(self) -> List[Dict[str, object]]:
         from hummingbot.client.config.config_helpers import read_yml_file
 
+        if self.demo:
+            return []  # the offline demo never reads the real keystore
         directory = self._connectors_dir()
         result: List[Dict[str, object]] = []
         if not directory.is_dir():
@@ -69,6 +72,8 @@ class KeystoreService:
         return result
 
     def select(self, name: object) -> Dict[str, object]:
+        if self.demo:
+            raise KeystoreError(_DEMO_REFUSAL)
         if not isinstance(name, str) or not name:
             raise KeystoreError("Не указано имя профиля.")
         names = {p["name"] for p in self.profiles()}
@@ -84,7 +89,7 @@ class KeystoreService:
         with self._lock:
             return {
                 "demo": self.demo,
-                "keystore_exists": self._keystore_exists(),
+                "keystore_exists": None if self.demo else self._keystore_exists(),
                 "selected_profile": self._selected,
                 "unlocked": self._unlocked_profile is not None and self._unlocked_profile == self._selected,
                 "api_key_format": (
@@ -97,6 +102,8 @@ class KeystoreService:
     # ----------------------------------------------------------------- unlock
     def unlock(self, password: object) -> Dict[str, object]:
         """Unlock via the native keystore; ``password`` is used once and never stored or echoed."""
+        if self.demo:
+            raise KeystoreError(_DEMO_REFUSAL)
         if not isinstance(password, str) or not password:
             raise KeystoreError("Пароль не передан.")
         with self._lock:
