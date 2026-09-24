@@ -29,7 +29,7 @@ import json
 import math
 import time
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from hummingbot.connector.derivative.lighter_perpetual import lighter_perpetual_constants as CONSTANTS
 from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_api_utils import (
@@ -232,10 +232,6 @@ def trade_rows_from_raw(raw: Any, *, account_index: int) -> List[ExchangeTradeRo
     return rows
 
 
-class PortReadError(RuntimeError):
-    """A connector read failed; the message names only the operation and the exception type (no URL/token)."""
-
-
 def market_is_tradable(raw_info: Any) -> bool:
     """Fail-closed market state from an ``orderBookDetails`` row (status, hidden, force_reduce_only)."""
     if not isinstance(raw_info, dict):
@@ -255,6 +251,35 @@ def _decimal_from_book_price(value: Any) -> Optional[Decimal]:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
         return None
     return Decimal(repr(value))
+
+
+class LighterPortRequestError(IOError):
+    """Type-only failure of a port read: the original exception's text is never kept.
+
+    Transport errors (e.g. aiohttp ``ContentTypeError``) render the request URL, which carries the
+    ``auth=`` token as a query parameter; only the original exception *type name* survives here.
+    """
+
+    def __init__(self, operation: str, original_type: str):
+        super().__init__(f"{operation} failed: {original_type}")
+        self.operation = operation
+        self.original_type = original_type
+
+
+async def _sanitized(operation: str, call: Callable[[], Awaitable[Any]]) -> Any:
+    """Await ``call``; re-raise failures as text-free errors with no exception chain (critic C1)."""
+    failure: Optional[BaseException] = None
+    try:
+        return await call()
+    except asyncio.CancelledError:
+        raise
+    except HistorySchemaError as exc:
+        failure = HistorySchemaError(str(exc))            # messages built by this adapter, never venue text
+    except LighterHistoryResponseError as exc:
+        failure = HistorySchemaError(str(exc))            # connector-built shape messages, no URL/token
+    except Exception as exc:  # noqa: BLE001 - anything else is reduced to its type name
+        failure = LighterPortRequestError(operation, type(exc).__name__)
+    raise failure                                          # raised outside the handler: no __context__
 
 
 # ---------------------------------------------------------------------------------------------
@@ -304,12 +329,6 @@ class LighterExchangePort:
         self._connector.remove_history_wakeup_listener(callback)
 
     # reads -----------------------------------------------------------------------------------
-    @staticmethod
-    def _read_failed(operation: str, exc: BaseException) -> "PortReadError":
-        """Connector read failures carry request URLs (with ``auth=<token>`` for authenticated GETs, e.g. an
-        aiohttp ContentTypeError): only the exception type crosses the port, never its text or cause."""
-        return PortReadError(f"{operation} failed: {type(exc).__name__}")
-
     async def trading_rules(self) -> TradingRules:
         """Fresh rules; limit/post-only availability comes from the refreshed market state.
 
@@ -318,13 +337,8 @@ class LighterExchangePort:
         snapshot). Anything else - including missing fields - reports both flags False so the engine
         blocks new exposure (NG-GRID-003, NG-RISK-004). A market absent after refresh raises.
         """
-        try:
-            await self._connector._update_trading_rules()
-            market = self._connector.market_info_for_trading_pair(self._trading_pair)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise self._read_failed("trading rules", exc) from None
+        await _sanitized("trading_rules", self._connector._update_trading_rules)
+        market = await _sanitized("trading_rules", self._market_info)
         tradable = market_is_tradable(getattr(market, "raw_info", None))
         max_leverage = market.max_leverage
         return TradingRules(
@@ -354,13 +368,12 @@ class LighterExchangePort:
             return None
         return (bid + ask) / 2
 
+    async def _market_info(self) -> Any:
+        return self._connector.market_info_for_trading_pair(self._trading_pair)
+
     async def position(self) -> PositionSnapshot:
-        try:
-            snapshot = await self._connector.fetch_account_position(self._trading_pair)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise self._read_failed("account position", exc) from None
+        snapshot = await _sanitized(
+            "position", lambda: self._connector.fetch_account_position(self._trading_pair))
         if snapshot.get("account_index") != self.account_index or snapshot.get("market_id") != self.market_id:
             raise HistorySchemaError("position snapshot is not scoped to the port account/market")
         return PositionSnapshot(
@@ -372,14 +385,7 @@ class LighterExchangePort:
         )
 
     async def active_orders(self) -> List[ExchangeOrderRow]:
-        try:
-            page = await self._connector.fetch_active_orders(self._trading_pair)
-        except LighterHistoryResponseError as exc:
-            raise HistorySchemaError(str(exc)) from exc
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise self._read_failed("active orders", exc) from None
+        page = await _sanitized("active_orders", lambda: self._connector.fetch_active_orders(self._trading_pair))
         if page.next_cursor not in (None, ""):
             raise HistorySchemaError("active orders response is truncated (next_cursor present)")
         rows = [order_row_from_raw(raw, timestamp_field=self._order_timestamp_field) for raw in page.rows]
@@ -387,27 +393,15 @@ class LighterExchangePort:
         return rows
 
     async def inactive_orders_page(self, cursor: Optional[str], limit: int = HISTORY_PAGE_LIMIT) -> HistoryPage:
-        try:
-            page = await self._connector.fetch_inactive_orders_page(self._trading_pair, cursor=cursor, limit=limit)
-        except LighterHistoryResponseError as exc:
-            raise HistorySchemaError(str(exc)) from exc
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise self._read_failed("inactive orders page", exc) from None
+        page = await _sanitized("inactive_orders_page", lambda: self._connector.fetch_inactive_orders_page(
+            self._trading_pair, cursor=cursor, limit=limit))
         rows = [order_row_from_raw(raw, timestamp_field=self._order_timestamp_field) for raw in page.rows]
         self._check_scope(rows)
         return HistoryPage(rows=rows, next_cursor=page.next_cursor, raw_cursor_sent=page.cursor_sent)
 
     async def trades_page(self, cursor: Optional[str], limit: int = HISTORY_PAGE_LIMIT) -> HistoryPage:
-        try:
-            page = await self._connector.fetch_trades_page(self._trading_pair, cursor=cursor, limit=limit)
-        except LighterHistoryResponseError as exc:
-            raise HistorySchemaError(str(exc)) from exc
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise self._read_failed("trades page", exc) from None
+        page = await _sanitized("trades_page", lambda: self._connector.fetch_trades_page(
+            self._trading_pair, cursor=cursor, limit=limit))
         account_index = self.account_index
         rows: List[ExchangeTradeRow] = []
         for raw in page.rows:

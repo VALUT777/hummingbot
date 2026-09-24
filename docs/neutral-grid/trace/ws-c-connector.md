@@ -69,6 +69,27 @@ Engine/store contract of the scanner:
 | Review fix 7: market state drives limit/post-only (NG-GRID-003, NG-RISK-004) | `LighterExchangePort.trading_rules`, `market_is_tradable` | `PORT::LighterPortTest::test_trading_rules_reflect_market_state_and_fail_closed` | done |
 | AC-13 support (WS wakes poller, never proof) | `add_history_wakeup_listener`, `LighterExchangePort.subscribe_history_wakeups`, `HistoryScanner.wake/should_scan` | `CONN::test_private_stream_activity_only_wakes_history_polling`, `SCAN::HistoryScannerTest::test_failures_back_off_and_wakeups_coalesce` | support only (AC-13 = WS-D) |
 
+## Round 3: audited conflict resolutions and sanitized port errors
+
+**Audited resolutions** (critic C3; NG-HIST-002, AC-40, AC-12, NG-OPS-003). Before this round, a conflict audited through `ack_history_conflict` came back on every walk while the contradicted row stayed inside the pages read, so the grid stayed RECONCILING and STOP ended STOP_UNCERTAIN.
+
+- New in `history.py`: `AuditedResolution(stream, key, accepted_fingerprint, rejected_fingerprints=frozenset())`.
+- The engine persists resolutions and serves them through the new **optional** view method `audited_resolutions()`. The scanner reads it with `getattr`, so a view without it gives no resolutions and exactly the previous behaviour. `InMemoryHistoryCursorView` implements it, plus `record_resolution()` and `apply_ledger_corrections()`. Resolutions are reloaded at the start of every walk; a malformed one is a `schema_error` (fail closed).
+- Semantics per resolved key:
+  - a row with the accepted fingerprint is normal evidence;
+  - a row with a rejected fingerprint is audited noise: it is skipped and does not make the walk incomplete. It still counts for the walk boundary and proves the high-water key is served. Counts are in `scanner.last_audited_noise`;
+  - any other fingerprint is still a conflict;
+  - if the accepted payload differs from the committed one, **and** the committed one is audited as rejected, the walk reports reason `ledger_correction_required`. The details are in `scanner.last_ledger_corrections` (`LedgerCorrection(stream, key, committed_fingerprint, accepted_fingerprint, row)`), plus a `ledger_correction_required:<stream>:<key>` entry in `conflicts`. The correction is never offered through `new_*`; the engine must apply it explicitly in one transaction. A committed payload that is neither accepted nor rejected stays a `committed_payload_mismatch` conflict.
+  - `accepted_fingerprint=None` accepts no version; only the rejected payloads become noise.
+- Helper: `history_row_fingerprint(stream, row)`.
+
+**Sanitized port errors** (critic C1). The five port reads (`trading_rules`, `position`, `active_orders`, `inactive_orders_page`, `trades_page`) run through `_sanitized()`. Any non-schema failure becomes `LighterPortRequestError("<op> failed: <OriginalType>")` with `.original_type`, raised outside the handler, so it carries no `__cause__`/`__context__`. aiohttp `ContentTypeError` text contains the request URL with `auth=`; it never leaves the port. The scanner reports `page_fetch_error:<stream>:<original_type>`.
+
+| Item | Test node ids | Red → green evidence |
+|---|---|---|
+| Resolutions: noise completes, third payload conflicts, explicit correction, unaudited committed payload conflicts, in-scan duplicate resolved, order-stream non-terminal noise, fail closed, optional method | `test/hummingbot/strategy_v2/executors/neutral_grid_executor/history/test_ng_history_audited_resolution.py::AuditedResolutionTest::*` (9 tests) | red: ImportError (API absent) at `203e31370`. Mutation A (any non-accepted payload treated as noise) → 4 subtests of `test_third_unaudited_payload_still_conflicts` fail. Mutation B (correction without the committed payload audited as rejected) → `test_committed_payload_not_audited_as_rejected_is_still_a_conflict` fails. Green after the fix. |
+| C1: no exception text or auth token leaves the port | `PORT::LighterPortTest::test_port_errors_carry_only_the_exception_type_never_its_text`, `PORT::LighterPortTest::test_scanner_reason_keeps_only_the_original_error_type` | red: all 5 subtests leak `auth=tok-SECRET-123` through a real aiohttp `ContentTypeError` at `203e31370`. Green after the fix. |
+
 ## Verified SDK facts (lighter-sdk 1.1.4 in the prepared env)
 
 `pip show lighter-sdk` -> `1.1.4` (`lighter/__init__.py` still says `__version__ = "1.0.0"`).
