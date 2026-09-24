@@ -9,6 +9,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     OrderState,
     OrderTypePolicy,
     Side,
+    SubmitRequest,
     TransportOutcome,
     TransportResult,
 )
@@ -136,11 +137,20 @@ def test_trade_cumulative_above_terminal_order_cumulative_is_conflict(store, liv
 
 
 def test_order_row_cumulative_regression_is_conflict(store, live):
+    active = order_row(live.cid, live.side, live.price, live.amount, Decimal("4"), status="open",
+                       order_id=f"9{live.cid}")
+    with store.transaction() as tx:
+        store.record_order_evidence(tx, active)
+    with pytest.raises(InvalidTransitionError, match="regressed"):  # active snapshot going backwards
+        with store.transaction() as tx:
+            store.record_order_evidence(tx, order_row(live.cid, live.side, live.price, live.amount, Decimal("3"),
+                                                      status="open", order_id=f"9{live.cid}"))
     _apply(store, [order_row(live.cid, live.side, live.price, live.amount, Decimal("4"), status="canceled",
                              order_id=f"9{live.cid}")])
     result = _apply(store, [order_row(live.cid, live.side, live.price, live.amount, Decimal("3"),
                                       status="canceled", order_id=f"9{live.cid}")])
-    assert [c.kind for c in result.conflicts] in (["PAYLOAD_MISMATCH"], ["ORDER_MISMATCH"])
+    assert [c.kind for c in result.conflicts] == ["PAYLOAD_MISMATCH"]  # terminal rows are immutable facts
+    assert store.order(live.cid).venue_filled == Decimal("4")
 
 
 def test_terminal_requires_exact_final_row_and_equal_history_cumulative(store, live):
@@ -179,19 +189,18 @@ def test_evidence_for_never_dispatched_intent_is_a_conflict(store):
     assert store.leg(intent.cid).filled == Decimal("0")
 
 
-def test_late_fill_after_release_is_recorded_on_old_cycle_and_freezes(store):
+def test_released_cycle_rejects_moves_and_extra_execution_is_a_conflict(store):
     transport = FakeTransport()
     entry_cid, tp_cid = complete_cycle(store, transport, cell_id=3)
-    tp = store.leg(tp_cid)
-    with pytest.raises(InvalidTransitionError):  # impossible: TP already fully filled
+    with pytest.raises(InvalidTransitionError):  # final states are final
         with store.transaction() as tx:
             store.set_leg_state(tx, tp_cid, OrderState.LIVE)
     entry = store.leg(entry_cid)
-    # a super-delayed extra entry execution after the cell was released (would be an overfill -> conflict)
+    # an execution beyond the fully filled entry cannot be attributed: overfill conflict, quantity not applied
     late = _apply(store, [trade_row("late-1", entry_cid, entry.side, "1", price=str(entry.price),
                                     exchange_order_id=f"9{entry_cid}")])
     assert [c.kind for c in late.conflicts] == ["OVERFILL"]
-    assert tp.state == OrderState.TERMINAL
+    assert store.leg(entry_cid).filled == Decimal("10") and store.leg(tp_cid).state == OrderState.TERMINAL
 
 
 def test_late_fill_on_terminal_partial_leg_is_applied_to_old_cycle(store, live):
@@ -232,9 +241,8 @@ def test_dedupe_key_is_the_canonical_tuple(live):
 
 def test_aggregated_tp_fill_allocation_is_exact_and_idempotent(store):
     transport = FakeTransport()
-    # two SELL-target cells of the same TP price are impossible in a fixed grid, so aggregate two cycles' dust of
-    # one BUY cell pair with the same target side: cell 5 TP carries an allocation for itself and cell 5 only;
-    # the store only checks the arithmetic and cycle membership
+    # an aggregated TP carries explicit per-cycle allocations (the split policy is WS-A's dust.aggregate); the
+    # store keeps the allocation, withholds cycle credit until the fill is allocated and checks the arithmetic
     entry = record_entry_intent(store, cell_id=5)
     submit_via_protocol(store, transport, entry)
     leg = store.leg(entry.cid)
@@ -243,7 +251,6 @@ def test_aggregated_tp_fill_allocation_is_exact_and_idempotent(store):
     cycle = store.cycle(GRID_ID, 5, 1)
     with store.transaction() as tx:
         cid = store.allocate_cid(tx, tp_leg(5))
-        from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import SubmitRequest
         store.record_intent(tx, tp_leg(5), SubmitRequest(cid, cycle.tp_side, cycle.tp_price, Decimal("10"),
                                                          OrderTypePolicy.LIMIT),
                             allocations=[(GRID_ID, 5, 1, Decimal("10"))])

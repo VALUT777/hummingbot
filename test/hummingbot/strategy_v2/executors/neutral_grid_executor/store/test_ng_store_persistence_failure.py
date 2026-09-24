@@ -53,27 +53,34 @@ def test_real_disk_full_rolls_back_the_whole_intent_and_nothing_is_sent(env, hoo
     live = record_entry_intent(store, cell_id=0)
     submit_via_protocol(store, transport, live)
     hooks.simulate_disk_full()
-    committed, failed_cell = [], None
+    committed, failure = [], None
     for cell_id in range(1, 55):
+        stage = "intent"
         try:
             intent = record_entry_intent(store, cell_id=cell_id)
+            committed.append(intent)
+            stage = "dispatch/result"
+            submit_via_protocol(store, transport, intent)
         except PersistenceError as exc:
-            failed_cell = cell_id
-            assert "SQLITE_FULL" in str(exc)
+            failure = (cell_id, stage, str(exc))
             break
-        committed.append(intent)
-        submit_via_protocol(store, transport, intent)  # may itself fail -> then transport is not called
-    assert failed_cell is not None, "the page cap never produced SQLITE_FULL"
-    assert "SQLITE_FULL" in store.degraded_reason
-    sent = {request.client_order_id for request in transport.submits}
-    dispatched = {o.cid for o in store.unresolved_outbox() if o.status == "DISPATCHED"}
-    assert sent <= {live.cid} | {i.cid for i in committed}
-    assert not dispatched  # every dispatch mark that committed was followed by a recorded result
+    assert failure is not None, "the page cap never produced SQLITE_FULL"
+    failed_cell, stage, message = failure
+    assert "SQLITE_FULL" in message and "SQLITE_FULL" in store.degraded_reason
+    committed_cids = {i.cid for i in committed}
+    sent = [request.client_order_id for request in transport.submits]
+    assert set(sent) <= {live.cid} | committed_cids and len(sent) == len(set(sent))  # nothing without intent
     store.close()
 
     hooks.restore_storage()
     reopened = env.open()
-    _assert_cell_untouched(reopened, failed_cell)
+    if stage == "intent":
+        _assert_cell_untouched(reopened, failed_cell)  # the failed intent transaction left nothing behind
+    else:  # intent is durable; its dispatch/result was not: restart sees a recovery question, never a new CID
+        leg = reopened.legs(cell_id=failed_cell)[0]
+        assert leg.state in (OrderState.INTENT, OrderState.SUBMIT_UNKNOWN)
+        assert leg.cid in {o.cid for o in reopened.unresolved_outbox()}
+        assert leg.cid in {r.cid for r in reopened.reservations()}
     assert reopened.leg(live.cid).state == OrderState.LIVE
     assert live.cid in {r.cid for r in reopened.reservations()}  # the known live order stays reserved
     assert reopened.verify_ledger() == []

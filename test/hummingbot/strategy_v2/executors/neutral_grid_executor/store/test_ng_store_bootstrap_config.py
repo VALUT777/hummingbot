@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import OrderState, Side
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CellSpec, OrderState, Side
 from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     BootstrapError,
     BootstrapRecord,
@@ -76,8 +76,10 @@ def test_bootstrap_requires_explicit_confirmation_and_consistent_grid(env):
                 upper_price=Decimal("6"), order_amount_base=Q, prices=prices, cells=cells, anchor=Decimal("5.4"),
                 baseline=Decimal("0"), market_id=MARKET, bootstrap_cut_ts_ms=BOOT_CUT_MS, actor="operator",
                 confirmation="yes")
+    flipped = [CellSpec(c.cell_id, c.low_price, c.high_price, Side.SELL) for c in cells]  # ignores anchor rule
     for bad in (dict(confirmation=""), dict(prices=prices[:-1]), dict(anchor=Decimal("7")),
-                dict(baseline=0.0), dict(order_amount_base=Decimal("0")), dict(cells=cells[::-1])):
+                dict(baseline=0.0), dict(order_amount_base=Decimal("0")), dict(cells=cells[::-1]),
+                dict(cells=flipped), dict(anchor=Decimal("5.6"))):
         with pytest.raises((ValueError, TypeError)):
             store.bootstrap(None, BootstrapRecord(**{**base, **bad}))
     assert store.engine().bootstrapped is False
