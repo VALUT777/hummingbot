@@ -165,7 +165,7 @@ def test_retention_window_and_weights():
     fx.clock.advance(61)
     assert run(fx.trades_page(None)).rows == []
     assert fx.request_weight("trades") == 600 and fx.request_weight("inactive_orders") == 100
-    assert fx.request_weight("position") == 300
+    assert fx.request_weight("account") == 300
     assert fx.weight_used(60) >= 600
 
 
