@@ -1,9 +1,21 @@
-"""NG-GRID-003 dust; AC-33 (visible, durable, blocks reset, same side+target only), AC-39 (exact idempotent split)."""
+"""NG-GRID-003 dust; AC-33 (visible, durable, blocks reset, same side+target only), AC-39 (ledger aggregate TP)."""
 import itertools
+import json
 import unittest
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import dust, grid
-from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import Side
+from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import (
+    CellLedger,
+    FillOutcome,
+    LedgerError,
+    TerminalOutcome,
+)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    OrderState,
+    Side,
+    TransportOutcome,
+    TransportResult,
+)
 from hummingbot.strategy_v2.executors.neutral_grid_executor.dust import AggregateTp, DustLot
 
 from .helpers import D, Harness, rules
@@ -71,6 +83,96 @@ class TestAggregateFills(unittest.TestCase):
                 agg.apply_fill(key, q)
             results.add(tuple(sorted(agg.per_lot_filled().items())))
         self.assertEqual(1, len(results))
+
+
+class TestLedgerAggregateTp(unittest.TestCase):
+    """AC-39 end to end through CellLedger: one aggregate TP over the DUST of two cycles of one cell."""
+
+    def two_dust_cycles(self):
+        r = rules(step="1", min_base="5", min_notional="0")
+        h = Harness(r=r)
+        e0 = h.entry()
+        h.fill(e0, "6")
+        h.ledger.set_state(e0, OrderState.CANCEL_PENDING)
+        h.ledger.set_state(e0, OrderState.TERMINAL_UNKNOWN)
+        h.ledger.confirm_terminal(e0, D("6"))
+        _, (tp0,) = h.dispatch_tps()
+        h.fill(tp0, "6")
+        h.ledger.confirm_terminal(tp0, D("6"))
+        h.ledger.release(True)
+        e1 = h.entry()
+        h.fill(e1, "3")
+        h.ledger.set_state(e1, OrderState.CANCEL_PENDING)
+        h.ledger.set_state(e1, OrderState.TERMINAL_UNKNOWN)
+        h.ledger.confirm_terminal(e1, D("3"))
+        self.assertEqual({1: D("3")}, h.ledger.refresh_dust(r))                  # alone: DUST 3 < 5
+        self.assertEqual(FillOutcome.LATE_EVIDENCE, h.fill(e0, "2")[0])         # gen 0 re-opened by 2
+        h.ledger.acknowledge_late_evidence(0)
+        return h, r
+
+    def test_ac39_ledger_dispatches_one_aggregate_and_splits_fills_exactly(self):
+        h, r = self.two_dust_cycles()
+        plan = h.ledger.tp_obligation_to_dispatch(r)
+        (item,) = plan.items
+        self.assertEqual((1, D("5"), ((0, D("2")), (1, D("3")))), (item.generation, item.qty, item.allocation))
+        self.assertEqual(D("0"), plan.dust)                                     # aggregatable: not DUST
+        self.assertEqual({1: D("0")}, h.ledger.refresh_dust(r))
+        leg = h.ledger.add_tp_intent(item.qty, 777, r, generation=item.generation, allocation=item.allocation)
+        self.assertEqual({0: D("2"), 1: D("3")}, leg.allocation)
+        h.ledger.record_transport(leg.identity, TransportResult(TransportOutcome.ACCEPTED, exchange_order_id="x777"))
+        before = h.ledger.to_record()
+        b0, b1 = (c.buckets() for c in h.ledger.cycles)
+        self.assertEqual((D("2"), D("3")), (b0.live_tp_remainder, b1.live_tp_remainder))
+        self.assertEqual((), h.ledger.tp_obligation_to_dispatch(r).items)       # no duplicate TP
+        out, k1 = h.fill(leg.identity, "1")
+        self.assertEqual(FillOutcome.APPLIED, out)
+        self.assertEqual((D("7"), D("0")), (h.ledger.cycles[0].X, h.ledger.cycles[1].X))
+        h.fill(leg.identity, "3")
+        self.assertEqual((D("8"), D("2")), (h.ledger.cycles[0].X, h.ledger.cycles[1].X))
+        self.assertEqual(FillOutcome.DUPLICATE, h.ledger.apply_fill(k1, leg.identity, D("1"), leg.price, leg.side))
+        self.assertEqual(FillOutcome.CONFLICT_KEY,
+                         h.ledger.apply_fill(k1, leg.identity, D("2"), leg.price, leg.side))
+        h.fill(leg.identity, "1")
+        self.assertEqual(TerminalOutcome.TERMINAL, h.ledger.confirm_terminal(leg.identity, D("5")))
+        for c in h.ledger.cycles:
+            self.assertEqual(c.E, c.X)
+        self.assertEqual([], h.ledger.check_invariants())
+        # Persistence: allocation survives the round trip; replay is idempotent.
+        restored = CellLedger.from_record(json.loads(json.dumps(h.ledger.to_record())))
+        self.assertEqual(h.ledger.to_record(), restored.to_record())
+        self.assertEqual([c.X for c in h.ledger.cycles], [c.X for c in restored.cycles])
+        # Order independence: the same executions in any order give the same per-cycle split.
+        fills = [(("t", "a"), D("1")), (("t", "b"), D("3")), (("t", "c"), D("1"))]
+        splits = set()
+        for perm in itertools.permutations(fills):
+            replica = CellLedger.from_record(json.loads(json.dumps(before)))
+            for key, q in perm:
+                replica.apply_fill(key, leg.identity, q, leg.price, leg.side)
+            splits.add(tuple(c.X for c in replica.cycles))
+        self.assertEqual({(D("8"), D("3"))}, splits)
+        self.assertTrue(h.ledger.can_release(True).ok)
+        h.ledger.release(True)
+        self.assertEqual(2, h.ledger.next_entry_identity().generation)
+
+    def test_aggregate_leg_is_visible_and_checked_by_invariants(self):
+        h, r = self.two_dust_cycles()
+        (item,) = h.ledger.tp_obligation_to_dispatch(r).items
+        leg = h.ledger.add_tp_intent(item.qty, 778, r, allocation=item.allocation)
+        self.assertEqual([], h.ledger.check_invariants())
+        self.assertEqual({"0": "2", "1": "3"}, h.ledger.to_view()["tp_children"][0]["allocation"])
+        leg.allocation[0] = D("3")                                      # corrupt: shares no longer sum to qty
+        self.assertTrue(any("allocation" in v for v in h.ledger.check_invariants()))
+
+    def test_aggregate_intent_is_validated_against_each_cycle(self):
+        h, r = self.two_dust_cycles()
+        with self.assertRaises(LedgerError):                                    # gen 0 owes only 2
+            h.ledger.add_tp_intent(D("5"), 900, r, allocation={0: D("3"), 1: D("2")})
+        with self.assertRaises(LedgerError):                                    # sum != qty
+            h.ledger.add_tp_intent(D("5"), 901, r, allocation={0: D("2"), 1: D("2")})
+        with self.assertRaises(LedgerError):                                    # unknown generation
+            h.ledger.add_tp_intent(D("5"), 902, r, allocation={0: D("2"), 7: D("3")})
+        with self.assertRaises(LedgerError):                                    # host must be newest gen
+            h.ledger.add_tp_intent(D("5"), 903, r, generation=0, allocation={0: D("2"), 1: D("3")})
 
 
 class TestDustVisibility(unittest.TestCase):

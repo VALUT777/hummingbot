@@ -113,6 +113,7 @@ class CoreSim:
         self.history = []                     # every applied fill: (key, identity, qty, price, side)
         self.last_admission = None
         self.last_router = None
+        self.aggregates = 0                   # aggregate TP legs dispatched (AC-39 path coverage)
 
     # ---------------------------------------------------------------- views
     def legs(self):
@@ -185,7 +186,10 @@ class CoreSim:
                 else:
                     ident = L.next_tp_identity(item.generation)
                     leg = L.add_tp_intent(item.qty, self.alloc.allocate(ident), self.rules, generation=item.generation,
-                                          order_type=OrderTypePolicy.LIMIT, seq=next(self._seq))
+                                          order_type=OrderTypePolicy.LIMIT, seq=next(self._seq),
+                                          allocation=item.allocation)
+                    if item.allocation is not None:
+                        self.aggregates += 1
                 self.by_cid[leg.cid] = (cid, leg.identity)
                 outcome = TransportOutcome.ACCEPTED if self.transport == "ACCEPTED" else TransportOutcome.UNKNOWN
                 L.record_transport(leg.identity, TransportResult(outcome, exchange_order_id=f"x{leg.cid}"

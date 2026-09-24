@@ -21,7 +21,7 @@ import unittest
 from decimal import Decimal
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import grid
-from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import CellLedger, FillOutcome
+from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import CellLedger, FillOutcome, TerminalOutcome
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     LegRole,
     OrderState,
@@ -260,6 +260,83 @@ def run_random(tc: unittest.TestCase, rng: random.Random, steps: int):
 
 
 class TestCoreProperties(unittest.TestCase):
+    def test_aggregate_tp_random_splits_are_exact_and_idempotent(self):
+        """AC-39 through CellLedger: two DUST cycles of one cell (late evidence re-opened the old one) closed by
+        aggregate/ordinary TPs under random floors, max_base, partial fills, duplicates and replay order."""
+        from .helpers import BUY_CELL, Harness
+        aggregates = 0
+        for seed in range(max(SEEDS, 1)):
+            with self.subTest(seed=seed):
+                rng = random.Random(20_000 + seed)
+                m = rng.choice([3, 4, 5])
+                max_base = rng.choice([None, str(m + 1), str(2 * m)])
+                r = rules(step="1", min_base=str(m), min_notional="0", max_base=max_base)
+                h = Harness(BUY_CELL, r=rules(step="1", min_base=str(m), min_notional="0"))
+                e0 = h.entry()
+                a = rng.randint(m, 9)
+                h.fill(e0, str(a))
+                h.ledger.set_state(e0, OrderState.CANCEL_PENDING)
+                h.ledger.set_state(e0, OrderState.TERMINAL_UNKNOWN)
+                h.ledger.confirm_terminal(e0, D(a))
+                for leg_ident in h.dispatch_tps()[1]:
+                    leg = h.leg(leg_ident)
+                    h.fill(leg_ident, str(leg.requested))
+                    h.ledger.confirm_terminal(leg_ident, leg.requested)
+                h.ledger.release(True)
+                e1 = h.entry()
+                b = rng.randint(1, m - 1)
+                h.fill(e1, str(b))
+                h.ledger.set_state(e1, OrderState.CANCEL_PENDING)
+                h.ledger.set_state(e1, OrderState.TERMINAL_UNKNOWN)
+                h.ledger.confirm_terminal(e1, D(b))
+                h.ledger.refresh_dust(r)
+                self.assertEqual(FillOutcome.LATE_EVIDENCE, h.fill(e0, str(rng.randint(1, 10 - a)))[0])
+                h.ledger.acknowledge_late_evidence(0)
+                self.assertEqual([], h.ledger.check_invariants())
+                seen_x = {}
+                events = []
+                for _ in range(30):
+                    plan = h.ledger.tp_obligation_to_dispatch(r)
+                    for item in plan.items:
+                        ident = h.ledger.next_tp_identity(item.generation)
+                        leg = h.ledger.add_tp_intent(item.qty, 5000 + len(events) + ident.revision * 97 + seed,
+                                                     r, generation=item.generation, allocation=item.allocation)
+                        aggregates += item.allocation is not None
+                        h.ledger.record_transport(leg.identity, TransportResult(TransportOutcome.ACCEPTED))
+                    h.ledger.refresh_dust(r)
+                    live = [leg for leg in h.ledger.non_final_legs() if leg.remaining > 0]
+                    if not live and not plan.items:
+                        break
+                    for leg in live:
+                        q = D(rng.randint(1, int(leg.remaining)))
+                        key = ("t", seed, len(events))
+                        self.assertEqual(FillOutcome.APPLIED, h.ledger.apply_fill(key, leg.identity, q, leg.price,
+                                                                                  leg.side))
+                        events.append((key, leg.identity, q, leg.price, leg.side))
+                        dup = rng.choice(events)
+                        self.assertEqual(FillOutcome.DUPLICATE, h.ledger.apply_fill(*dup))
+                    for leg in h.ledger.non_final_legs():
+                        if leg.remaining == 0:
+                            self.assertEqual(TerminalOutcome.TERMINAL, h.ledger.confirm_terminal(leg.identity,
+                                                                                                 leg.filled))
+                    self.assertEqual([], h.ledger.check_invariants())
+                    for c in h.ledger.cycles:
+                        self.assertLessEqual(seen_x.get(c.generation, Decimal(0)), c.X)
+                        self.assertLessEqual(c.X, c.E)
+                        seen_x[c.generation] = c.X
+                self.assertEqual([], h.ledger.non_final_legs())
+                for c in h.ledger.cycles:
+                    self.assertEqual(c.E - c.X, c.buckets().dust)          # closed out exactly, or visible DUST
+                # Persisted state: replaying every execution, in any order, is a no-op and keeps the exact split
+                # (order independence of the split itself: test_dust.py::TestLedgerAggregateTp permutations).
+                replica = CellLedger.from_record(h.ledger.to_record())
+                for event in rng.sample(events, len(events)):
+                    self.assertEqual(FillOutcome.DUPLICATE, replica.apply_fill(*event))
+                self.assertEqual([c.X for c in h.ledger.cycles], [c.X for c in replica.cycles])
+                if h.ledger.buckets().dust == 0:
+                    self.assertTrue(h.ledger.can_release(True).ok, h.ledger.can_release(True).reasons)
+        self.assertGreater(aggregates, 0)
+
     def test_late_evidence_is_resolved_by_ordinary_tps_and_never_latches(self):
         """AC-42 (ledger part): late executions of already-final entries (incl. released cycles) are applied to
         their own cycle, flagged for audit, and after the audit closed by ordinary TP legs; no cell stays locked."""
