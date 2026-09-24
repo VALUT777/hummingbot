@@ -1,10 +1,11 @@
 """Config preview before start (NG-UI-002, AC-46).
 
-The arithmetic is delegated to the core package (``grid.build_grid``, ``grid.assign_cells``,
-``grid.validate_config``, ``admission.required_slots``) through :class:`GridCore`, so the preview and
-the engine share one implementation. Values that depend on the current mid price (BUY/SELL split,
-reachable range, armed/queued) are advisory: the anchor is fixed only by the engine after full
-reconciliation at bootstrap.
+All arithmetic comes from the core package — ``grid.build_preview`` (integer-tick grid, anchor/sides,
+full-Q validation, admission plan and slot ledger), ``risk.reachable_interval``,
+``risk.required_margin_estimate`` and ``risk.margin_advisory`` — so the preview and the engine share
+one implementation. This module only adds presentation: exact strings, Russian labels, cap/advisory
+warnings and the ``preview_id``. Mid-dependent values (BUY/SELL split, reachable range, armed/queued)
+are advisory: the anchor is fixed by the engine after full reconciliation at bootstrap.
 
 ``preview_id`` fingerprints what a Start confirmation is about: config, runtime rules and the
 committed revisions. It deliberately excludes the moving mid price and the operator's baseline input,
@@ -15,51 +16,32 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 from dataclasses import dataclass
-from decimal import ROUND_CEILING, Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol
+from decimal import Decimal, InvalidOperation
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
-    CellSpec,
-    GridConfig,
-    OrderTypePolicy,
-    Side,
-    TradingRules,
-)
+from hummingbot.strategy_v2.executors.neutral_grid_executor import grid as core_grid, risk as core_risk
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import GridConfig, TradingRules
 from web.neutral_grid import jsonsafe
 
-
-class GridCore(Protocol):
-    grid_error: type
-
-    def build_grid(self, lower: Decimal, upper: Decimal, cell_count: int, rules: TradingRules) -> List[Decimal]: ...
-
-    def assign_cells(self, prices: List[Decimal], anchor: Decimal) -> List[CellSpec]: ...
-
-    def validate_config(self, cfg: GridConfig, rules: TradingRules, mid: Optional[Decimal]) -> List[str]: ...
-
-    def required_slots(self, q: Decimal, rules: TradingRules, tp_price: Decimal) -> int: ...
-
-
-class PackageGridCore:
-    """Adapter over the core package (WS-A) — the single implementation of grid/admission math."""
-
-    def __init__(self) -> None:
-        from hummingbot.strategy_v2.executors.neutral_grid_executor import admission, grid
-        self._grid = grid
-        self._admission = admission
-        self.grid_error = getattr(grid, "GridValidationError", ValueError)
-
-    def build_grid(self, lower, upper, cell_count, rules):
-        return list(self._grid.build_grid(lower, upper, cell_count, rules))
-
-    def assign_cells(self, prices, anchor):
-        return list(self._grid.assign_cells(prices, anchor))
-
-    def validate_config(self, cfg, rules, mid):
-        return [str(e) for e in self._grid.validate_config(cfg, rules, mid)]
-
-    def required_slots(self, q, rules, tp_price):
-        return int(self._admission.required_slots(q, rules, tp_price))
+_MISSING_BASELINE = "expected_initial_position: required"
+_ERROR_LABELS = (
+    ("grid:", "Сетка"),
+    ("leverage:", "Плечо"),
+    ("order_amount_base:", "Размер ордера Q"),
+    ("expected_initial_position:", "Baseline B"),
+    ("max_active_orders:", "Лимит ордеров"),
+    ("max_abs_net_position:", "Лимит |net|"),
+    ("max_gross_position:", "Лимит gross"),
+    ("mid_price:", "Средняя цена"),
+    ("RULES_", "Правила рынка"),
+    ("history_", "Параметры истории"),
+    ("poll_interval_s:", "Интервал опроса"),
+    ("settlement_", "Выдержка"),
+    ("tp_gtt_seconds:", "Срок GTT для TP"),
+    ("entry", "Тип ордера входа"),
+    ("tp", "Тип ордера TP"),
+    ("cell", "Ячейка"),
+)
 
 
 @dataclass(frozen=True)
@@ -99,31 +81,27 @@ def parse_signed_decimal(value: object) -> Decimal:
     return parsed
 
 
+def localize_error(message: str) -> str:
+    """Prefix a core validation message with a Russian label; the exact technical text is kept."""
+    for prefix, label in _ERROR_LABELS:
+        if message.startswith(prefix):
+            return f"{label}: {message}"
+    return f"Проверка: {message}"
+
+
 def _config_dict(cfg: GridConfig) -> Dict[str, Any]:
-    data = dataclasses.asdict(cfg)
-    return jsonsafe.make_safe(data)
+    return jsonsafe.make_safe(dataclasses.asdict(cfg))
 
 
 def _rules_dict(rules: Optional[TradingRules]) -> Optional[Dict[str, Any]]:
     return None if rules is None else jsonsafe.make_safe(dataclasses.asdict(rules))
 
 
-def _quantize_up(value: Decimal, step: Decimal) -> Decimal:
-    return (value / step).to_integral_value(rounding=ROUND_CEILING) * step
-
-
 class PreviewService:
-    def __init__(self, config: GridConfig, market: MarketSource, *, core: Optional[GridCore] = None,
-                 mode: str = "demo"):
+    def __init__(self, config: GridConfig, market: MarketSource, *, mode: str = "demo"):
         self.config = config
         self._market = market
-        self._core = core
         self.mode = mode
-
-    def core(self) -> GridCore:
-        if self._core is None:
-            self._core = PackageGridCore()
-        return self._core
 
     def preview_id(self, rules: Optional[TradingRules], config_revision: int, engine_revision: int) -> str:
         rules_view = _rules_dict(rules)
@@ -138,9 +116,57 @@ class PreviewService:
                     baseline_confirmed_in_ledger: bool = False) -> Dict[str, Any]:
         cfg = self.config
         ctx = await self._market()
-        errors: List[str] = []
+        rules, mid = ctx.rules, ctx.mid
         warnings: List[str] = []
-        rules = ctx.rules
+        bootstrap = not baseline_confirmed_in_ledger
+        baseline = baseline_override if baseline_override is not None else cfg.expected_initial_position
+        effective_cfg = dataclasses.replace(cfg, expected_initial_position=baseline)
+        gp = core_grid.build_preview(effective_cfg, rules, mid, baseline, bootstrap=bootstrap)
+
+        errors: List[str] = []
+        for message in gp.errors:
+            if baseline is None and message.startswith(_MISSING_BASELINE):
+                continue  # collected in the Start dialog, not a config defect
+            errors.append(localize_error(message))
+        if self.mode != "demo" and not cfg.enabled:
+            errors.append("enabled=false: live-старт невозможен без изменения конфигурации и явного подтверждения.")
+        if baseline is None:
+            warnings.append("expected_initial_position (B) не задан в конфигурации: его нужно ввести и подтвердить "
+                            "в диалоге старта. Диапазон ниже рассчитан для B=0.")
+
+        cells = gp.cells
+        q = cfg.order_amount_base
+        p_min, p_max = gp.reachable_min, gp.reachable_max
+        baseline_used = baseline
+        if cells and baseline is None:
+            baseline_used = Decimal(0)
+            p_min, p_max = core_risk.reachable_interval(baseline_used, cells, q)
+        cap = cfg.max_abs_net_position
+        within_net = None if p_min is None else (p_max <= cap and p_min >= -cap)
+        if within_net is False:
+            warnings.append(f"Достижимый диапазон [{p_min}, {p_max}] выходит за лимит ±{cap}: движок будет "
+                            "отклонять входы, которые могут вывести позицию за лимит (AC-24/25).")
+        gross_worst = gp.gross_worst
+        within_gross = None if gross_worst is None else gross_worst <= cfg.max_gross_position
+        if within_gross is False:
+            warnings.append(f"Худший gross {gross_worst} больше лимита {cfg.max_gross_position}: часть ячеек "
+                            "не сможет открыть цикл одновременно.")
+        if cells and gp.queued:
+            warnings.append(f"Лимит ордеров позволяет вооружить {gp.armed} из {len(cells)} ячеек; остальные "
+                            f"{gp.queued} ждут в очереди (выход всегда в приоритете).")
+
+        margin_required = None
+        if p_min is not None and p_max is not None:
+            margin_required = core_risk.required_margin_estimate(p_min, p_max, mid, cfg.leverage)
+        margin_warning, margin_blocks = core_risk.margin_advisory(ctx.available_collateral, margin_required)
+        if margin_warning:
+            warnings.append(("Маржа неизвестна — движок заблокирует новую экспозицию до получения данных: "
+                             if margin_blocks else "Предупреждение о марже (решает биржа): ") + margin_warning)
+        gross_notional = (gross_worst * mid) if (gross_worst is not None and mid is not None) else None
+
+        slots = list(gp.slots_per_cell.values())
+        tp_min = list(gp.min_valid_tp_qty.values())
+        venue_cap = rules.max_active_orders_venue if rules is not None else None
         result: Dict[str, Any] = {
             "mode": self.mode,
             "config_revision": config_revision,
@@ -150,139 +176,55 @@ class PreviewService:
             "runtime_rules": _rules_dict(rules),
             "market_source": ctx.source,
             "rules_fetched_at": ctx.fetched_at,
+            "live_confirmation_required": bootstrap,
+            "baseline": {
+                "value": _s(baseline), "signed": signed(baseline) if baseline is not None else None,
+                "source": "operator_input" if baseline_override is not None else (
+                    "config" if cfg.expected_initial_position is not None else "missing"),
+                "confirmed_in_ledger": baseline_confirmed_in_ledger,
+            },
+            "grid": {"boundaries": len(gp.prices), "cells": len(cells) if cells else max(len(gp.prices) - 1, 0),
+                     "prices": [format(p, "f") for p in gp.prices]},
+            "anchor": {"mid": _s(mid), "anchor_estimate": _s(gp.anchor),
+                       "note": "Якорь фиксируется движком после полной сверки при bootstrap; здесь — оценка по "
+                               "текущей средней цене. Цены ячеек после старта не меняются."},
+            "sides": {"buy": gp.buy_cells, "sell": gp.sell_cells, "known": bool(cells)},
+            "admission": {
+                "effective_cap": gp.slot_cap if cells else None, "configured_cap": cfg.max_active_orders,
+                "venue_cap": venue_cap,
+                "slots_per_cell_min": min(slots) if slots else None, "slots_per_cell_max": max(slots) if slots else None,
+                "armed": gp.armed if slots else None, "queued": gp.queued if slots else None,
+                "slots_actual": 0 if slots else None, "slots_reserved": gp.slots_reserved if slots else None,
+                "slots_free": gp.slots_free if slots else None,
+                "note": "Порядок вооружения: расстояние фиксированной цены входа до текущей цены, затем cell_id.",
+            },
+            "reachable": {"P_min": _s(p_min), "P_max": _s(p_max), "net_cap": _s(cap), "within_cap": within_net,
+                          "baseline_used": _s(baseline_used)},
+            "gross": {"worst": _s(gross_worst), "cap": _s(cfg.max_gross_position), "within_cap": within_gross},
+            "leverage": {"configured": _s(cfg.leverage),
+                         "venue_max": _s(rules.max_leverage) if rules is not None else None},
+            "notional": {
+                "mark": _s(mid),
+                "net_notional_estimate": _s(gp.estimated_max_notional),
+                "gross_notional_estimate": _s(gross_notional),
+                "margin_estimate": _s(margin_required.quantize(Decimal("0.01"))) if margin_required is not None else None,
+                "available_collateral": _s(ctx.available_collateral),
+                "warning": margin_warning, "blocks_exposure": margin_blocks,
+            },
+            "floors": {
+                "tick_size": _s(rules.tick_size) if rules else None,
+                "size_step": _s(rules.size_step) if rules else None,
+                "min_base": _s(rules.min_base) if rules else None,
+                "min_notional": _s(rules.min_notional) if rules else None,
+                "max_base": _s(rules.max_base) if rules else None,
+                "min_valid_tp_qty_min": _s(min(tp_min)) if tp_min else None,
+                "min_valid_tp_qty_max": _s(max(tp_min)) if tp_min else None,
+                "freshness_s": _s(cfg.history_freshness_s), "settlement_delay_s": _s(cfg.settlement_delay_s),
+                "settlement_scans": cfg.settlement_scans, "history_overlap_s": _s(cfg.history_overlap_s),
+                "poll_interval_s": _s(cfg.poll_interval_s),
+            },
+            "errors": errors,
+            "warnings": warnings,
+            "can_start": not errors,
         }
-        if self.mode != "demo" and not cfg.enabled:
-            errors.append("enabled=false: live-старт невозможен без изменения конфигурации и явного подтверждения.")
-        for label, policy in (("entry", cfg.entry_order_type), ("TP", cfg.tp_order_type)):
-            if not isinstance(policy, OrderTypePolicy):
-                errors.append(f"Недопустимый тип ордера {label}: {policy} (MARKET запрещён).")
-
-        baseline = baseline_override if baseline_override is not None else cfg.expected_initial_position
-        result["baseline"] = {
-            "value": _s(baseline), "signed": signed(baseline) if baseline is not None else None,
-            "source": "operator_input" if baseline_override is not None else (
-                "config" if cfg.expected_initial_position is not None else "missing"),
-            "confirmed_in_ledger": baseline_confirmed_in_ledger,
-        }
-        result["live_confirmation_required"] = not baseline_confirmed_in_ledger
-        if baseline is None:
-            warnings.append("expected_initial_position не задан: его нужно ввести и подтвердить при первом старте. "
-                            "Диапазон ниже рассчитан для B=0.")
-        b = baseline if baseline is not None else Decimal(0)
-
-        if rules is None:
-            errors.append("Нет свежих торговых правил рынка: превью и старт невозможны (NG-RISK-004).")
-            result.update(errors=errors, warnings=warnings, can_start=False)
-            return result
-
-        core = self.core()
-        try:
-            prices = core.build_grid(cfg.lower_price, cfg.upper_price, cfg.cell_count, rules)
-        except core.grid_error as exc:
-            errors.append(f"Сетка: {exc}")
-            prices = []
-        except (ValueError, ArithmeticError) as exc:
-            errors.append(f"Сетка: {exc}")
-            prices = []
-        errors.extend(e for e in core.validate_config(cfg, rules, ctx.mid) if e not in errors)
-
-        result["grid"] = {
-            "boundaries": len(prices), "cells": max(len(prices) - 1, 0),
-            "prices": [format(p, "f") for p in prices],
-        }
-        mid = ctx.mid
-        anchor = None
-        if mid is not None and prices:
-            anchor = min(max(mid, cfg.lower_price), cfg.upper_price)
-        result["anchor"] = {"mid": _s(mid), "anchor_estimate": _s(anchor),
-                            "note": "Якорь фиксируется движком после полной сверки при bootstrap; "
-                                    "здесь — оценка по текущей средней цене."}
-        cells: List[CellSpec] = core.assign_cells(prices, anchor) if (anchor is not None and prices) else []
-        buys = sum(1 for c in cells if c.entry_side == Side.BUY)
-        sells = len(cells) - buys
-        result["sides"] = {"buy": buys, "sell": sells, "known": bool(cells)}
-
-        q = cfg.order_amount_base
-        slots_per_cell: List[int] = []
-        tp_min_qtys: List[Decimal] = []
-        for cell in cells:
-            slots_per_cell.append(core.required_slots(q, rules, cell.tp_price))
-            tp_min_qtys.append(_quantize_up(max(rules.min_base, rules.min_notional / cell.tp_price), rules.size_step))
-        venue_cap = rules.max_active_orders_venue
-        effective_cap = cfg.max_active_orders if venue_cap is None else min(cfg.max_active_orders, venue_cap)
-        if venue_cap is not None and cfg.max_active_orders > venue_cap:
-            warnings.append(f"max_active_orders={cfg.max_active_orders} выше лимита площадки {venue_cap}; "
-                            f"используется {effective_cap}.")
-        armed_ids: List[int] = []
-        reserved = 0
-        if cells and mid is not None:
-            order = sorted(zip(cells, slots_per_cell),
-                           key=lambda pair: (abs(pair[0].entry_price - mid), pair[0].cell_id))
-            for cell, need in order:
-                if reserved + need > effective_cap:
-                    break  # strict queue order: no skipping ahead to a cheaper cell
-                armed_ids.append(cell.cell_id)
-                reserved += need
-        result["admission"] = {
-            "effective_cap": effective_cap, "configured_cap": cfg.max_active_orders, "venue_cap": venue_cap,
-            "slots_per_cell_min": min(slots_per_cell) if slots_per_cell else None,
-            "slots_per_cell_max": max(slots_per_cell) if slots_per_cell else None,
-            "armed": len(armed_ids) if cells else None, "queued": (len(cells) - len(armed_ids)) if cells else None,
-            "slots_actual": 0, "slots_reserved": reserved if cells else None,
-            "slots_free": (effective_cap - reserved) if cells else None,
-            "note": "Порядок вооружения: расстояние фиксированной цены входа до текущей цены, затем cell_id.",
-        }
-        if cells and len(armed_ids) < len(cells):
-            warnings.append(f"Лимит ордеров позволяет вооружить {len(armed_ids)} из {len(cells)} ячеек; "
-                            f"остальные {len(cells) - len(armed_ids)} ждут в очереди.")
-
-        p_max = b + q * buys
-        p_min = b - q * sells
-        cap = cfg.max_abs_net_position
-        within_net = p_max <= cap and p_min >= -cap
-        result["reachable"] = {"P_min": _s(p_min) if cells else None, "P_max": _s(p_max) if cells else None,
-                               "net_cap": _s(cap), "within_cap": within_net if cells else None,
-                               "baseline_used": _s(b)}
-        if cells and not within_net:
-            errors.append(f"Достижимый диапазон позиции [{p_min}, {p_max}] выходит за max_abs_net_position ±{cap}.")
-        gross_worst = q * len(cells)
-        result["gross"] = {"worst": _s(gross_worst) if cells else None, "cap": _s(cfg.max_gross_position),
-                           "within_cap": (gross_worst <= cfg.max_gross_position) if cells else None}
-        if cells and gross_worst > cfg.max_gross_position:
-            errors.append(f"Худший gross {gross_worst} превышает max_gross_position {cfg.max_gross_position}.")
-        result["leverage"] = {"configured": _s(cfg.leverage), "venue_max": _s(rules.max_leverage)}
-        if rules.max_leverage is not None and cfg.leverage > rules.max_leverage:
-            errors.append(f"Плечо {cfg.leverage} выше максимума площадки {rules.max_leverage}.")
-        if cfg.leverage <= 0:
-            errors.append("Плечо должно быть положительным.")
-
-        mark = mid
-        notional = (gross_worst * mark) if (mark is not None and cells) else None
-        margin = (notional / cfg.leverage) if (notional is not None and cfg.leverage > 0) else None
-        available = ctx.available_collateral
-        margin_warning = None
-        margin_blocks = False
-        if margin is None or available is None or not available.is_finite() or available < 0:
-            margin_warning = "Маржа неизвестна: движок заблокирует новую экспозицию до получения данных (NG-RISK-004)."
-            margin_blocks = True
-        elif margin > available:
-            margin_warning = (f"Оценка маржи {margin.quantize(Decimal('0.01'))} больше доступного "
-                              f"{available} USDG — только предупреждение; правила маржи применит биржа.")
-        result["notional"] = {
-            "mark": _s(mark), "gross_notional_estimate": _s(notional.quantize(Decimal("0.01"))) if notional else None,
-            "margin_estimate": _s(margin.quantize(Decimal("0.01"))) if margin is not None else None,
-            "available_collateral": _s(available), "warning": margin_warning, "blocks_exposure": margin_blocks,
-        }
-        if margin_warning:
-            warnings.append(margin_warning)
-        result["floors"] = {
-            "tick_size": _s(rules.tick_size), "size_step": _s(rules.size_step), "min_base": _s(rules.min_base),
-            "min_notional": _s(rules.min_notional), "max_base": _s(rules.max_base),
-            "min_valid_tp_qty_min": _s(min(tp_min_qtys)) if tp_min_qtys else None,
-            "min_valid_tp_qty_max": _s(max(tp_min_qtys)) if tp_min_qtys else None,
-            "freshness_s": _s(cfg.history_freshness_s), "settlement_delay_s": _s(cfg.settlement_delay_s),
-            "settlement_scans": cfg.settlement_scans, "history_overlap_s": _s(cfg.history_overlap_s),
-            "poll_interval_s": _s(cfg.poll_interval_s),
-        }
-        result.update(errors=errors, warnings=warnings, can_start=not errors)
         return result

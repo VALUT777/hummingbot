@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from ngweb_fakes import FakeGateway, ReferenceGridCore, sample_config, sample_rules  # noqa: E402
+from ngweb_fakes import FakeGateway, sample_config, sample_rules  # noqa: E402
 
 from web.neutral_grid.keystore import KeystoreService  # noqa: E402
 from web.neutral_grid.preview import MarketContext, PreviewService  # noqa: E402
@@ -92,13 +92,13 @@ def default_market(market: Dict[str, Any]):
 async def make_web():
     clients = []
 
-    async def factory(snapshot=None, *, config=None, core=None, mode="demo", keystore=None, stale_after_s=15.0,
+    async def factory(snapshot=None, *, config=None, mode="demo", keystore=None, stale_after_s=15.0,
                       demo=None, gateway=None, bind_host="127.0.0.1", policy=None):
         market = {"rules": sample_rules(), "mid": Decimal("5.4"), "available": Decimal("3000")}
         cfg = config or sample_config()
         ctx = WebContext(
             gateway=gateway or FakeGateway(snapshot),
-            preview=PreviewService(cfg, default_market(market), core=core or ReferenceGridCore(), mode=mode),
+            preview=PreviewService(cfg, default_market(market), mode=mode),
             keystore=keystore or KeystoreService(demo=(mode == "demo")),
             engine_identity={"grid_id": cfg.grid_id, "connector_name": cfg.connector_name,
                              "trading_pair": cfg.trading_pair, "account_index": cfg.account_index},

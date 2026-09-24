@@ -147,13 +147,19 @@ async def test_start_requires_explicit_baseline_and_risk_confirmation(make_web):
 async def test_start_with_baseline_outside_cap_is_rejected(make_web):
     web = await make_web(None)
     await web.login()
-    _, payload = await _start_payload(web, "900")  # reachable P_max = 900 + 220 > 1000
+    _, payload = await _start_payload(web, "-1100")  # |B| above max_abs_net_position: core validation error
     resp = await web.command("start", "start-cap-000000001", payload)
     assert resp.status == 422
     body = await resp.json()
     assert body["error"] == "preview_invalid"
-    assert any("max_abs_net_position" in e for e in body["errors"])
+    assert any("max_abs_net_position" in e and e.startswith("Baseline B") for e in body["errors"])
     assert web.gateway.commands == []
+    # |B| within cap but reachable range beyond it: allowed, the engine blocks the unsafe entries (AC-24)
+    preview, payload = await _start_payload(web, "900")
+    assert preview["reachable"] == {"P_min": "570", "P_max": "1120", "net_cap": "1000", "within_cap": False,
+                                    "baseline_used": "900"}
+    assert any("AC-24" in w for w in preview["warnings"])
+    assert (await web.command("start", "start-cap-000000002", payload)).status == 202
 
 
 @pytest.mark.asyncio

@@ -1,58 +1,19 @@
-"""Test doubles for the web layer: an in-memory gateway and a reference grid core.
+"""Test doubles for the web layer: an in-memory store gateway and sample config/rules/snapshots.
 
 ``FakeGateway`` mimics the store boundary (committed snapshots + durable command queue) so API tests
-do not depend on engine internals. ``ReferenceGridCore`` implements the spec formulas (NG-GRID-001/002,
-NG-RISK-005) directly for preview tests; tests against the real core package live next to it.
+do not depend on engine internals. Preview arithmetic always uses the real core package.
 """
 from __future__ import annotations
 
 import copy
 import itertools
 import time
-from decimal import ROUND_CEILING, Decimal
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
-    CellSpec,
-    GridConfig,
-    Side,
-    TradingRules,
-)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import GridConfig, TradingRules
 
 BIG_BASE = (1 << 53) + 1  # every fake id is beyond the JS safe-integer range (AC-22)
-
-
-class GridValidationError(ValueError):
-    pass
-
-
-class ReferenceGridCore:
-    grid_error = GridValidationError
-
-    def build_grid(self, lower, upper, cell_count, rules):
-        tick = rules.tick_size
-        if lower % tick or upper % tick:
-            raise GridValidationError("границы не кратны tick")
-        lt, ut = int(lower / tick), int(upper / tick)
-        span = ut - lt
-        if cell_count <= 0 or span < cell_count:
-            raise GridValidationError("недостаточно тиков")
-        return [(lt + (i * span) // cell_count) * tick for i in range(cell_count + 1)]
-
-    def assign_cells(self, prices, anchor):
-        return [CellSpec(i, prices[i], prices[i + 1], Side.BUY if prices[i] < anchor else Side.SELL)
-                for i in range(len(prices) - 1)]
-
-    def validate_config(self, cfg, rules, mid):
-        errors = []
-        if cfg.order_amount_base % rules.size_step:
-            errors.append("order_amount_base не кратен шагу объёма")
-        return errors
-
-    def required_slots(self, q, rules, tp_price):
-        min_q = max(rules.min_base, rules.min_notional / tp_price)
-        min_q = (min_q / rules.size_step).to_integral_value(rounding=ROUND_CEILING) * rules.size_step
-        return 1 + int((q / min_q).to_integral_value(rounding=ROUND_CEILING))
 
 
 def sample_rules(**overrides) -> TradingRules:
