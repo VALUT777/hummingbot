@@ -92,6 +92,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     CursorUpdate,
     EngineIdentity as StoreIdentity,
     EntryBlockedError,
+    InvalidTransitionError,
     NeutralGridStore,
     PersistenceError,
     Reservation,
@@ -822,6 +823,18 @@ class NeutralGridEngine:
             "observed_position": str(venue), "old_effective_baseline": str(old),
             "new_effective_baseline": str(new_baseline), "acknowledged_unmatched": inbox_ids}, reload=True)
 
+    def _acknowledge_scan_conflicts(self, now: float) -> None:
+        """The operator audited the current scanner conflicts: they are not re-flagged, and the walk boundary is
+        rebased (a walk containing a contradicted row never completes, so the old high-water could not advance).
+        The contradicted rows stay withheld; nothing is reset (no rebaseline, cells untouched)."""
+        last = self.scanner.last_result
+        current = list(last.conflicts) if last is not None else []
+        self.meta.acknowledged_conflicts = (self.meta.acknowledged_conflicts + [
+            c for c in current if c not in self.meta.acknowledged_conflicts])[-200:]
+        if current:
+            floor = _ms(now) - int(self.config.history_overlap_s * 1000)
+            self.meta.history_reset = {STREAM_TRADES: floor, STREAM_ORDERS: floor}
+
     def _cmd_reconcile(self, action: str, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
         if action not in AUDIT_ACTIONS:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "UNKNOWN_AUDIT_ACTION", "action": action})
@@ -833,12 +846,14 @@ class NeutralGridEngine:
             ids = [c.id for c in self.open_conflicts if c.kind == "LATE_FILL"]
             s.record_manual_reconciliation(tx, actor, note, evidence, resolved_conflict_ids=ids,
                                            clear_manual_reconcile=False)
+            self._acknowledge_scan_conflicts(now)
             return CommandOutcome(CommandStatus.APPLIED, {"resolved_conflicts": ids}, reload=True)
         if action == "ack_history_conflict":
             ids = [c.id for c in self.open_conflicts if c.kind != "LATE_FILL"]
             s.record_manual_reconciliation(tx, actor, note, evidence, resolved_conflict_ids=ids,
                                            clear_manual_reconcile=True)
             self.meta.freezes.pop(FREEZE_INVARIANT, None)
+            self._acknowledge_scan_conflicts(now)
             return CommandOutcome(CommandStatus.APPLIED, {"resolved_conflicts": ids}, reload=True)
         if action == "ack_retention_gap":
             # The unreachable old boundary is replaced by the currently available history (audited); baseline,
@@ -931,6 +946,8 @@ class NeutralGridEngine:
         in_progress = not result.complete and result.incomplete_reason in ("in_progress", "backoff")
         if self.bootstrapped:
             self._apply_history(result, now, in_progress)
+            if not in_progress:
+                self._apply_late_evidence(now)
         else:
             self._apply_prebootstrap(result)
         if result.complete:
@@ -1021,7 +1038,8 @@ class NeutralGridEngine:
                 if fill.role == LegRole.ENTRY:
                     self.meta.obligations.setdefault(f"{fill.cell_id}:{fill.generation}", now_ms)
             gaps = [c for c in conflicts if c.startswith("retention_gap")]
-            others = [c for c in conflicts if not c.startswith("retention_gap")]
+            others = [c for c in conflicts if not c.startswith("retention_gap")
+                      and c not in self.meta.acknowledged_conflicts]
             already = self.b_engine.manual_reconcile_required
             if gaps and not already:
                 s.mark_manual_reconcile_required(tx, "history retention gap: required overlap boundary is older "
@@ -1065,6 +1083,49 @@ class NeutralGridEngine:
                 with s.transaction() as tx:
                     s.kv_set(tx, "engine_meta", self.meta.to_json())
         self.last_history_commit_at = now
+        self._refresh_store_facts()
+
+    def _apply_late_evidence(self, now: float) -> None:
+        """Executions the scanner withheld only because they exceed an order's *already settled* terminal cumulative
+        are late evidence (NG-HIST-002, AC-42): exact own trades after the cycle was released. They are committed
+        to the OLD cycle (the store marks LATE_FILL and CUMULATIVE_EXCEEDS_ORDER, freezing the market for audit).
+        Anything else that is contradicted (payload mismatch, unsettled order) stays withheld: no guessing (AC-40).
+        """
+        withheld = self.scanner.last_conflicted_rows.get(STREAM_TRADES, [])
+        if not withheld:
+            return
+        domain = self.port.domain
+        versions: Dict[Tuple, List[ExchangeTradeRow]] = {}
+        for row in withheld:
+            versions.setdefault(row.dedupe_key(domain), []).append(row)
+        late: List[ExchangeTradeRow] = []
+        for key, rows in versions.items():
+            if len(rows) != 1 or key in self.committed[STREAM_TRADES]:
+                continue
+            row = rows[0]
+            cid = row.own_client_order_id if row.own_client_order_id in self.order_meta else None
+            leg = self.leg_by_cid(cid) if cid is not None else None
+            if leg is not None and leg.state == OrderState.TERMINAL and \
+                    (not row.own_exchange_order_id or row.own_exchange_order_id == leg.exchange_order_id):
+                late.append(row)
+        if not late:
+            return
+        res = self.store.apply_history_batch(None, late, (), None, batch_id=f"late-{_ms(now)}")
+        for fill in res.new_fills:
+            ledger = self.cells.get(fill.cell_id)
+            identity = self.store.identity_for_cid(fill.cid)
+            if ledger is not None and identity is not None:
+                ledger.fills[fill.dedupe_key] = LedgerFill(identity=identity, qty=fill.size, price=fill.price,
+                                                           side=fill.own_side)
+            self.trades_by_cid.setdefault(fill.cid, []).append(self._trade_from_fill(fill))
+        for cid in sorted(res.touched_cids):
+            self._mirror(cid)
+            leg = self.leg_by_cid(cid)
+            if leg is not None:
+                leg.late_evidence = True
+        for row in late:
+            self.committed[STREAM_TRADES][row.dedupe_key(domain)] = trade_payload_fingerprint(row)
+        self._error("LATE_EVIDENCE", f"{len(late)} late execution(s) after settlement attributed to old cycles", now)
         self._refresh_store_facts()
 
     # ================================================================================== active list
@@ -1589,6 +1650,13 @@ class NeutralGridEngine:
         except EntryBlockedError as exc:
             self.reload_needed = True
             self.cell_blockers[ledger.cell_id] = f"STORE_ENTRY_BLOCKED:{exc}"
+            return False
+        except InvalidTransitionError as exc:
+            # The durable ledger refuses this intent (e.g. a TP for a released cycle re-opened by late evidence):
+            # nothing was sent; keep the obligation visible on the cell instead of freezing every cell.
+            self.reload_needed = True
+            self.cell_blockers[ledger.cell_id] = f"STORE_REFUSED_INTENT:{exc}"
+            self._error("STORE_REFUSED_INTENT", f"cell {ledger.cell_id}: {exc}", now)
             return False
         except CidAllocationError as exc:
             self.reload_needed = True

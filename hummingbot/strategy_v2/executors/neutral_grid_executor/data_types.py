@@ -120,6 +120,7 @@ class EngineMeta:
     ever_normal: bool = False
     bootstrap_floor_ms: Optional[int] = None
     history_reset: Dict[str, int] = field(default_factory=dict)  # stream -> floor ms after audited retention gap
+    acknowledged_conflicts: list = field(default_factory=list)  # scanner conflict strings an operator audited
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)

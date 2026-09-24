@@ -190,6 +190,16 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
     }
 
 
+def _commands(engine) -> List[Dict[str, Any]]:
+    """Committed command rows (including CONFLICTs the store decided without the engine)."""
+    store = getattr(engine, "store", None)
+    if store is None or store.closed:
+        return [{"id": _s(c["id"]), "kind": c["kind"], "status": c["status"], "result": c["result"]}
+                for c in engine.recent_commands]
+    return [{"id": _s(c.id), "kind": c.kind, "status": c.status.value, "result": c.result,
+             "idempotency_key": c.idempotency_key} for c in store.list_commands(limit=20)]
+
+
 def build_snapshot(engine, now: float) -> Dict[str, Any]:
     cells = [_cell_view(engine, engine.cells[i], now) for i in sorted(engine.cells)]
     snap = {
@@ -204,10 +214,7 @@ def build_snapshot(engine, now: float) -> Dict[str, Any]:
             {"id": rec.id, "stream": rec.stream, "status": rec.status, "cid": _s(rec.cid), "detail": rec.detail,
              "payload": rec.payload} for rec in engine.unmatched],
         "errors": [{"at": e["at"], "code": e["code"], "message": e["message"]} for e in engine.errors],
-        "commands": [
-            {"id": _s(c["id"]), "kind": c["kind"], "status": c["status"], "result": c["result"]}
-            for c in engine.recent_commands
-        ],
+        "commands": _commands(engine),
     }
     snap.update(_revisions(engine))
     return snap

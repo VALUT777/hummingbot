@@ -285,6 +285,19 @@ def test_ac42_super_delayed_fill_after_reuse_goes_to_old_cycle_and_freezes(tmp_p
         assert h.state == EngineState.FROZEN, (h.state, h.engine.reasons)
         assert any(c.kind == "LATE_FILL" for c in h.engine.open_conflicts)
         assert h.engine.last_snapshot["cells"][cell]["late_evidence"] is True
+        assert h.engine.endpoints.P == h.fx.net_position == D("3")          # obligation visible, not guessed
+        entries = len([c for c in h.fx.submits()
+                       if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.ENTRY])
+        h.tick(5)
+        assert len([c for c in h.fx.submits()
+                    if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.ENTRY]) == entries
+        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_late_evidence", "note": "venue export reviewed"})
+        h.tick()
+        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict", "note": "stale order row"})
+        h.tick(12)
+        assert h.state != EngineState.FROZEN, h.engine.reasons                # audit unfreezes the market
+        assert h.cell(cell).cycles[1].E == D("3")                             # old cycle keeps its obligation
+        assert h.cell(cell).current is None or h.cell(cell).current.generation == 2
     finally:
         h.close()
 
