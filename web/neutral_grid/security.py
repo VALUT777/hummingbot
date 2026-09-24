@@ -305,9 +305,25 @@ FREE_TEXT_KEYS = frozenset({
 })
 
 
+# Identifier keys stay exact even inside a free-text container (e.g. an engine result carrying the 32-hex
+# conflict_set_id or version fingerprints): they are digests/ids, never free text, and must round-trip.
+EXACT_KEYS = frozenset({
+    "fingerprint", "accepted", "noise", "key", "keys", "cid", "stream", "committed", "conflict_set_id",
+    "acknowledged", "resolved_conflicts", "retired_cid", "preview_id", "material_id", "cell_id", "trade_id_str",
+    "accepted_trades",
+})
+
+
+def _exact_key(key: str) -> bool:
+    return key in EXACT_KEYS or key.endswith("_id") or key.endswith("_id_str") or key.endswith("_cid")
+
+
 def redact_tree(value, key: str = "", inside: bool = False):
-    """Redact every string under a free-text key; other strings (ids, cursors, decimals) are left exact."""
-    inside = inside or key in FREE_TEXT_KEYS
+    """Redact every string under a free-text key; ids, digests, cursors and decimals are left exact."""
+    if key in FREE_TEXT_KEYS:
+        inside = True
+    elif _exact_key(key):
+        inside = False
     if isinstance(value, str):
         return redact_free_text(value) if inside else value
     if isinstance(value, dict):

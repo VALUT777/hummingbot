@@ -197,3 +197,46 @@ collects 655 tests with 0 errors, and the combined run gives 655 passed, 230 sub
 Fields the web reads that the engine snapshot does not publish yet (WS-D):
 - `summary.colliding_cid`. Without it, retire needs a typed CID while the CID freeze is present.
 - `summary.grid_mutation_blockers`. Without it, migrate stays unavailable (fail-closed).
+
+
+## Round 4: M1, audit bound to the reviewed conflict set (AC-40, NG-UI-002)
+
+| Item | Fix | Tests (red → green) |
+|---|---|---|
+| Rendering | Overview card «Конфликты истории»: for each key, every version side by side (fingerprint, committed / not committed, all summary fields as exact strings), plus the `conflict_set_id`. The drill-down (`/api/lookup`) matches keys, fingerprints and summary values and renders the same table. | `test_ngweb_conflicts.py::test_conflict_set_rendered_exactly_and_in_drilldown` (int id beyond 2^53 served as an exact string) |
+| Bound ack | `ack_history_conflict` requires `conflict_set_id` (captured when the dialog opens from the snapshot on screen), `accepted` {key → fingerprint}, a note, `acknowledge` and the typed phrase «ПРИНЯТЬ НАБОР <set id>». The server checks: the set id equals the published `summary.conflict_set_id` (409 `conflict_set_changed` with the fresh set; unpublished → 409 `conflict_set_unavailable`); every key without a committed version has an explicit pick; picks name only shown versions of shown keys (422 otherwise). The UI shows radios only where no version is committed. | `::test_ack_payload_carries_set_id_and_accepted_versions`, `::test_ack_payload_validation[*]`, `::test_changed_set_is_409_with_fresh_set_never_enqueued`, `::test_engine_accepts_the_web_payload_shape` |
+| Changed set | On a 409 the dialog re-opens with the fresh set; picks and the phrase naming the old set are dropped, and a new operator click is required (nothing auto-resent). An engine-side REJECTED `CONFLICT_SET_CHANGED` is shown as «аудит НЕ выполнен». | B: `test_ngweb_browser.py::test_browser_history_conflict_ack_bound_to_viewed_set` |
+
+Coded against WS-D's announced fields `summary.history_conflicts` and `summary.conflict_set_id`. They are not in `codex/ng-engine` yet (checked `5f266ca83`), so until they land the web refuses the ack (409, fail-closed).
+
+
+## Final M1 contract (engine `codex/ng-engine@b36e95497`, merged `d82f5992e`)
+
+- R7 (WS-D): the web passes `conflict_set_id` and `accepted` through. `_normalize_only` keeps them (since
+  `6fdf45d76`), together with `note`, `acknowledge` and `confirmation`; the engine ignores the extra keys.
+  Proven by the end-to-end test below.
+- Rendering: all six streams (`trades`, `inactive_orders`, `store_conflict`, `manual_reconcile`, `freeze`,
+  `active_evidence`) get Russian labels plus `cell_id`, in the overview card, the ack dialog and the drill-down.
+- Choices match the engine:
+  - radios appear only where no version is committed;
+  - a committed key may only repeat its committed version; another version gets 422, like the engine's
+    `LEDGER_CORRECTION_NOT_SUPPORTED`;
+  - validation iterates the list, because keys can repeat across streams.
+- Engine error codes are shown as Russian messages, with per-key sub-errors: `CONFLICT_SET_ID_REQUIRED`,
+  `CONFLICT_SET_CHANGED`, `NOTHING_TO_AUDIT`, `ACCEPTED_CHOICE_REQUIRED`, `ACCEPTED_INVALID` (`NOT_IN_CONFLICT_SET`,
+  `NOT_A_SEEN_VERSION`, `LEDGER_CORRECTION_NOT_SUPPORTED`).
+- Bug found by the end-to-end test: the C1 redaction masked the engine result's 32-hex `conflict_set_id`, and would
+  have masked fingerprints the same way. Identifier keys (`*_id`, `fingerprint`, `accepted`, `noise`, `key`, `cid`, …)
+  now stay exact inside free-text containers; free text around them is still redacted.
+  Test: `test_ngweb_round3.py::test_c1_redaction_keeps_ids_and_digests_inside_results`.
+
+| Tests | |
+|---|---|
+| `test_ngweb_conflicts.py::test_committed_key_may_only_repeat_its_committed_version`, `::test_ack_payload_validation[*]` (incl. ledger correction), `::test_ui_maps_engine_conflict_errors_and_stream_labels`, `::test_conflict_set_rendered_exactly_and_in_drilldown` (six streams, `cell_id`) | contract parity |
+| `test_ngweb_demo_engine.py::test_demo_engine_history_conflict_ack_through_web_is_applied` | Real engine + FakeExchange: a persistent conflicting duplicate trade publishes a `trades` conflict with sizes {3, 1}. A web ack for an unseen set gets 409 and is never enqueued. The web ack of the published set is APPLIED, and its result's `conflict_set_id` equals the acknowledged one. |
+
+Verified against `codex/ng-engine@19dc443d6` (merged as `620da6e8f`). The engine's canonical opaque keys
+(`trade:…`, `order:…`, `<kind>:sha:<32hex>`, `store_conflict:<id>`, `manual_reconcile:reason`,
+`freeze:LEDGER_INVARIANT`, `active_evidence:<cell>`), its 32-hex fingerprints and its 32-hex `conflict_set_id`
+pass the web's strict validation unchanged. Fixtures use exactly these forms and the lowercase stream values. The
+end-to-end demo test also asserts the canonical forms on the real engine's snapshot before the web ack is APPLIED.

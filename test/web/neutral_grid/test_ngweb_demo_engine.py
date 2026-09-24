@@ -216,3 +216,77 @@ async def test_demo_engine_full_operator_flow(tmp_path):
     finally:
         await client.close()
         await bundle.close()
+
+
+def _ack_payload(state):
+    summary = state["summary"]
+    accepted = {}
+    for conflict in summary.get("history_conflicts") or []:
+        versions = conflict["versions"]
+        if not any(v["committed"] for v in versions):  # the operator's explicit pick: the venue-proven size
+            accepted[conflict["key"]] = next(v["fingerprint"] for v in versions if v["summary"].get("size") == "3")
+    set_id = summary["conflict_set_id"]
+    return {"action": "ack_history_conflict", "note": "сверено с выгрузкой биржи", "acknowledge": True,
+            "conflict_set_id": set_id, "accepted": accepted, "confirmation": f"ПРИНЯТЬ НАБОР {set_id}"}
+
+
+@pytest.mark.asyncio
+async def test_demo_engine_history_conflict_ack_through_web_is_applied(tmp_path):
+    """M1 end to end: a conflicting duplicate trade on the fake venue freezes the real engine; the operator acks
+    exactly the published conflict set through the web; the engine applies it."""
+    from web.neutral_grid import runtime
+    from web.neutral_grid.server import create_app
+
+    args = types.SimpleNamespace(data_dir=tmp_path / "demo", host="127.0.0.1", stale_after=15.0, allowed_host=[])
+    bundle = await runtime.build_demo(args)
+    client = TestClient(TestServer(create_app(bundle.context), host="127.0.0.1"))
+    await client.start_server()
+    api = Api(client, bundle.context.access.token)
+    try:
+        await api.login()
+        preview = await api.get("/api/preview")
+        assert (await _command_ok(api, "start", "cf-start", {
+            "expected_initial_position": "0", "baseline_acknowledged": True, "risk_acknowledged": True,
+            "preview_id": preview["preview_id"]}))["status"] == "APPLIED"
+        await api.wait_state(lambda s: (s["summary"].get("bootstrap") or {}).get("ready") is True, "bootstrap ready")
+        assert (await _command_ok(api, "confirm_baseline", "cf-confirm",
+                                  {"expected_initial_position": "0", "confirm": True}))["status"] == "APPLIED"
+        await api.wait_state(lambda s: s["engine"]["display_state"] == "NORMAL"
+                             and int(s["summary"].get("owned_active") or 0) > 0, "NORMAL")
+        fill = await api.demo("partial_entry")
+        store = bundle.context.gateway._store
+        deadline = time.monotonic() + 40
+        while not store.fills(int(fill["cid"])) and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+        trade_id = store.fills(int(fill["cid"]))[0].trade_id_str
+        bundle.fake.inject_conflicting_trade(trade_id, Decimal("1"), persistent=True)
+        state = await api.wait_state(lambda s: any(c["stream"] == "trades" for c in
+                                                   s["summary"].get("history_conflicts") or []),
+                                     "history conflict published", timeout=60)
+        conflict = next(c for c in state["summary"]["history_conflicts"] if c["stream"] == "trades")
+        assert {v["summary"]["size"] for v in conflict["versions"]} == {"3", "1"}
+        # engine canonical opaque forms (they pass the web's strict id/key validation unchanged)
+        import re
+        assert re.fullmatch(r"[0-9a-f]{32}", state["summary"]["conflict_set_id"])
+        assert all(re.fullmatch(r"[0-9a-f]{32}", v["fingerprint"]) for v in conflict["versions"])
+        assert conflict["key"].startswith("trade:") and re.fullmatch(r"[A-Za-z0-9_:.\-]{1,160}", conflict["key"])
+        # an ack for a set the operator did not see is refused by the web and never enqueued
+        stale = dict(_ack_payload(state), conflict_set_id="0" * 32, confirmation="ПРИНЯТЬ НАБОР " + "0" * 32)
+        status, body = await api.command("baseline_audit", "cf-ack-stale-000001", stale)
+        assert status == 409 and body["error"] in ("conflict_set_changed", "stale_revision"), body
+        # the ack of exactly the published set, retried on a stale-revision 409 with a freshly read set
+        for attempt in range(8):
+            state = await api.get("/api/state")
+            status, body = await api.command("baseline_audit", f"cf-ack-{attempt:02d}".ljust(16, "x"),
+                                             _ack_payload(state))
+            if status == 202:
+                break
+            assert status == 409, body
+            await asyncio.sleep(0.5)
+        assert status == 202, body
+        row = await api.wait_command(body["command"]["id"])
+        assert row["status"] == "APPLIED", row
+        assert row["result"]["conflict_set_id"] == body["command"]["payload"]["conflict_set_id"]
+    finally:
+        await client.close()
+        await bundle.close()

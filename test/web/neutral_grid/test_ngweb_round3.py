@@ -178,3 +178,15 @@ def test_d2_17_extended_actions_match_engine():
                      "confirmation": "СПИСАТЬ CID 5"},
                     {"action": "migrate_grid", "note": "n", "acknowledge": True, "confirmation": "МИГРАЦИЯ СЕТКИ g"}):
         assert engine_commands.validate_kind("baseline_audit", payload) is None
+
+
+def test_c1_redaction_keeps_ids_and_digests_inside_results():
+    from web.neutral_grid.security import redact_tree
+    digest = "4233715fe06fca5a1736214c6ea97cbc"
+    result = {"result": {"conflict_set_id": digest, "audited_payloads": [
+        {"stream": "trades", "key": "trade:1", "accepted": "ab" * 20, "noise": ["cd" * 20]}],
+        "detail": f"retry https://x.example/api?auth={SECRET}", "retired_cid": "281474976710655"}}
+    out = redact_tree(result)["result"]
+    assert out["conflict_set_id"] == digest and out["retired_cid"] == "281474976710655"
+    assert out["audited_payloads"][0]["accepted"] == "ab" * 20 and out["audited_payloads"][0]["noise"] == ["cd" * 20]
+    assert SECRET not in out["detail"]

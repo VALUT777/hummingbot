@@ -558,7 +558,9 @@ def test_r16_ledger_invariant_freeze_survives_reload_and_restart_until_acknowled
         h.restart()
         h.tick(3)
         assert "LEDGER_INVARIANT" in h.engine.meta.freezes and h.state == EngineState.FROZEN
-        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict", "note": "reviewed"}, key="r16")
+        h.command(CommandKind.BASELINE_AUDIT, {
+            "action": "ack_history_conflict", "note": "reviewed",
+            "conflict_set_id": h.engine.latest_committed_snapshot()["summary"]["conflict_set_id"]}, key="r16")
         h.tick(4)
         assert "LEDGER_INVARIANT" not in h.engine.meta.freezes
     finally:

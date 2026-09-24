@@ -161,8 +161,9 @@ def test_c3_audited_payload_conflict_restores_completeness_and_stop_finishes_hon
         h.fx.inject_conflicting_trade(t1, D("1"), persistent=True)
         h.tick(6)
         assert not h.engine.history_complete and h.state == EngineState.FROZEN
-        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict",
-                                               "note": "venue export: the committed size 3 is right"}, key="c3-ack")
+        h.command(CommandKind.BASELINE_AUDIT, {
+            "action": "ack_history_conflict", "note": "venue export: the committed size 3 is right",
+            "conflict_set_id": h.engine.latest_committed_snapshot()["summary"]["conflict_set_id"]}, key="c3-ack")
         h.tick(8)
         assert _cmd(h, "c3-ack").status == CommandStatus.APPLIED
         audit = h.engine.store.audit_events(kind="manual_reconcile")[0]

@@ -47,6 +47,9 @@ class NeutralGridConfig(ControllerConfigBase):
     entry_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT_MAKER
     tp_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT
     tp_gtt_seconds: int = 28 * 24 * 3600
+    # An unknown submit is audited as "never landed" only with evidence taken this long after its dispatch (>= the
+    # settlement delay); a venue active list lagging longer is an operator-audit residual risk (D2-15).
+    unknown_resolution_delay_s: Decimal = Decimal("120")
     # None = the store's default ledger per account/market (``<data>/neutral_grid/<domain>.<account>.<pair>``), the
     # same identity as the host lock/marker: a new grid on that market is an audited migration, never a new DB.
     db_path: Optional[str] = None
@@ -81,6 +84,8 @@ class NeutralGridConfig(ControllerConfigBase):
                 raise ValueError(f"{name} must be a finite positive number")
         if not self.settlement_delay_s.is_finite() or self.settlement_delay_s < 0:
             raise ValueError("settlement_delay_s must be finite and non-negative")
+        if not self.unknown_resolution_delay_s.is_finite() or self.unknown_resolution_delay_s < self.settlement_delay_s:
+            raise ValueError("unknown_resolution_delay_s must be finite and >= settlement_delay_s")
         if self.settlement_scans < 1 or self.cell_count < 1 or self.max_active_orders < 1 or self.tp_gtt_seconds < 1:
             raise ValueError("settlement_scans, cell_count, max_active_orders and tp_gtt_seconds must be positive")
         if self.entry_order_type not in _ALLOWED_ORDER_TYPES or self.tp_order_type not in _ALLOWED_ORDER_TYPES:
@@ -119,6 +124,7 @@ class NeutralGridConfig(ControllerConfigBase):
             history_overlap_s=self.history_overlap_s, poll_interval_s=self.poll_interval_s,
             entry_order_type=self.entry_order_type, tp_order_type=self.tp_order_type,
             tp_gtt_seconds=self.tp_gtt_seconds, enabled=self.enabled, db_path=self.resolved_db_path(),
+            unknown_resolution_delay_s=self.unknown_resolution_delay_s,
             operator_confirmed_start=self._operator_confirmed_start,
             operator_confirmed_baseline=self._operator_confirmed_baseline,
             operator_confirmed_migration=self._operator_confirmed_migration,

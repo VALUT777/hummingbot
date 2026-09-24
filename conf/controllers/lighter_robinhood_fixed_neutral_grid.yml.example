@@ -32,6 +32,8 @@ poll_interval_s: '5'
 entry_order_type: LIMIT_MAKER
 tp_order_type: LIMIT
 tp_gtt_seconds: 2419200
+# An unknown submit may be audited as "never landed" only after this delay (>= settlement_delay_s).
+unknown_resolution_delay_s: '120'
 # Optional; default (null) is the per account/market ledger
 # <hummingbot data path>/neutral_grid/neutral_grid.<domain>.<account>.<pair>.sqlite3
 # (a new grid on that market is an audited migration of this ledger, never a new file)

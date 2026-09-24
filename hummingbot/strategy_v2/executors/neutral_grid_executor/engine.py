@@ -87,6 +87,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.history import (
     HighWaterMark,
     HistoryScanner,
     ScanRecord,
+    canonical_decimal,
     evaluate_terminal_release,
     order_dedupe_key as c_order_key,
     order_payload_fingerprint,
@@ -194,6 +195,50 @@ def _key_label(key: Tuple) -> str:
 
 def _key_from_label(label: str) -> Tuple:
     return tuple(int(v) if t == "i" else v for t, v in json.loads(label))
+
+
+def _history_row_summary(stream: str, row: Any) -> Dict[str, str]:
+    """Operator-readable, string-only view of one history row version (M1 conflict set)."""
+    def text(value: Any) -> str:
+        if value is None:
+            return ""
+        return canonical_decimal(value) if isinstance(value, Decimal) else str(value)
+    if stream == STREAM_TRADES:
+        return {"trade_id": text(row.trade_id_str), "side": text(row.own_side.value), "size": text(row.size),
+                "price": text(row.price), "exchange_order_id": text(row.own_exchange_order_id),
+                "client_order_id": text(row.own_client_order_id), "is_maker": text(row.is_maker),
+                "timestamp_ms": text(row.timestamp_ms)}
+    return {"order_index": text(row.order_index), "order_id": text(row.order_id),
+            "client_order_id": text(row.client_order_id), "status": text(row.status), "side": text(row.side.value),
+            "price": text(row.price), "initial": text(row.initial_base_amount),
+            "filled": text(row.filled_base_amount), "remaining": text(row.remaining_base_amount),
+            "nonce": text(row.nonce), "timestamp_ms": text(row.timestamp_ms)}
+
+
+_PUBLIC_PART = re.compile(r"[A-Za-z0-9_.\-]*\Z")
+
+
+def public_conflict_key(stream: str, key: Tuple) -> str:
+    """Canonical, web-safe key of a contradicted history row (M1 parity with WS-E, ``[A-Za-z0-9_:.-]{1,160}``):
+    ``trade:<trade_id>:<own_side>:<own_exchange_order_id>`` / ``order:<exchange_order_id>``. Domain, account and
+    market are constant for one engine (the scanner rejects rows outside them), so they are omitted. A part outside
+    ``[A-Za-z0-9_.-]`` or an over-long key falls back to ``<kind>:sha:<32 hex of the exact typed key>``."""
+    kind, parts = ("trade", key[3:]) if stream == STREAM_TRADES else ("order", key[3:])
+    text = ":".join([kind] + [str(p) for p in parts])
+    if len(text) <= 160 and all(_PUBLIC_PART.match(str(p)) for p in parts):
+        return text
+    return f"{kind}:sha:{_digest(_key_label(key))}"
+
+
+def public_fingerprint(raw: str) -> str:
+    """Web-safe version fingerprint: the first 32 hex of sha256 over the scanner's canonical payload fingerprint
+    (``history.trade/order_payload_fingerprint``, UTF-8); the engine maps it back to the raw one."""
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _digest(value: Any, n: int = 32) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+                          ).hexdigest()[:n]
 
 
 def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
@@ -426,6 +471,12 @@ class NeutralGridEngine:
             default=str).encode()).hexdigest()[:32]           # everything a START acknowledges (E-09)
         self._position_reads: Deque[Tuple[int, float, Decimal]] = deque(maxlen=32)
         self.evidence_conflicts: Dict[int, str] = {}          # cell -> refused active-row evidence (D1-02)
+        self.history_rows_commit_seq = 0                       # latest history commit with ANY new row (M4)
+        # Restart with only cell-attributed history problems: exits and risk-reducing cancels of the unaffected
+        # cells proceed, entries stay blocked globally, the affected cells stay blocked (M3).
+        self.startup_scoped = False
+        self.history_refused_cells: Dict[int, str] = {}       # cell -> its rows are in a refused history batch
+        self.history_refused_unattributed: Optional[str] = None
         if self.fatal_reason is None:
             try:
                 self._load()
@@ -753,8 +804,11 @@ class NeutralGridEngine:
         return int(text) if text.isdigit() and int(text) in self.order_meta else None
 
     def _leg_settled(self, cid: int) -> bool:
+        """Final with a proven cumulative. A zero-fill resolution (venue reject or an audited "never landed") is final
+        too, but any execution signal for it is new evidence, never a replay: its label stays pending until history
+        commits it (H1)."""
         leg = self.leg_by_cid(cid)
-        return leg is not None and leg.state in FINAL_STATES
+        return leg is not None and leg.state in FINAL_STATES and leg.state != OrderState.REJECTED_ZERO_FILL
 
     def history_lag_s(self, now: Optional[float] = None) -> float:
         """Age of the oldest WS trade signal not yet reflected in committed history (AC-13)."""
@@ -983,20 +1037,30 @@ class NeutralGridEngine:
                     return CommandOutcome(CommandStatus.REJECTED, {
                         "error": "BASELINE_CONFIG_MISMATCH", "config": str(self.config.expected_initial_position),
                         "command": str(payload["expected_initial_position"])})
+            latest_stop = self.meta.last_stop_applied_ms or self.meta.stop_requested_ms
             if self.meta.stop_requested_ms is not None and payload.get("source") == "launcher" \
-                    and payload.get("resume_stop_ms") != self.meta.stop_requested_ms:
+                    and payload.get("resume_stop_ms") != latest_stop:
                 # An automatic launcher START (every process start, new random key) never overrides a durable
                 # STOP / STOPPING / STOP_UNCERTAIN: only an explicit operator START (web: key + expected revisions
-                # of a viewed snapshot) or a launcher resume naming this very stop may (NG-OPS-003, AC-36).
+                # of a viewed snapshot) or a launcher resume naming the LATEST applied STOP may (NG-OPS-003, AC-36).
+                # A STOP applied after the operator typed the resume phrase (e.g. the Hummingbot stop while the old
+                # drain is still STOPPING, which keeps stop_requested_ms) supersedes that phrase (H2).
                 return CommandOutcome(CommandStatus.REJECTED, {
                     "error": "DURABLE_STOP_ACTIVE", "stop_requested_ms": self.meta.stop_requested_ms,
-                    "stop_outcome": self.meta.stop_outcome,
-                    "detail": "an explicit operator START or a launcher resume naming this stop is required"})
+                    "latest_stop_ms": latest_stop, "stop_outcome": self.meta.stop_outcome,
+                    "detail": "an explicit operator START or a launcher resume naming the latest stop is required"})
+            rebind = False
             if self.meta.started and self.meta.stop_requested_ms is None:
-                return CommandOutcome(CommandStatus.APPLIED, {"already_started": True, "grid_id": self.grid_id,
-                                                              "engine_state": self.engine_state.value})
+                if self.bootstrapped or self.meta.start_config_fingerprint == self.full_fingerprint:
+                    return CommandOutcome(CommandStatus.APPLIED, {"already_started": True, "grid_id": self.grid_id,
+                                                                  "engine_state": self.engine_state.value})
+                # Before bootstrap a START for a changed config re-binds the acknowledgement to it (audited); the
+                # baseline is then confirmable for exactly the config this START acknowledged (E-09, L1).
+                rebind = True
             resumed = {"resumed_stop_ms": self.meta.stop_requested_ms,
                        "stop_outcome": self.meta.stop_outcome} if self.meta.stop_requested_ms is not None else {}
+            if rebind:
+                resumed["rebound_from"] = self.meta.start_config_fingerprint
             self.meta.started = True
             self.meta.start_preview_id = preview_id
             self.meta.start_config_fingerprint = self.full_fingerprint
@@ -1005,7 +1069,10 @@ class NeutralGridEngine:
             self.meta.stop_requested_ms = None
             self.meta.stop_outcome = None
             self.meta.stop_reason = None
-            return CommandOutcome(CommandStatus.APPLIED, {"started": True, "grid_id": self.grid_id},
+            result = {"started": True, "grid_id": self.grid_id}
+            if rebind:
+                result["rebound"] = True
+            return CommandOutcome(CommandStatus.APPLIED, result,
                                   audit=("start", dict({"grid_id": self.grid_id, "preview_id": preview_id,
                                                         "risk_acknowledged": True,
                                                         "config_fingerprint": self.full_fingerprint,
@@ -1024,6 +1091,9 @@ class NeutralGridEngine:
                 self.meta.stop_requested_ms = _ms(now)
                 self.meta.stop_outcome = None
                 self.meta.stop_reason = str(payload.get("reason") or "operator stop")
+            # A STOP while STOPPING keeps the drain's stop time, but it is the newest stop intent: a resume must name
+            # it (a resume phrase typed before it is stale, H2).
+            self.meta.last_stop_applied_ms = max(_ms(now), self.meta.stop_requested_ms)
             return CommandOutcome(CommandStatus.APPLIED, {"stopping": True},
                                   audit=("stop", {"reason": self.meta.stop_reason}))
         if kind == CommandKind.BASELINE_AUDIT.value:
@@ -1193,6 +1263,13 @@ class NeutralGridEngine:
         reasons = []
         if self.position_seq < self.fills_commit_seq:
             reasons.append("position read predates the latest committed fill")
+        if self.position_seq < self.history_rows_commit_seq:
+            # any row (own fill, unmatched manual trade, order row): an audit rebased on this read would
+            # acknowledge an inbox row the read does not include (D2-07, M4)
+            reasons.append("position read predates a committed history row")
+        if self.active_rows is None or self.active_at is None or self.active_seq < self.position_seq:
+            # the "active ahead" check below needs a list at least as new as the position (D2-18, M4)
+            reasons.append("active orders unknown or older than the position read")
         if self.ws_pending:
             reasons.append(f"{len(self.ws_pending)} WS trade signal(s) not yet in committed history")
         if self.history_lag_s(now) > 0:
@@ -1284,7 +1361,7 @@ class NeutralGridEngine:
         accepted = self._withheld_late_trades()
         if accepted:
             res = s.apply_history_batch(tx, accepted, (), None, batch_id=f"late-audit-{_ms(now)}")
-            self.fills_commit_seq = self._next_seq()
+            self.fills_commit_seq = self.history_rows_commit_seq = self._next_seq()
             for fill in res.new_fills:
                 ledger = self.cells.get(fill.cell_id)
                 identity = s.identity_for_cid(fill.cid)
@@ -1379,15 +1456,7 @@ class NeutralGridEngine:
         if action == "ack_late_evidence":
             return self._cmd_ack_late_evidence(actor, note, evidence, now, tx)
         if action == "ack_history_conflict":
-            self.evidence_conflicts = {}
-            ids = [c.id for c in self.open_conflicts if c.kind != "LATE_FILL"]
-            audited = self._audit_withheld_payloads()      # durable in engine_meta, same command transaction
-            s.record_manual_reconciliation(tx, actor, note, dict(evidence, audited_payloads=audited),
-                                           resolved_conflict_ids=ids, clear_manual_reconcile=True)
-            self.meta.freezes.pop(FREEZE_INVARIANT, None)
-            self._acknowledge_scan_conflicts(now)
-            return CommandOutcome(CommandStatus.APPLIED, {"resolved_conflicts": ids, "audited_payloads": audited},
-                                  reload=True)
+            return self._cmd_ack_history_conflict(actor, note, evidence, payload, now, tx)
         if action == "ack_retention_gap":
             # The unreachable old boundary is replaced by the currently available history (audited); baseline,
             # cells and fills are untouched (no reset, no rebaseline). Drift checks still apply afterwards. The
@@ -1437,29 +1506,145 @@ class NeutralGridEngine:
             return CommandOutcome(CommandStatus.APPLIED, {"cid": str(cid), "resolution": "not_landed"}, reload=True)
         return CommandOutcome(CommandStatus.REJECTED, {"error": "UNKNOWN_AUDIT_ACTION", "action": action})
 
+    def unknown_resolution_delay_s(self) -> float:
+        return max(float(self.options.unknown_resolution_delay_s), float(self.config.settlement_delay_s))
+
+    def history_conflict_set(self) -> Tuple[List[Dict[str, Any]], str]:
+        """Everything an ``ack_history_conflict`` audits, as published in the snapshot (M1): the durable payload
+        contradictions with every version seen (``committed`` marks the ledger's), the open store conflicts, the
+        manual-reconcile reason, a ledger-invariant freeze and refused active-row evidence. ``conflict_set_id`` binds
+        an ack to exactly this set: anything that appears after the operator's review changes it."""
+        items: List[Dict[str, Any]] = []
+        for _, entry in sorted(self.meta.history_conflicts.items()):
+            cell = self._cell_of_ids(entry.get("client"), entry.get("exchange"))
+            items.append({"stream": entry["stream"], "key": self._public_key_of(entry),
+                          "cell_id": None if cell is None else str(cell),
+                          "versions": sorted(({"fingerprint": public_fingerprint(fp), "summary": dict(summary),
+                                               "committed": fp == entry.get("committed")}
+                                              for fp, summary in entry["versions"].items()),
+                                             key=lambda v: v["fingerprint"])})
+
+        def single(stream: str, key: str, summary: Dict[str, str], cell: Optional[int] = None) -> None:
+            items.append({"stream": stream, "key": f"{stream}:{key}", "cell_id": None if cell is None else str(cell),
+                          "versions": [{"fingerprint": _digest([stream, key, summary]), "summary": summary,
+                                        "committed": True}]})
+        for c in self.open_conflicts:
+            if c.kind != "LATE_FILL":
+                cell = self.order_meta[c.cid].cell_id if c.cid in self.order_meta else None
+                single("store_conflict", str(c.id), {"kind": str(c.kind), "cid": "" if c.cid is None else str(c.cid),
+                                                     "detail": redact(c.detail or "")}, cell)
+        if self.b_engine is not None and self.b_engine.manual_reconcile_required:
+            single("manual_reconcile", "reason", {"reason": redact(self.b_engine.manual_reconcile_reason or "")})
+        if FREEZE_INVARIANT in self.meta.freezes:
+            single("freeze", FREEZE_INVARIANT, {"detail": redact(self.meta.freezes[FREEZE_INVARIANT])})
+        for cell_id, why in sorted(self.evidence_conflicts.items()):
+            single("active_evidence", str(cell_id), {"detail": redact(why)}, cell_id)
+        set_id = _digest([[i["stream"], i["key"], [v["fingerprint"] for v in i["versions"]]] for i in items])
+        return items, set_id
+
+    @staticmethod
+    def _public_key_of(entry: Dict[str, Any]) -> str:
+        return public_conflict_key(entry["stream"], _key_from_label(entry["key"]))
+
+    def _cmd_ack_history_conflict(self, actor: str, note: str, evidence: Dict[str, Any], payload: Dict[str, Any],
+                                  now: float, tx) -> CommandOutcome:
+        """Operator audit bound to the reviewed ``conflict_set_id`` (M1). Only the versions in that set are audited:
+        the ledger's committed payload is accepted (never a quantity change, R6); a key that was never committed
+        needs the operator's ``accepted`` choice (then the scanner commits it as ordinary evidence); every other
+        version of the key seen by any walk is audited noise, merged with earlier noise so a flapping key converges
+        (CR-3). Nothing audited => REJECTED."""
+        items, set_id = self.history_conflict_set()
+        given = payload.get("conflict_set_id")
+        if not isinstance(given, str) or not given:
+            return CommandOutcome(CommandStatus.REJECTED, {
+                "error": "CONFLICT_SET_ID_REQUIRED", "conflict_set_id": set_id,
+                "detail": "ack the conflict set you reviewed (snapshot summary.conflict_set_id)"})
+        if given != set_id:
+            return CommandOutcome(CommandStatus.REJECTED, {
+                "error": "CONFLICT_SET_CHANGED", "conflict_set_id": set_id, "acknowledged": given,
+                "detail": "the conflict set changed after your review; review the current snapshot again"})
+        if not items:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "NOTHING_TO_AUDIT"})
+        choices = payload.get("accepted") or {}
+        if not isinstance(choices, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                    for k, v in choices.items()):
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "ACCEPTED_INVALID",
+                                                           "detail": "accepted must map key -> fingerprint"})
+        # The published (web-safe) key/fingerprints map back to the exact typed key and raw payload fingerprints.
+        entries = sorted(self.meta.history_conflicts.values(), key=lambda e: (e["stream"], e["key"]))
+        need, invalid, audited, internal = [], [], [], []
+        known_keys = {self._public_key_of(e) for e in entries}
+        invalid.extend({"key": k, "error": "NOT_IN_CONFLICT_SET"} for k in choices if k not in known_keys)
+        for entry in entries:
+            public = self._public_key_of(entry)
+            raw = {public_fingerprint(fp): fp for fp in entry["versions"]}
+            committed, choice = entry.get("committed"), choices.get(public)
+            if committed is not None:
+                if choice is not None and raw.get(choice) != committed:
+                    invalid.append({"key": public, "error": "LEDGER_CORRECTION_NOT_SUPPORTED",
+                                    "committed": public_fingerprint(committed)})
+                accept = committed
+            elif choice is None:
+                need.append(public)
+                continue
+            elif choice not in raw:
+                invalid.append({"key": public, "error": "NOT_A_SEEN_VERSION"})
+                continue
+            else:
+                accept = raw[choice]
+            noise = sorted(set(entry["versions"]) - {accept})
+            internal.append((entry["stream"], entry["key"], accept, noise))
+            audited.append({"stream": entry["stream"], "key": public, "accepted": public_fingerprint(accept),
+                            "noise": sorted(public_fingerprint(fp) for fp in noise)})
+        if invalid:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "ACCEPTED_INVALID", "keys": invalid[:20]})
+        if need:
+            return CommandOutcome(CommandStatus.REJECTED, {
+                "error": "ACCEPTED_CHOICE_REQUIRED", "keys": need[:20],
+                "detail": "no committed payload exists for these keys: choose the version the venue export proves"})
+        for stream, label, accept, noise_now in internal:
+            previous = self.meta.audited_payloads.get(stream, {}).get(label) or {}
+            noise = set(noise_now) | (set(previous.get("noise", [])) if previous.get("accepted") == accept else set())
+            self.meta.audited_payloads.setdefault(stream, {})[label] = {"accepted": accept,
+                                                                        "noise": sorted(noise - {accept})}
+        ids = [int(i["key"].split(":", 1)[1]) for i in items if i["stream"] == "store_conflict"]
+        s = self.store
+        s.record_manual_reconciliation(tx, actor, note, dict(evidence, conflict_set_id=set_id, audited_payloads=audited,
+                                                             audited_set=items[:50]),
+                                       resolved_conflict_ids=ids, clear_manual_reconcile=True)
+        self.meta.history_conflicts = {}
+        self.evidence_conflicts = {}
+        self.meta.freezes.pop(FREEZE_INVARIANT, None)
+        self._acknowledge_scan_conflicts(now)
+        return CommandOutcome(CommandStatus.APPLIED, {"conflict_set_id": set_id, "resolved_conflicts": ids,
+                                                      "audited_payloads": audited}, reload=True)
+
     def _absence_not_proven(self, cid: int, now: float) -> Optional[str]:
-        """An unknown submit may be audited as "never landed" only against evidence taken AFTER it was dispatched:
-        a fresh active-orders list read after the dispatch and a complete history walk started after it."""
+        """An unknown submit may be audited as "never landed" only against evidence taken long AFTER it was
+        dispatched: no WS execution signal for the CID (filed under its trade id or the CID) still pending, and, only
+        after ``unknown_resolution_delay_s`` (>= settlement_delay_s), a fresh active-orders list and
+        ``settlement_scans`` complete history walks that started after that delay. Absence is never provable: an
+        active list lagging longer than the delay stays an operator-audit residual risk (D2-15, H1)."""
         dispatched = [o.dispatched_at_ms for o in self.store.outbox_for_cid(cid)
                       if o.kind == "SUBMIT" and o.dispatched_at_ms is not None]
         if not dispatched:
             return "no dispatch recorded"
-        sent_ms = max(dispatched)
-        settled_ms = sent_ms + int(float(self.config.settlement_delay_s) * 1000)
-        if _ms(now) < settled_ms:
-            return "settlement delay since the dispatch has not elapsed"
-        if str(cid) in self.ws_pending:
-            return "a WS signal for this CID is not yet in committed history"
+        if any(label == str(cid) or self._ws_label_cid.get(label) == cid for label in self.ws_pending):
+            return "a WS execution signal for this CID is not yet in committed history"
+        delay = self.unknown_resolution_delay_s()
+        resolve_ms = max(dispatched) + int(delay * 1000)
+        if _ms(now) < resolve_ms:
+            return f"unknown-resolution delay ({delay:g} s) since the dispatch has not elapsed"
         if self.active_rows is None or self.active_at is None:
             return "active orders unknown"
-        if _ms(self.active_at) <= settled_ms:
-            return "no active orders list read after the dispatch + settlement delay"
+        if _ms(self.active_at) <= resolve_ms:
+            return "no active orders list read after the dispatch + unknown-resolution delay"
         if now - self.active_at > float(self.config.history_freshness_s):
             return "active orders list is stale"
-        walks = [w for w in self.complete_scans if _ms(w.started_at) > settled_ms]
+        walks = [w for w in self.complete_scans if _ms(w.started_at) > resolve_ms]
         if len(walks) < self.config.settlement_scans:
             return (f"{len(walks)}/{self.config.settlement_scans} complete history walks started after the "
-                    f"dispatch + settlement delay")
+                    f"dispatch + unknown-resolution delay")
         return None
 
     # ================================================================================== account reads
@@ -1610,8 +1795,15 @@ class NeutralGridEngine:
                                if at >= started or (self._is_trade_label(label) and (
                                    at + settle > started or self._own_live_label(label)))}
             self._ws_label_cid = {k: v for k, v in self._ws_label_cid.items() if k in self.ws_pending}
+        if not in_progress:
+            self._record_history_conflicts()
         if self.bootstrapped:
-            self._apply_history(result, now, in_progress)
+            try:
+                self._apply_history(result, now, in_progress)
+            except (StoreError, LedgerError):
+                if not in_progress:
+                    self._note_refused_batch(result)
+                raise
         else:
             self._apply_prebootstrap(result)
         if result.complete:
@@ -1626,6 +1818,59 @@ class NeutralGridEngine:
             self.history_incomplete_reason = None if result.incomplete_reason is None else redact(result.incomplete_reason)
             self.bootstrap_probe = None
             self._error("HISTORY_INCOMPLETE", f"{result.incomplete_reason}: {result.conflicts[:3]}", now)
+            if self._walk_problems_attributed(result):
+                self._scope_startup()
+
+    def _row_ids(self, stream: str, row: Any) -> Tuple[Optional[str], Optional[str]]:
+        if stream == STREAM_TRADES:
+            client, exchange = row.own_client_order_id, row.own_exchange_order_id
+        else:
+            client, exchange = row.client_order_id, (row.order_index or row.order_id)
+        return (None if client is None else str(client)), (str(exchange) if exchange else None)
+
+    def _cell_of_ids(self, client: Optional[str], exchange: Optional[str]) -> Optional[int]:
+        """Own cell of a history row by exact client order id, else exact exchange order id (never guessed)."""
+        cid = int(client) if client is not None and client.isdigit() else None
+        if cid not in self.order_meta and exchange:
+            cid = next((leg.cid for leg in self.all_legs() if leg.exchange_order_id == exchange), None)
+        return self.order_meta[cid].cell_id if cid in self.order_meta else None
+
+    def _scope_startup(self) -> None:
+        if not self.startup_reconciled and self.bootstrapped and self.active_rows is not None \
+                and self.position is not None:
+            self.startup_scoped = True
+
+    _SCOPED_CONFLICTS = ("duplicate_key_payload_mismatch", "committed_payload_mismatch",
+                         "trades_exceed_order_cumulative", "inactive_order_not_terminal")
+
+    def _walk_problems_attributed(self, result) -> bool:
+        """A finished walk whose only problems are row contradictions attributed to own cells (every other row of
+        the walk was delivered): startup may proceed for the unaffected cells (M3). Boundary, retention, schema or
+        unattributable problems keep the global block."""
+        if not self.bootstrapped or result.incomplete_reason != REASON_CONFLICT or not result.conflicts:
+            return False
+        if any(not c.startswith(tuple(f"{REASON_CONFLICT}:{k}:" for k in self._SCOPED_CONFLICTS))
+               for c in result.conflicts):
+            return False
+        blocked, unattributed = self._withheld_conflict_cells()
+        return bool(blocked) and unattributed is None
+
+    def _note_refused_batch(self, result) -> None:
+        """A history batch the store refused (recurring): the cells of its rows wait (their evidence is not in the
+        ledger); a row that is not exactly attributable blocks every TP. Only-attributed refusals let startup proceed
+        for the other cells (M3)."""
+        cells: Dict[int, str] = {}
+        unattributed = None
+        for stream, rows in ((STREAM_TRADES, result.new_trades), (STREAM_ORDERS, result.new_orders)):
+            for row in rows:
+                cell = self._cell_of_ids(*self._row_ids(stream, row))
+                if cell is None:
+                    unattributed = f"HISTORY_REFUSED_UNATTRIBUTED:{stream}"
+                else:
+                    cells.setdefault(cell, f"HISTORY_REFUSED:{stream} batch refused by the store")
+        self.history_refused_cells, self.history_refused_unattributed = cells, unattributed
+        if cells and unattributed is None and (result.complete or self._walk_problems_attributed(result)):
+            self._scope_startup()
 
     def _only_audited_conflicts(self, result) -> bool:
         """A conflicted walk whose contradictions were all audited (``ack_late_evidence``) and whose withheld rows
@@ -1757,6 +2002,9 @@ class NeutralGridEngine:
         res = s.apply_history_batch(None, rows, cursor_updates, transitions, batch_id=f"scan-{now_ms}")
         # Projection only after the commit succeeded.
         committed_at = self.clock()
+        self.history_refused_cells, self.history_refused_unattributed = {}, None
+        if len(rows) > res.duplicates:                          # a row not committed before (any kind, M4)
+            self.history_rows_commit_seq = self._next_seq()
         if res.new_fills:
             self.fills_commit_seq = self._next_seq()           # the ledger P moved: earlier position reads are stale
             for fill in res.new_fills:
@@ -2027,9 +2275,10 @@ class NeutralGridEngine:
                 tp.append(f"FROZEN:{code}")
         entry.extend(f"STORE:{b}" for b in self.store_entry_blockers)
         self.tp_blocked_cells = self._scoped_tp_blocks()
-        if self.unattributed_conflict:
-            entry.append(self.unattributed_conflict)
-            tp.append(self.unattributed_conflict)
+        for blocker in (self.unattributed_conflict, self.history_refused_unattributed):
+            if blocker:
+                entry.append(blocker)
+                tp.append(blocker)
         if not self.bootstrapped:
             entry.append("BASELINE_NOT_CONFIRMED")
             tp.append("BASELINE_NOT_CONFIRMED")
@@ -2037,7 +2286,8 @@ class NeutralGridEngine:
             entry.append("AWAITING_START")
         if not self.startup_reconciled:
             entry.append("RECONCILING")
-            tp.append("RECONCILING")
+            if not self.startup_scoped:
+                tp.append("RECONCILING")
         if self.unknown_active:
             entry.append("UNKNOWN_ACTIVE_ORDER")
             if not self.normal_since_start:
@@ -2105,7 +2355,7 @@ class NeutralGridEngine:
         elif self.fatal_reason is not None or self.persistence_error is not None or FREEZE_CID in self.meta.freezes:
             # A latched CID allocation failure (collision/exhaustion) is a system fault, not a risk limit.
             state = EngineState.DEGRADED
-        elif late or conflict or FREEZE_INVARIANT in self.meta.freezes or (
+        elif late or conflict or FREEZE_INVARIANT in self.meta.freezes or self.meta.history_conflicts or (
                 self.b_engine is not None and self.b_engine.manual_reconcile_required
                 and "conflict" in (self.b_engine.manual_reconcile_reason or "")):
             state = EngineState.FROZEN
@@ -2151,7 +2401,7 @@ class NeutralGridEngine:
         if FREEZE_INVARIANT in self.meta.freezes:
             for cell_id, why in self._invariant_cells().items():
                 blocked.setdefault(cell_id, f"FROZEN:LEDGER_INVARIANT:{why}")
-        for cell_id, why in self.evidence_conflicts.items():
+        for cell_id, why in list(self.evidence_conflicts.items()) + list(self.history_refused_cells.items()):
             blocked.setdefault(cell_id, why)
         withheld, self.unattributed_conflict = self._withheld_conflict_cells()
         for cell_id, why in withheld.items():
@@ -2163,15 +2413,21 @@ class NeutralGridEngine:
         reach the store, so no store conflict names their cell: map them to cells by own CID or exchange order id
         (their TPs wait, AC-40). A row that cannot be attributed blocks every new TP (fail closed). Rows whose
         conflict the operator audited are not blocking."""
-        rows = self.scanner.last_conflicted_rows
-        if not any(rows.values()):
-            return {}, None
-        last = self.scanner.last_result
-        if last is not None and last.incomplete_reason == REASON_CONFLICT and self._only_audited_conflicts(last):
-            return {}, None
-        by_exchange = {leg.exchange_order_id: leg.cid for leg in self.all_legs() if leg.exchange_order_id}
         blocked: Dict[int, str] = {}
         unattributed: Optional[str] = None
+        for entry in self.meta.history_conflicts.values():            # durable until audited (M2)
+            cell = self._cell_of_ids(entry.get("client"), entry.get("exchange"))
+            if cell is None:
+                unattributed = f"HISTORY_CONFLICT_UNATTRIBUTED:{entry['stream']}"
+            else:
+                blocked.setdefault(cell, f"HISTORY_CONFLICT:unaudited {entry['stream']} contradiction")
+        rows = self.scanner.last_conflicted_rows
+        if not any(rows.values()):
+            return blocked, unattributed
+        last = self.scanner.last_result
+        if last is not None and last.incomplete_reason == REASON_CONFLICT and self._only_audited_conflicts(last):
+            return blocked, unattributed
+        by_exchange = {leg.exchange_order_id: leg.cid for leg in self.all_legs() if leg.exchange_order_id}
         for stream, stream_rows in rows.items():
             for row in stream_rows:
                 if self._audited_row(stream, row):
@@ -2200,25 +2456,58 @@ class NeutralGridEngine:
         audited = self.meta.audited_payloads.get(stream, {}).get(_key_label(key))
         return audited is not None and (fp == audited.get("accepted") or fp in audited.get("noise", []))
 
-    def _audit_withheld_payloads(self) -> List[Dict[str, Any]]:
-        """Record the current withheld keys whose accepted payload is the committed one (never a quantity change:
-        the ledger keeps what it committed). A key that was never committed is not audited here: no accepted
-        payload is known, so it stays a conflict (no guessing, AC-40)."""
-        versions: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    def _committed_row(self, stream: str, key: Tuple) -> Optional[Any]:
+        """The ledger's own copy of a committed row (for the operator summary of the committed version)."""
+        domain = self.port.domain
+        if stream == STREAM_TRADES:
+            return next((r for rows in self.trades_by_cid.values() for r in rows if r.dedupe_key(domain) == key), None)
+        return next((r for r in self.terminal_rows.values() if c_order_key(domain, r) == key), None)
+
+    def _record_history_conflicts(self) -> None:
+        """Durably record every unaudited payload contradiction of the finished walk (a key served with a payload
+        other than the committed one, or with several payloads) with all versions seen, until an operator
+        ``ack_history_conflict`` audits exactly that set. A contradiction the venue serves only once keeps its cell
+        blocked and the engine FROZEN (M2, CR-2)."""
+        by_key: Dict[Tuple[str, Tuple], Dict[str, Any]] = {}
         for stream, rows in self.scanner.last_conflicted_rows.items():
             for row in rows:
-                key, fp = self._row_key_fp(stream, row)
-                committed = self.committed[stream].get(key)
-                if committed is None:
+                if self._audited_row(stream, row):
                     continue
-                entry = versions.setdefault((stream, _key_label(key)), {"accepted": committed, "noise": []})
-                if fp != committed and fp not in entry["noise"]:
-                    entry["noise"].append(fp)
-        audited = []
-        for (stream, label), entry in sorted(versions.items()):
-            self.meta.audited_payloads.setdefault(stream, {})[label] = entry
-            audited.append({"stream": stream, "key": label, "accepted": entry["accepted"], "noise": entry["noise"]})
-        return audited
+                key, fp = self._row_key_fp(stream, row)
+                by_key.setdefault((stream, tuple(key)), {}).setdefault(fp, row)
+        changed = False
+        for (stream, key), versions in sorted(by_key.items(), key=lambda kv: (kv[0][0], _key_label(kv[0][1]))):
+            committed = self.committed[stream].get(key)
+            if len(versions) < 2 and (committed is None or committed in versions):
+                continue                                   # not a payload contradiction (e.g. late evidence)
+            label = _key_label(key)
+            record_id = f"{stream}|{label}"
+            entry = self.meta.history_conflicts.get(record_id)
+            if entry is None:
+                client, exchange = self._row_ids(stream, next(iter(versions.values())))
+                entry = {"stream": stream, "key": label, "client": client, "exchange": exchange,
+                         "committed": committed, "versions": {}}
+                self.meta.history_conflicts[record_id] = entry
+                changed = True
+            if committed is not None and committed not in entry["versions"]:
+                row = versions.get(committed) or self._committed_row(stream, key)
+                entry["versions"][committed] = (_history_row_summary(stream, row) if row is not None
+                                                else {"note": "committed ledger payload"})
+                changed = True
+            for fp, row in versions.items():
+                if fp not in entry["versions"]:
+                    entry["versions"][fp] = _history_row_summary(stream, row)
+                    changed = True
+        if changed:
+            self._persist_meta_field("history_conflicts", self.meta.history_conflicts)
+
+    def _persist_meta_field(self, name: str, value: Any) -> None:
+        """Merge one engine-meta field into the stored meta in its own transaction (a later refusal and reload must
+        not lose it)."""
+        with self.store.transaction() as tx:
+            stored = EngineMeta.from_json(self.store.kv_get("engine_meta") or {})
+            setattr(stored, name, value)
+            self.store.kv_set(tx, "engine_meta", stored.to_json())
 
     def _invariant_cells(self) -> Dict[int, str]:
         if self._invariant_cells_cache is None:
@@ -2432,7 +2721,7 @@ class NeutralGridEngine:
             return
         if self.tp_blockers:
             self.admission_plan = self._slot_admission()
-            if "PERSISTENCE_FAILURE" not in self.tp_blockers and self.startup_reconciled:
+            if "PERSISTENCE_FAILURE" not in self.tp_blockers and (self.startup_reconciled or self.startup_scoped):
                 self._risk_reducing_cancels(cancels, now)
                 await self._dispatch_cancels(cancels, now)
             return
