@@ -1,5 +1,7 @@
 import asyncio
+import math
 import time
+from contextlib import AsyncExitStack
 from decimal import Decimal
 from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple
 
@@ -116,6 +118,9 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         # authoritative history: no legacy per-order polls, lost-order handling, generic cancel or
         # re-send of the same client id.
         self._history_reconciled_client_order_ids: Set[str] = set()
+        # CIDs currently waiting at the pre-send gates. This closes the single-process race before
+        # an order is registered with the tracker; ownership is released if the signer is never run.
+        self._pending_cid_submissions: Set[str] = set()
         self._real_time_balance_update = False
         self._signer_client = self._create_signer_client() if trading_required and self._account_index is not None else None
         super().__init__(balance_asset_limit, rate_limits_share_pct)
@@ -1419,6 +1424,27 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         code = self._extract_tx_code(tx_response)
         return code == 200
 
+    @staticmethod
+    def _signer_error_category(error: Any) -> str:
+        """Return an allowlisted diagnostic category without exposing SDK error text."""
+        normalized = str(error).casefold() if error is not None else ""
+        if "invalid nonce" in normalized:
+            return "invalid_nonce"
+        if "order not found" in normalized:
+            return "order_not_found"
+        if "too many requests" in normalized or "rate limit" in normalized or "http 429" in normalized:
+            return "rate_limited"
+        return "unclassified"
+
+    @staticmethod
+    def _transport_exception_category(exc: BaseException) -> str:
+        """Classify an exception without publishing its message or arbitrary class name."""
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return "timeout"
+        if isinstance(exc, ConnectionError):
+            return "connection"
+        return "unclassified"
+
     # ── Neutral grid: paginated authoritative history (NG-HIST-001/002) ─────────────────────────
     # Additive API. The legacy one-page readers (`_find_order`, `get_grid_account_snapshot`,
     # `_update_trade_history`) are intentionally left unchanged.
@@ -1626,13 +1652,17 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         amount: Decimal,
         order_type: OrderType,
         order_expiry_ms: Optional[int] = None,
+        *,
+        pre_send_timeout_s: float = 5.0,
     ) -> LighterTransportResult:
         """Submit a LIMIT (GoodTillTime) or LIMIT_MAKER (post-only) order with a pre-persisted CID.
 
         The numeric client order id is used unchanged as ``client_order_index`` (never replaced by
         ``_new_client_order_id``); ``reduce_only`` is always explicitly ``False`` (virtual neutral
         cells, NG-ORD-002). The order is registered with the Hummingbot order tracker before the
-        signer call and the signer runs under the connector's existing tx lock.
+        signer call and the signer runs under the connector's existing tx lock. The pre-send gate
+        timeout is intentionally shorter than the neutral-grid engine's default 10-second outer
+        timeout: expiring while waiting for the throttler/tx lock proves the signer was not invoked.
         """
         not_sent = LighterTransportOutcome.NOT_SENT
         problem = self._client_order_id_problem(client_order_id)
@@ -1644,6 +1674,9 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             return LighterTransportResult(not_sent, "pre_send_validation: only LIMIT and LIMIT_MAKER are allowed")
         if order_expiry_ms is not None and (type(order_expiry_ms) is not int or order_expiry_ms <= 0):
             return LighterTransportResult(not_sent, "pre_send_validation: order_expiry_ms must be a positive int")
+        if (type(pre_send_timeout_s) not in (int, float) or not math.isfinite(pre_send_timeout_s)
+                or pre_send_timeout_s <= 0):
+            return LighterTransportResult(not_sent, "pre_send_validation: pre_send_timeout_s must be finite and positive")
         try:
             await self._ensure_account_ready()
             market = self.market_info_for_trading_pair(trading_pair)
@@ -1662,22 +1695,12 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         order_id = str(client_order_id)
         if (
             order_id in self._history_reconciled_client_order_ids
+            or order_id in self._pending_cid_submissions
             or self._order_tracker.fetch_order(client_order_id=order_id) is not None
         ):
             # A previous submission with this CID governs; re-sending it is not proven idempotent.
             return LighterTransportResult(LighterTransportOutcome.UNKNOWN, "duplicate_client_order_id_in_flight")
 
-        self.start_tracking_order(
-            order_id=order_id,
-            exchange_order_id=None,
-            trading_pair=trading_pair,
-            trade_type=trade_type,
-            price=price,
-            amount=amount,
-            order_type=order_type,
-            position_action=PositionAction.NIL,
-        )
-        self._history_reconciled_client_order_ids.add(order_id)
         tif = (
             self._signer_client.ORDER_TIME_IN_FORCE_POST_ONLY
             if order_type is OrderType.LIMIT_MAKER
@@ -1695,19 +1718,67 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         )
         if order_expiry_ms is not None:
             order_kwargs["order_expiry"] = order_expiry_ms
+        # No await separates the duplicate check from this claim, so only one coroutine can own a
+        # CID while it waits for the throttler and tx lock.
+        self._pending_cid_submissions.add(order_id)
+        gates = AsyncExitStack()
         try:
-            async with self._throttler.execute_task(limit_id=CONSTANTS.SEND_TX_LIMIT):
-                async with self._tx_lock:
-                    _, tx_response, error = await self._signer_client.create_order(**order_kwargs)
+            try:
+                async with asyncio.timeout(pre_send_timeout_s):
+                    await gates.enter_async_context(
+                        self._throttler.execute_task(limit_id=CONSTANTS.SEND_TX_LIMIT)
+                    )
+                    await gates.enter_async_context(self._tx_lock)
+            except TimeoutError:
+                if (
+                    order_id in self._history_reconciled_client_order_ids
+                    or self._order_tracker.fetch_order(client_order_id=order_id) is not None
+                ):
+                    return LighterTransportResult(
+                        LighterTransportOutcome.UNKNOWN, "duplicate_client_order_id_in_flight"
+                    )
+                return LighterTransportResult(
+                    not_sent, "pre_send_validation: gate timeout before signer invocation"
+                )
+            # Durable registration may change while this owner awaits the shared gates. Recheck
+            # under the tx lock before registering or invoking the signer.
+            if (
+                order_id in self._history_reconciled_client_order_ids
+                or self._order_tracker.fetch_order(client_order_id=order_id) is not None
+            ):
+                return LighterTransportResult(
+                    LighterTransportOutcome.UNKNOWN, "duplicate_client_order_id_in_flight"
+                )
+            self.start_tracking_order(
+                order_id=order_id,
+                exchange_order_id=None,
+                trading_pair=trading_pair,
+                trade_type=trade_type,
+                price=price,
+                amount=amount,
+                order_type=order_type,
+                position_action=PositionAction.NIL,
+            )
+            self._history_reconciled_client_order_ids.add(order_id)
+            _, tx_response, error = await self._signer_client.create_order(**order_kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return LighterTransportResult(LighterTransportOutcome.UNKNOWN, f"transport_exception: {type(exc).__name__}")
+            return LighterTransportResult(
+                LighterTransportOutcome.UNKNOWN,
+                f"transport_exception:{self._transport_exception_category(exc)}",
+            )
+        finally:
+            try:
+                await gates.aclose()
+            finally:
+                self._pending_cid_submissions.discard(order_id)
         if error is not None or not self._is_tx_response_success(tx_response):
             code = self._extract_tx_code(tx_response)
             return LighterTransportResult(
                 LighterTransportOutcome.UNKNOWN,
-                f"transport_error: code={code}" if error is None else "transport_error: signer returned an error",
+                (f"transport_error: code={code}" if error is None else
+                 f"transport_error: signer_error:{self._signer_error_category(error)}"),
             )
         self._order_tracker.process_order_update(OrderUpdate(
             client_order_id=order_id,

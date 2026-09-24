@@ -384,6 +384,151 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["is_ask"])
         self.assertNotIn("order_expiry", kwargs)
 
+    async def test_submit_gate_timeout_is_proven_not_sent_and_releases_partial_gate(self):
+        entered = asyncio.Event()
+        exited = asyncio.Event()
+
+        class Gate:
+            async def __aenter__(gate_self):
+                entered.set()
+                return gate_self
+
+            async def __aexit__(gate_self, *args):
+                exited.set()
+
+        self.connector._throttler.execute_task = MagicMock(return_value=Gate())
+        await self.connector._tx_lock.acquire()
+        try:
+            result = await self.connector.submit_with_client_id(
+                client_order_id=41, trading_pair=PAIR, trade_type=TradeType.BUY, price=Decimal("5.0000"),
+                amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER, pre_send_timeout_s=0.01)
+        finally:
+            self.connector._tx_lock.release()
+        self.assertEqual(LighterTransportOutcome.NOT_SENT, result.outcome)
+        self.assertEqual("pre_send_validation: gate timeout before signer invocation", result.detail)
+        self.assertTrue(entered.is_set())
+        self.assertTrue(exited.is_set())
+        self.signer.create_order.assert_not_awaited()
+        self.assertIsNone(self.connector._order_tracker.fetch_order(client_order_id="41"))
+
+    async def test_submit_gate_timeout_validation_is_proven_not_sent(self):
+        for cid, value in enumerate((0, -1, float("nan"), float("inf"), True), start=45):
+            with self.subTest(value=value):
+                result = await self.connector.submit_with_client_id(
+                    client_order_id=cid, trading_pair=PAIR, trade_type=TradeType.BUY,
+                    price=Decimal("5.0000"), amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER,
+                    pre_send_timeout_s=value)
+                self.assertEqual(LighterTransportOutcome.NOT_SENT, result.outcome)
+                self.assertIn("pre_send_timeout_s", result.detail)
+                self.assertIsNone(self.connector._order_tracker.fetch_order(client_order_id=str(cid)))
+        self.signer.create_order.assert_not_awaited()
+
+    async def test_outer_timeout_shorter_than_gate_stays_ambiguous_without_late_send(self):
+        blocking = asyncio.Event()
+
+        class Gate:
+            async def __aenter__(gate_self):
+                await blocking.wait()
+
+            async def __aexit__(gate_self, *args):
+                return None
+
+        self.connector._throttler.execute_task = MagicMock(return_value=Gate())
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self.connector.submit_with_client_id(
+                    client_order_id=50, trading_pair=PAIR, trade_type=TradeType.BUY,
+                    price=Decimal("5.0000"), amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER,
+                    pre_send_timeout_s=1.0),
+                timeout=0.01,
+            )
+        await asyncio.sleep(0)
+        self.signer.create_order.assert_not_awaited()
+        self.assertIsNone(self.connector._order_tracker.fetch_order(client_order_id="50"))
+
+    async def test_submit_gate_external_cancel_propagates_without_signer_or_tracking(self):
+        blocking = asyncio.Event()
+
+        class Gate:
+            async def __aenter__(gate_self):
+                await blocking.wait()
+
+            async def __aexit__(gate_self, *args):
+                return None
+
+        self.connector._throttler.execute_task = MagicMock(return_value=Gate())
+        task = asyncio.create_task(self.submit_cid(42))
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.signer.create_order.assert_not_awaited()
+        self.assertIsNone(self.connector._order_tracker.fetch_order(client_order_id="42"))
+
+    async def test_submit_cancel_during_signer_propagates_and_releases_lock(self):
+        signer_entered = asyncio.Event()
+        signer_release = asyncio.Event()
+
+        async def blocked_signer(**kwargs):
+            signer_entered.set()
+            await signer_release.wait()
+
+        self.signer.create_order.side_effect = blocked_signer
+        task = asyncio.create_task(self.submit_cid(43))
+        await signer_entered.wait()
+        self.assertTrue(self.connector._tx_lock.locked())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(self.connector._tx_lock.locked())
+
+    async def test_concurrent_duplicate_cid_is_rechecked_inside_send_lock(self):
+        signer_entered = asyncio.Event()
+        signer_release = asyncio.Event()
+
+        async def blocked_signer(**kwargs):
+            signer_entered.set()
+            await signer_release.wait()
+            return None, {"code": 200, "tx_hash": "0xfeed"}, None
+
+        self.signer.create_order.side_effect = blocked_signer
+        first = asyncio.create_task(self.submit_cid(44))
+        await signer_entered.wait()
+        second = asyncio.create_task(self.submit_cid(44))
+        signer_release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        self.assertEqual(LighterTransportOutcome.ACCEPTED, first_result.outcome)
+        self.assertEqual(LighterTransportOutcome.UNKNOWN, second_result.outcome)
+        self.assertEqual("duplicate_client_order_id_in_flight", second_result.detail)
+        self.signer.create_order.assert_awaited_once()
+
+    async def test_concurrent_duplicate_cid_gate_timeout_is_unknown_not_not_sent(self):
+        signer_entered = asyncio.Event()
+        signer_release = asyncio.Event()
+
+        async def blocked_signer(**kwargs):
+            signer_entered.set()
+            await signer_release.wait()
+            return None, {"code": 200, "tx_hash": "0xfeed"}, None
+
+        self.signer.create_order.side_effect = blocked_signer
+        await self.connector._tx_lock.acquire()
+        first = asyncio.create_task(self.submit_cid(51))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(self.connector.submit_with_client_id(
+            client_order_id=51, trading_pair=PAIR, trade_type=TradeType.BUY,
+            price=Decimal("5.0000"), amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER,
+            pre_send_timeout_s=0.01))
+        await asyncio.sleep(0)
+        self.connector._tx_lock.release()
+        await signer_entered.wait()
+        second_result = await second
+        self.assertEqual(LighterTransportOutcome.UNKNOWN, second_result.outcome)
+        self.assertEqual("duplicate_client_order_id_in_flight", second_result.detail)
+        signer_release.set()
+        self.assertEqual(LighterTransportOutcome.ACCEPTED, (await first).outcome)
+        self.signer.create_order.assert_awaited_once()
+
     async def test_pre_send_validation_is_not_sent_and_never_touches_signer_or_tracker(self):
         base = dict(client_order_id=7, trading_pair=PAIR, trade_type=TradeType.BUY, price=Decimal("5.0000"),
                     amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER)
@@ -417,12 +562,18 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_ac56_timeout_not_found_and_errors_are_unknown_and_never_retry_with_new_cid(self):
         outcomes = {
-            "timeout": (asyncio.TimeoutError(), "transport_exception: TimeoutError"),
-            "connection": (ConnectionResetError("peer reset"), "transport_exception: ConnectionResetError"),
-            "secretish_exception": (RuntimeError(f"{PRIVATE_KEY} {AUTH_TOKEN}"), "transport_exception: RuntimeError"),
-            "http_400_or_signing_error": ((None, None, "invalid nonce"),
-                                          "transport_error: signer returned an error"),
-            "not_found": ((None, None, "order not found"), "transport_error: signer returned an error"),
+            "timeout": (asyncio.TimeoutError(), "transport_exception:timeout"),
+            "connection": (ConnectionResetError("peer reset"), "transport_exception:connection"),
+            "secretish_exception": (RuntimeError(f"{PRIVATE_KEY} {AUTH_TOKEN}"),
+                                    "transport_exception:unclassified"),
+            "http_400_or_signing_error": ((None, None, f"invalid nonce {PRIVATE_KEY} {AUTH_TOKEN}"),
+                                          "transport_error: signer_error:invalid_nonce"),
+            "not_found": ((None, None, "order not found"),
+                          "transport_error: signer_error:order_not_found"),
+            "rate_limited": ((None, None, "HTTP 429: too many requests"),
+                             "transport_error: signer_error:rate_limited"),
+            "secretish_signer_error": ((None, None, f"failed {PRIVATE_KEY} {AUTH_TOKEN}"),
+                                       "transport_error: signer_error:unclassified"),
             "non_200": ((None, {"code": 21120, "message": "rejected"}, None), "transport_error: code=21120"),
             "missing_code": ((None, {}, None), "transport_error: code=None"),
         }
