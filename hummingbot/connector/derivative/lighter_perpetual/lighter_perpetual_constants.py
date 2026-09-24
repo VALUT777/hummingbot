@@ -59,6 +59,17 @@ POSITION_FUNDING_PATH_URL = "/api/v1/positionFunding"
 EXCHANGE_STATS_PATH_URL = "/api/v1/exchangeStats"
 CANDLES_PATH_URL = "/api/v1/candles"
 
+SEND_TX_PATH_URL = "/api/v1/sendTx"  # sent by the SDK signer client, not by the web assistant
+
+# Authoritative history pagination (lighter-sdk 1.1.4 OrderApi.trades / account_inactive_orders):
+# `limit` is validated by the SDK as 1..100; `next_cursor` is an opaque string passed back verbatim.
+HISTORY_PAGE_LIMIT_MAX = 100
+# Key added to the saved tracking state of orders submitted with a pre-persisted client id, so the
+# history-reconciled treatment (no legacy polling/cancel/re-send) survives a Hummingbot restore.
+HISTORY_RECONCILED_STATE_MARKER = "lighter_history_reconciled"
+TRADES_SORT_BY_TRADE_ID = "trade_id"
+TRADES_SORT_DIR_DESC = "desc"
+
 DEFAULT_AUTH_TOKEN_EXPIRY_SECONDS = 10 * 60
 AUTH_TOKEN_REFRESH_BUFFER_SECONDS = 30
 FUNDING_INTERVAL_SECONDS = 60 * 60

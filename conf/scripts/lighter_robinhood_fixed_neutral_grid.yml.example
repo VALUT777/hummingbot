@@ -1,0 +1,11 @@
+# Runner for the fixed-cell neutral grid (copy to conf/scripts/lighter_robinhood_fixed_neutral_grid.yml).
+# Live start is refused unless the controller config has enabled: true AND live_start_confirmation equals
+#   START <grid_id> ON lighter_perpetual_robinhood LIT-USDG WITH B=<expected_initial_position>
+# exactly (for the example: START lit-neutral-fixed-v1 ON lighter_perpetual_robinhood LIT-USDG WITH B=0).
+# Stopping never flattens the position; drawdown stops are therefore not available for this runner.
+script_file_name: lighter_robinhood_fixed_neutral_grid.py
+controllers_config:
+  - lighter_robinhood_fixed_neutral_grid.yml
+max_global_drawdown_quote: null
+max_controller_drawdown_quote: null
+live_start_confirmation: null
