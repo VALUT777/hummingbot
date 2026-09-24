@@ -16,14 +16,12 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from ngweb_fakes import FakeGateway, sample_config, sample_rules  # noqa: E402
+from ngweb_fakes import ACCESS_TOKEN, FakeGateway, sample_config, sample_rules  # noqa: E402
 
 from web.neutral_grid.keystore import KeystoreService  # noqa: E402
 from web.neutral_grid.preview import MarketContext, PreviewService  # noqa: E402
 from web.neutral_grid.security import AccessGate  # noqa: E402
 from web.neutral_grid.server import WebContext, create_app  # noqa: E402
-
-ACCESS_TOKEN = "test-access-token-0123456789abcdef"
 
 
 class WebHarness:

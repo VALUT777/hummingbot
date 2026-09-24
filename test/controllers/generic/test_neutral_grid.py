@@ -98,7 +98,7 @@ def test_config_rejects_unsafe_values(updates, message):
 def test_profile_and_confirmation_policy():
     cfg = controller_config(enabled=True, leverage=D("10"))
     assert any("leverage" in e for e in validate_profile(cfg))
-    assert any("max_abs_net_position" in e for e in validate_profile(controller_config(max_abs_net_position=D("2000"))))
+    assert validate_profile(controller_config(max_abs_net_position=D("2000"))) == []    # a user limit, not a ceiling
     assert confirmation_phrase("g1", D("-12.5")) == "START g1 ON lighter_perpetual_robinhood LIT-USDG WITH B=-12.5"
     with pytest.raises(ValidationError):
         LighterRobinhoodFixedNeutralGridConfig(controllers_config=["other.yml"])
@@ -125,7 +125,7 @@ def test_controller_creates_exactly_one_executor_and_never_recreates():
     assert len(actions) == 1 and isinstance(actions[0], CreateExecutorAction)
     ex_cfg = actions[0].executor_config
     assert isinstance(ex_cfg, NeutralGridExecutorConfig) and ex_cfg.type == EXECUTOR_TYPE
-    assert ex_cfg.db_path and ex_cfg.cell_count == 10 and ex_cfg.controller_id == "ng-test"
+    assert ex_cfg.cell_count == 10 and ex_cfg.controller_id == "ng-test"
     assert controller.determine_executor_actions() == []            # one executor for all cells, ever
     assert ExecutorOrchestrator._executor_mapping[EXECUTOR_TYPE] is NeutralGridExecutor
 
@@ -399,3 +399,152 @@ def test_launcher_stop_drives_the_engine_drain(tmp_path):
     finally:
         asyncio.set_event_loop(None)
         loop.close()
+
+
+# ------------------------------------------------------------------------------------------ review package 2
+def test_a_hummingbot_stop_is_resent_after_a_conflict_until_the_engine_applies_it(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, CommandStatus
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    executor = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(executor.on_start())
+        _run(loop, executor, clock, 25)
+        engine = executor.engine
+        assert engine.engine_state == EngineState.NORMAL and len(fx.open_orders(owned=True)) == 10
+        engine.enqueue(CommandKind.PAUSE, {"reason": "web pause"}, key="web-pause")   # applied first
+        executor.early_stop()                                        # carries the same (soon stale) revisions
+        for _ in range(80):
+            _run(loop, executor, clock, 1)
+            if executor.close_type is not None:
+                break
+        stops = [c for c in engine.store.list_commands(limit=50) if c.kind == "stop"]
+        assert any(c.status == CommandStatus.CONFLICT for c in stops)          # the race really happened
+        assert any(c.status == CommandStatus.APPLIED for c in stops)           # re-sent with fresh revisions
+        assert engine.meta.stop_requested_ms is not None
+        assert executor.close_type == CloseType.EARLY_STOP and fx.open_orders(owned=True) == []
+    finally:
+        if executor.engine is not None and executor.engine.store is not None and not executor.engine.store.closed:
+            executor.engine.store.close()
+        loop.close()
+
+
+def _drain_harness(tmp_path, clock, fx, **updates):
+    values = dict(connector_name="lighter_perpetual_robinhood", trading_pair="LIT-USDG", grid_id="g-stop",
+                  lower_price=D("5"), upper_price=D("6"), cell_count=10, order_amount_base=D("10"),
+                  leverage=D("5"), expected_initial_position=D("0"), max_abs_net_position=D("1000"),
+                  max_gross_position=D("1000"), max_active_orders=120, enabled=True,
+                  db_path=str(tmp_path / "ng.sqlite3"), operator_confirmed_start=True,
+                  operator_confirmed_baseline=True, timestamp=clock(), controller_id="ng-ctl")
+    values.update(updates)
+    executor = NeutralGridExecutor(_strategy(clock), NeutralGridExecutorConfig(**values), update_interval=0.001,
+                                   port=fx, clock=clock)
+    orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)
+    orchestrator.active_executors = {"ng-ctl": [executor]}
+    orchestrator.cached_performance = {"ng-ctl": object()}
+    orchestrator.positions_held = {"ng-ctl": []}
+    launcher = LighterRobinhoodFixedNeutralGrid.__new__(LighterRobinhoodFixedNeutralGrid)
+    launcher.controllers = {}
+    launcher.executor_orchestrator = orchestrator
+    return executor, launcher
+
+
+def test_a_drain_reports_the_durable_outcome_and_waits_at_least_the_uncertain_bound(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import CancelBehavior
+    from scripts.lighter_robinhood_fixed_neutral_grid import STOP_DRAIN_TIMEOUT_S
+    assert STOP_DRAIN_TIMEOUT_S >= EngineOptions().stop_uncertain_after_s
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    executor, launcher = _drain_harness(tmp_path, clock, fx)
+
+    async def scenario():
+        running = True
+
+        async def advance_clock():
+            while running:
+                clock.advance(0.5)
+                await asyncio.sleep(0.002)
+
+        advancer = asyncio.ensure_future(advance_clock())
+        executor.start()
+        for _ in range(5000):
+            if executor.engine is not None and len(fx.open_orders(owned=True)) == 10:
+                break
+            await asyncio.sleep(0.002)
+        victim = next(o.client_order_id for o in fx.open_orders(owned=True))
+        for _ in range(1000):
+            fx.script_cancel(CancelBehavior.TIMEOUT_NOT_LANDED, victim)      # this order's cancel never lands
+        clean = await launcher.drain_neutral_executors(timeout_s=3.0, poll_s=0.005)
+        running = False
+        await advancer
+        return clean
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        clean = loop.run_until_complete(scenario())
+        assert clean is False
+        assert launcher.last_drain_outcome == "STOP_UNCERTAIN"           # read from the durable engine state
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def test_e_controller_default_database_is_per_account_and_market():
+    cfg = controller_config(enabled=True)
+    assert cfg.resolved_db_path() is None                             # store default: <domain>.<account>.<pair>
+    assert make_controller(cfg).config.executor_config().db_path is None
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import engine_db_path
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    path = engine_db_path(None, "lighter_perpetual_robinhood", "LIT-USDG", fx)
+    assert path.endswith(f"lighter_perpetual_robinhood.{fx.account_index}.LIT-USDG.sqlite3")
+    assert "g-exec" not in path and engine_db_path("/x/y.sqlite3", "c", "p", fx) == "/x/y.sqlite3"
+
+
+def test_h_profile_caps_are_defaults_not_a_product_ceiling():
+    from scripts.lighter_robinhood_fixed_neutral_grid import profile_warnings
+    cfg = controller_config(enabled=True, max_abs_net_position=D("1500"), max_gross_position=D("1500"))
+    assert validate_profile(cfg) == []
+    assert any("1500" in w for w in profile_warnings(cfg))
+    assert profile_warnings(controller_config(enabled=True)) == []
+
+
+def test_i_operator_confirmations_cannot_be_loaded_from_yaml():
+    for name in ("operator_confirmed_start", "operator_confirmed_baseline"):
+        with pytest.raises(ValidationError):
+            controller_config(enabled=True, **{name: True})
+    cfg = controller_config(enabled=True)
+    ex = cfg.executor_config()
+    assert ex.operator_confirmed_start is False and ex.operator_confirmed_baseline is False
+    cfg.mark_operator_confirmed(start=True, baseline=True)          # only the fixed launcher calls this
+    ex = cfg.executor_config()
+    assert ex.operator_confirmed_start is True and ex.operator_confirmed_baseline is True
+
+
+def test_b_e_launcher_confirmations_bind_resume_and_migration_to_explicit_phrases():
+    from scripts.lighter_robinhood_fixed_neutral_grid import (
+        evaluate_launch,
+        migration_phrase,
+        resume_phrase,
+    )
+    connector = MagicMock()
+    connector._api_private_key = "0x" + "ab" * 40
+    cfg = controller_config(enabled=True, connector_name="lighter_perpetual_robinhood", trading_pair="LIT-USDG",
+                            grid_id="g1")
+    phrase = confirmation_phrase("g1", cfg.expected_initial_position)
+    script = LighterRobinhoodFixedNeutralGridConfig(live_start_confirmation=phrase)
+    decision = evaluate_launch(cfg, script, connector, durable_stop_ms=None)
+    assert decision.refusal is None and decision.resume_stop_ms is None and not decision.migrate
+    # a durable stop is never resumed by the standing start phrase alone
+    decision = evaluate_launch(cfg, script, connector, durable_stop_ms=1790000123000)
+    assert decision.resume_stop_ms is None and "RESUME" in (decision.notice or "")
+    script = LighterRobinhoodFixedNeutralGridConfig(live_start_confirmation=phrase,
+                                                    resume_after_stop_confirmation=resume_phrase("g1", 1790000123000))
+    assert evaluate_launch(cfg, script, connector, durable_stop_ms=1790000123000).resume_stop_ms == 1790000123000
+    assert evaluate_launch(cfg, script, connector, durable_stop_ms=1790000999000).resume_stop_ms is None
+    script = LighterRobinhoodFixedNeutralGridConfig(live_start_confirmation=phrase,
+                                                    migrate_grid_confirmation=migration_phrase("g1"))
+    assert evaluate_launch(cfg, script, connector, durable_stop_ms=None).migrate is True

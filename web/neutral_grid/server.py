@@ -58,13 +58,22 @@ class WebContext:
     access: AccessGate = field(default_factory=AccessGate)
     policy: SecurityPolicy = field(default_factory=SecurityPolicy)
     host_status: Callable[[], Dict[str, Any]] = lambda: {}
+    health_provider: Callable[[], Dict[str, Any]] = lambda: {}
+    identity_provider: Optional[Callable[[], Dict[str, Any]]] = None
     demo: Optional[DemoControls] = None
     commands: Optional[CommandService] = None
 
     def __post_init__(self) -> None:
         if self.commands is None:
-            self.commands = CommandService(self.gateway, self.build_preview, self.engine_identity,
-                                           config_baseline=self.preview.config.expected_initial_position)
+            self.commands = CommandService(self.gateway, self.build_preview, self.identity,
+                                           config_baseline=self._config_baseline)
+
+    def identity(self) -> Dict[str, Any]:
+        return dict(self.identity_provider()) if self.identity_provider is not None else dict(self.engine_identity)
+
+    def _config_baseline(self):
+        cfg, error = self.preview.current_config()
+        return (cfg.expected_initial_position if cfg is not None else None), error
 
     async def build_preview(self, *, config_revision: int, engine_revision: int) -> Dict[str, Any]:
         snapshot = self.gateway.latest_snapshot()
@@ -145,7 +154,7 @@ async def logout(request: web.Request) -> web.Response:
 async def session_info(request: web.Request) -> web.Response:
     ctx = _ctx(request)
     return _json({"csrf_token": request["session"].csrf_token, "mode": ctx.mode,
-                  "engine_identity": ctx.engine_identity, "stale_after_s": ctx.stale_after_s,
+                  "engine_identity": ctx.identity(), "stale_after_s": ctx.stale_after_s,
                   "demo_actions": ctx.demo.actions if ctx.demo else None})
 
 
@@ -160,7 +169,7 @@ async def state(request: web.Request) -> web.Response:
                                              "committed_at")}
     return _json({
         "mode": ctx.mode,
-        "engine_identity": ctx.engine_identity,
+        "engine_identity": ctx.identity(),
         "engine": views.engine_view(snapshot, fresh),
         "freshness": fresh,
         "snapshot": meta,
@@ -172,6 +181,7 @@ async def state(request: web.Request) -> web.Response:
         "recent_commands": views.for_display(ctx.gateway.list_commands(limit=10)),
         "engine_started": views.engine_started(snapshot),
         "host": ctx.host_status(),
+        "health": views.health_view(ctx.health_provider(), fresh, ctx.clock()),
     })
 
 
@@ -203,9 +213,17 @@ async def commands_list(request: web.Request) -> web.Response:
     if before is not None and not views.valid_lookup_id(before):
         return json_error(400, "bad_cursor", "Некорректный курсор.")
     limit = _int_param(request, "limit", 50, 1, views.MAX_PAGE)
-    rows = ctx.gateway.list_commands(limit=limit + 1, before=before)
+    rows, truncated = _page(ctx.gateway, "commands_page", "list_commands", before, limit + 1)
     next_cursor = str(rows[limit - 1]["id"]) if len(rows) > limit else None
-    return _json({"commands": rows[:limit], "next_cursor": next_cursor})
+    return _json({"commands": rows[:limit], "next_cursor": next_cursor, "truncated": truncated})
+
+
+def _page(gateway: Any, paged: str, plain: str, before: Optional[str], limit: int):
+    """Use the gateway's truncation-aware page when it has one (StoreGateway), else the plain listing."""
+    method = getattr(gateway, paged, None)
+    if callable(method):
+        return method(before=before, limit=limit)
+    return getattr(gateway, plain)(limit=limit, before=before), False
 
 
 async def command_get(request: web.Request) -> web.Response:
@@ -225,11 +243,15 @@ async def lookup(request: web.Request) -> web.Response:
     if not views.valid_lookup_id(wanted):
         return json_error(400, "bad_id", "ID: 1–96 символов [0-9A-Za-z_:.-]; сравнивается как строка.")
     snapshot = _snapshot(ctx)
+    lookup_fn = getattr(ctx.gateway, "lookup", None)
+    found = lookup_fn(wanted) if callable(lookup_fn) else {
+        "orders": ctx.gateway.find_orders(wanted), "trades": ctx.gateway.find_trades(wanted), "truncated": False}
     return _json({
         "id": wanted,
         "snapshot_matches": views.lookup_in_snapshot(snapshot, wanted),
-        "orders": ctx.gateway.find_orders(wanted),
-        "trades": ctx.gateway.find_trades(wanted),
+        "orders": found["orders"],
+        "trades": found["trades"],
+        "truncated": bool(found.get("truncated")),
     })
 
 
@@ -239,9 +261,9 @@ async def audit(request: web.Request) -> web.Response:
     if before is not None and not views.valid_lookup_id(before):
         return json_error(400, "bad_cursor", "Некорректный курсор.")
     limit = _int_param(request, "limit", 50, 1, views.MAX_PAGE)
-    rows = ctx.gateway.audit_events(limit=limit + 1, before=before)
+    rows, truncated = _page(ctx.gateway, "audit_page", "audit_events", before, limit + 1)
     next_cursor = str(rows[limit - 1]["id"]) if len(rows) > limit else None
-    return _json({"events": rows[:limit], "next_cursor": next_cursor})
+    return _json({"events": rows[:limit], "next_cursor": next_cursor, "truncated": truncated})
 
 
 # ---------------------------------------------------------------------------- write side

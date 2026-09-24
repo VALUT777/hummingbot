@@ -227,18 +227,37 @@ def test_fail_closed_engine_reports_degraded_not_normal(tmp_path):
         h.close()
 
 
-def test_status_states_are_honest_during_bootstrap_and_reconcile(h):
-    assert h.state == EngineState.BOOTSTRAPPING
-    h.tick(2)
-    assert h.state == EngineState.BOOTSTRAPPING and "BASELINE_NOT_CONFIRMED" in h.engine.reasons
-    _started(h)
-    assert h.state == EngineState.NORMAL
-    h.restart()
-    assert h.state != EngineState.NORMAL                                # no optimistic NORMAL before reconcile
-    h.tick()
-    h.run_until(lambda: h.state == EngineState.NORMAL, max_ticks=10)
-    assert h.engine.legs if hasattr(h.engine, "legs") else True
-    assert all(leg.state != OrderState.INTENT for leg in h.engine.non_final_legs())
+def test_status_states_are_honest_during_bootstrap_and_reconcile(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+    h = Harness(tmp_path, options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0,
+                                                max_scan_pages_per_tick=1))
+    try:
+        assert h.state == EngineState.BOOTSTRAPPING
+        h.tick(2)
+        assert h.state == EngineState.BOOTSTRAPPING and "BASELINE_NOT_CONFIRMED" in h.engine.reasons
+        _started(h)
+        h.tick(4)
+        assert h.state == EngineState.NORMAL
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, LegRole.ENTRY)
+        h.restart()
+        for _ in range(100):                                            # > one page of own trades since the cursor
+            h.fx.fill(entry.cid, D("0.1"))
+        submits = len(h.fx.submits())
+        h.tick()
+        # a restart with a history backlog larger than one bounded scanner step: honest RECONCILING, nothing sent
+        assert h.state == EngineState.RECONCILING, (h.state, h.engine.reasons)
+        assert h.engine.scanner.progress_summary()["resumable"]
+        assert len(h.fx.submits()) == submits
+        while h.engine.scanner.progress_summary()["resumable"]:
+            assert h.state != EngineState.NORMAL, "NORMAL before the history walk completed"
+            h.tick()
+        h.run_until(lambda: h.state == EngineState.NORMAL, max_ticks=10)
+        assert h.engine.history_complete and h.engine.startup_reconciled
+        assert h.cell(cell).cycles[-1].E == D("10")                     # the whole backlog was applied
+        assert all(leg.state != OrderState.INTENT for leg in h.engine.non_final_legs())
+    finally:
+        h.close()
 
 
 def test_command_failing_after_a_store_write_is_rolled_back_then_rejected(h, monkeypatch):

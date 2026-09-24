@@ -34,6 +34,15 @@ D = Decimal
 START = 1_790_000_000.0
 
 
+# What an operator START carries (web: risk + baseline acknowledged from a viewed preview; AC-47, W1).
+PREVIEW_ID = "0123456789abcdef01234567"
+
+
+def start_payload(baseline: Decimal = D("0")) -> Dict[str, Any]:
+    return {"expected_initial_position": str(baseline), "risk_acknowledged": True, "baseline_acknowledged": True,
+            "preview_id": PREVIEW_ID}
+
+
 def make_config(**overrides: Any) -> GridConfig:
     values: Dict[str, Any] = dict(
         grid_id="grid-t", connector_name="fake_lighter", trading_pair="LIT-USDG", account_index=4242,
@@ -131,6 +140,8 @@ class Harness:
 
     def command(self, kind: CommandKind, payload: Optional[Dict[str, Any]] = None, key: Optional[str] = None,
                 expected=None):
+        if payload is None and kind == CommandKind.START:
+            payload = start_payload(self.config.expected_initial_position or D("0"))
         return self.engine.enqueue(kind, payload or {}, key=key or f"test-{next(self._keys)}", expected=expected)
 
     def bootstrap(self, baseline: Decimal = D("0"), start: bool = True, confirm_tick: bool = True) -> None:
@@ -140,7 +151,7 @@ class Harness:
         tick. ``confirm_tick=False`` leaves that tick to the caller (e.g. to arm a crash point first).
         """
         if start:
-            self.command(CommandKind.START)
+            self.command(CommandKind.START, start_payload(baseline))
         self.run_until(lambda: self.engine.bootstrap_ready(self.clock())[0], max_ticks=60)
         self.command(CommandKind.CONFIRM_BASELINE, {"expected_initial_position": str(baseline)})
         if confirm_tick:

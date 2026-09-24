@@ -41,6 +41,16 @@ class EngineOptions:
     snapshot_every_tick: bool = True
     min_wake_interval_s: float = 2.0             # WS wakeups coalesce into at most one extra scan per 2 s
     committed_cache_rows: int = 5000             # recent inbox rows kept as scanner "committed" view on restart
+    rules_retry_initial_s: float = 2.0           # failed trading-rules read: exponential backoff from here ...
+    rules_retry_max_s: float = 60.0              # ... up to here (the rules read never starves history scans)
+    reject_backoff_initial_s: float = 30.0       # a latched reject is retried with unchanged rules after this ...
+    reject_backoff_max_s: float = 3600.0         # ... doubling up to this
+    normal_hysteresis_ticks: int = 3             # back to NORMAL after DEGRADED only after this many clean ticks
+
+    @property
+    def rules_max_age_published_s(self) -> float:
+        """Staleness bound the engine publishes with ``runtime_rules`` (the UI's attach gate)."""
+        return max(self.rules_max_age_s, 3 * self.rules_refresh_s)
 
 
 def grid_config_to_json(cfg: GridConfig) -> Dict[str, Any]:
@@ -95,6 +105,7 @@ class OrderMeta:
     cancel_requested_ms: Optional[int] = None
     cancel_sent_ms: Optional[int] = None
     audited_cumulative: Optional[str] = None     # operator-audited cumulative after late evidence (exact decimal)
+    arming_min_tp: Optional[str] = None          # entry only: minimum valid TP quantity when the cycle was armed
     transport_detail: Optional[str] = None
 
     def to_json(self) -> Dict[str, Any]:
@@ -122,6 +133,12 @@ class EngineMeta:
     bootstrap_floor_ms: Optional[int] = None
     history_reset: Dict[str, int] = field(default_factory=dict)  # stream -> floor ms after audited retention gap
     acknowledged_conflicts: list = field(default_factory=list)  # scanner conflict strings an operator audited
+    # cell id -> {"role", "reason", "fingerprint", "retry_at_ms", "failures"}: a rejected intent of this cell/role is
+    # not re-issued until the rules/config fingerprint changes or the backoff elapses
+    reject_latches: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    risk_blocked: Dict[str, str] = field(default_factory=dict)   # router TP key -> RISK_BLOCKED reason
+    start_preview_id: Optional[str] = None                        # preview the applied START acknowledged
+    colliding_cid: Optional[int] = None                           # CID a foreign order owns (retire_colliding_cid)
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -169,10 +186,12 @@ class NeutralGridExecutorConfig(ExecutorConfigBase):
     tp_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT
     tp_gtt_seconds: int = 28 * 24 * 3600
     enabled: bool = False
-    db_path: str
+    db_path: Optional[str] = None                       # None = the store's default per account/market
     # Explicit operator confirmations collected by the launcher (never implied by enabled=true).
     operator_confirmed_start: bool = False
     operator_confirmed_baseline: bool = False
+    operator_confirmed_migration: bool = False             # launcher-confirmed audited grid migration (AC-52)
+    operator_resume_stop_ms: Optional[int] = None          # launcher-confirmed resume of exactly this durable stop
 
     @model_validator(mode="after")
     def _no_market_orders(self):

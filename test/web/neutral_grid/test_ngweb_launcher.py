@@ -11,7 +11,6 @@ from pathlib import Path
 
 import aiohttp
 import pytest
-import yaml
 
 from web.neutral_grid.security import BindRefused
 
@@ -121,8 +120,6 @@ def _free_port() -> int:
 
 @pytest.mark.asyncio
 async def test_attach_mode_serves_store_and_never_logs_token(tmp_path, caplog):
-    from ngweb_fakes import sample_snapshot
-
     from hummingbot.strategy_v2.executors.neutral_grid_executor.store import EngineIdentity, NeutralGridStore
 
     caplog.set_level(logging.DEBUG)
@@ -130,18 +127,18 @@ async def test_attach_mode_serves_store_and_never_logs_token(tmp_path, caplog):
                               account_index=7, trading_pair="LIT-USDG")
     db = tmp_path / "ng.sqlite3"
     writer = NeutralGridStore.open(db, identity, create_if_missing=True, lock_dir=tmp_path / "locks")
-    body = sample_snapshot("PAUSED")
+    from test_ngweb_attach import attach_snapshot, engine_config_json
+
+    body = attach_snapshot(engine_config=engine_config_json(enabled=False))
+    body["engine_state"] = "PAUSED"
+    body["reasons"] = ["OPERATOR_PAUSE"]
     for key in ("snapshot_version", "config_revision", "engine_revision", "committed_at"):
         body.pop(key)
     writer.write_snapshot(None, body)
-    cfg = tmp_path / "grid.yml"
-    cfg.write_text(yaml.safe_dump({
-        "grid_id": "ng-attach", "connector_name": "lighter_perpetual_robinhood", "trading_pair": "LIT-USDG",
-        "account_index": 7, "lower_price": "5", "upper_price": "6", "cell_count": 55, "order_amount_base": "10",
-        "leverage": "5", "expected_initial_position": "0", "max_abs_net_position": "1000",
-        "max_gross_position": "1000", "max_active_orders": 120, "enabled": False, "unknown_field": 1}))
+    (tmp_path / "ng.sqlite3.health.json").write_text(
+        '{"persistence_error": null, "fatal_reason": null, "at": "1", "engine_revision": 0}')
     port = _free_port()
-    args = launcher.parse_args(["--attach-db", str(db), "--config", str(cfg), "--port", str(port)])
+    args = launcher.parse_args(["--attach-db", str(db), "--port", str(port)])
     ready, stop, out = asyncio.Event(), asyncio.Event(), io.StringIO()
     task = asyncio.create_task(launcher.serve(args, ready=ready, stop=stop, out=out))
     await asyncio.wait_for(ready.wait(), 10)
@@ -159,7 +156,13 @@ async def test_attach_mode_serves_store_and_never_logs_token(tmp_path, caplog):
     await asyncio.wait_for(task, 10)
     writer.close()
     assert state["mode"] == "attach" and state["engine"]["display_state"] == "PAUSED"
-    assert state["engine_identity"]["grid_id"] == "ng-attach"
+    assert state["engine_identity"]["grid_id"] == "ng-engine-grid"  # from the engine's committed config
+    assert state["health"]["known"] is True and state["health"]["banner"] is None
     assert preview["grid"]["cells"] == 55 and preview["market_source"] == "snapshot"
     assert any(e.startswith("enabled=false") for e in preview["errors"])  # live start refused while disabled
     assert token not in caplog.text
+
+
+def test_config_option_removed_attach_reads_engine_config():
+    with pytest.raises(SystemExit):
+        launcher.parse_args(["--attach-db", "x.sqlite3", "--config", "grid.yml"])

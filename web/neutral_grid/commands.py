@@ -21,13 +21,13 @@ import asyncio
 import re
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, Union
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind
 from web.neutral_grid import jsonsafe
 from web.neutral_grid.gateway import EngineGateway
 from web.neutral_grid.preview import parse_signed_decimal
-from web.neutral_grid.views import is_engine_active, snapshot_revisions
+from web.neutral_grid.views import engine_started, is_engine_active, snapshot_revisions
 
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{16,128}\Z")
 MAX_NOTE = 500
@@ -75,17 +75,20 @@ def _note(payload: Dict[str, Any], field: str = "note") -> Optional[str]:
 
 
 class CommandService:
-    def __init__(self, gateway: EngineGateway, preview: PreviewBuilder, engine_identity: Dict[str, Any],
-                 config_baseline: Optional[Decimal] = None):
+    def __init__(self, gateway: EngineGateway, preview: PreviewBuilder,
+                 engine_identity: Union[Dict[str, Any], Callable[[], Dict[str, Any]]],
+                 config_baseline: Union[Optional[Decimal], Callable[[], Tuple[Optional[Decimal], Optional[str]]]] = None):
         self._gateway = gateway
         self._preview = preview
-        self._identity = dict(engine_identity)
-        self._config_baseline = config_baseline
+        self._identity = engine_identity if callable(engine_identity) else (lambda: dict(engine_identity))
+        # (baseline, error): error set when the engine config itself is unavailable/untrusted
+        self._config_baseline = (config_baseline if callable(config_baseline)
+                                 else (lambda: (config_baseline, None)))
         self._lock = asyncio.Lock()
 
     @property
     def engine_identity(self) -> Dict[str, Any]:
-        return dict(self._identity)
+        return dict(self._identity())
 
     async def submit(self, body: Any) -> CommandOutcome:
         if not isinstance(body, dict):
@@ -182,10 +185,13 @@ class CommandService:
 
     def _check_config_baseline(self, typed: Decimal) -> None:
         """B is part of the config (NG-ARCH-003); the operator re-types it as the explicit confirmation."""
-        if self._config_baseline is None:
+        baseline, error = self._config_baseline()
+        if error:
+            raise ValueError(f"Конфигурация движка недоступна ({error}): B сверить не с чем.")
+        if baseline is None:
             raise ValueError("expected_initial_position не задан в конфигурации: старт невозможен.")
-        if typed != self._config_baseline:
-            raise ValueError(f"Введённый B={typed} не совпадает с expected_initial_position={self._config_baseline} "
+        if typed != baseline:
+            raise ValueError(f"Введённый B={typed} не совпадает с expected_initial_position={baseline} "
                              "из конфигурации. Бот не принимает текущую позицию автоматически.")
 
     def _normalize_only(self, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -236,6 +242,12 @@ class CommandService:
             if snapshot is None:
                 return normalized, self._error(409, "engine_not_started",
                                                "Движок ещё не опубликовал состояние; команда неприменима.")
+            if kind == CommandKind.CONFIRM_BASELINE.value and engine_started(snapshot) is not True:
+                # The baseline is confirmed only after a Start that carried the risk acknowledgement and a
+                # checked preview_id was applied; otherwise confirm_baseline would bootstrap trading without them.
+                return normalized, self._error(
+                    409, "start_required", "Сначала отправьте «Старт» с подтверждением риска по превью; "
+                    "baseline подтверждается только после применённого старта.")
             return normalized, None
         pending = self._gateway.list_commands(limit=1, kind=CommandKind.START.value, status="QUEUED")
         if pending:

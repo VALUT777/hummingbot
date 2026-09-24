@@ -60,7 +60,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="разрешить не-loopback адрес (опасно: нет TLS; используйте SSH-туннель)")
     parser.add_argument("--allowed-host", action="append", default=[],
                         help="дополнительное имя хоста для проверки Host/Origin (только вместе с флагом выше)")
-    parser.add_argument("--config", type=Path, help="YAML конфигурации сетки (режим --attach-db)")
     parser.add_argument("--profile", default="lighter_perpetual_robinhood",
                         help="имя профиля в зашифрованном keystore Hummingbot")
     parser.add_argument("--unlock-tty", action="store_true",

@@ -119,10 +119,7 @@ Issues found and fixed during this run:
      all ids as strings.
    - GTT `expiry` (ms string) additionally becomes `expiry_at` (seconds).
    - Test: `test_engine_shaped_snapshot_with_string_times_and_int_cell_ids`.
-5. **Store listing API.** Commands and audit have no `before` cursor. `StoreGateway` pages by filtering
-   `id < before` over a bounded window (`_SCAN_LIMIT=5000`). Exchange/trade-id lookups scan `legs()`,
-   `order()`, `fills()` and `unmatched_evidence()` within the same bound. An indexed read API in the store
-   would remove the bound.
+5. **Store listing API.** Resolved: WS-B indexed drill-down reads and keyset pages (see review fix #5).
 6. **Revision churn vs. safety commands (risk for WS-D/integration).**
    - The engine bumps `engine_revision` on autonomous state changes, e.g. every DEGRADED ↔ NORMAL flip
      while history lags. Observed in the manual demo: Stop got 409 twice while the engine flapped
@@ -142,3 +139,47 @@ Issues found and fixed during this run:
 9. **Engine request-weight budget in the demo.** With default `EngineOptions.weight_budget_per_min=14400`,
    rapid demo actions can starve history scans. The engine then honestly shows DEGRADED/HISTORY_STALE. The
    demo keeps the realistic defaults.
+
+
+## Review fixes (adversarial review of `bcd2eebef`, 8 confirmed issues)
+
+Base: merged the integration tip `bb49f434e` into `codex/ng-web` (fast-forward). Each fix has a test that
+failed before it.
+
+| # | Issue | Fix | Tests |
+|---|---|---|---|
+| 1 | `confirm_baseline` accepted before any Start: bootstrap without the risk acknowledgement or preview check | `CommandService` answers 409 `start_required` unless the committed snapshot shows `engine_started` (explicit `summary.started`, or no `AWAITING_START`). The UI disables «Подтвердить baseline» until then. | `test_ngweb_commands.py::test_confirm_baseline_refused_before_start[False/None]` |
+| 2 | Attach mode loaded config from a separate YAML: the shipped controller YAML crashed; a hand-written file could drift; unknown keys were defaulted | `--config` removed. Preview config, B check and engine identity come from the committed `summary.engine_config`. Every GridConfig field is required; unknown keys, float decimals and wrong types are errors; `fingerprint` must equal core `grid.config_fingerprint`. If the config is unavailable, the preview shows an error and Start is refused (422). | `test_ngweb_attach.py::test_attach_preview_identity_and_baseline_come_from_engine_config`, `::test_attach_engine_config_is_strict[*]` (missing config, missing key, unknown key, fingerprint mismatch, float decimal), `::test_engine_config_parser_direct`, `test_ngweb_launcher.py::test_config_option_removed_attach_reads_engine_config`, `::test_attach_mode_serves_store_and_never_logs_token` |
+| 3 | A persistence failure was never visible in the UI: a failing store cannot commit a snapshot | New uncommitted health channel: demo/in-process via `EngineHost.health()` (engine `persistence_error` and `fatal_reason`, also in `host.status()`); attach via `<db>.health.json`. `/api/state.health` carries a banner marked «не зафиксировано». A stale snapshot with a missing or unreadable file shows «состояние хранилища неизвестно». | `test_ngweb_health.py::*`, B: `test_ngweb_browser.py::test_browser_truthful_state_security_and_keyboard` (banner rendered) |
+| 4 | Attach preview hard-coded limit/post-only support, showed the snapshot time as the rules time, and had no freshness gate | `snapshot_market` reads `runtime_rules.supports_limit`, `.supports_post_only` and `.fetched_at`. Unknown flags, rules older than `history_freshness_s` or a stale snapshot are preview errors, so Start is disabled. | `test_ngweb_attach.py::test_attach_market_rules_flags_and_freshness[*]`, `::test_attach_rules_fetched_at_is_the_rules_time_not_snapshot_time` |
+| 5 | ID lookup and journal paging silently stopped at the newest 5000 rows | Closed with WS-B `codex/ng-store@3d0a4d162` (merged). All scan windows are removed; the gateway uses only the indexed store reads `find_orders_by_id` (with `matched_on`), `find_fills_by_trade_id` plus fills of matched orders, and keyset `commands_page`/`audit_page(before_id, limit≤1000)`. Ids are passed as exact `str`. `truncated` stays in the API contract (always false) and the UI warning is kept for it. | `test_ngweb_drilldown_store.py::test_old_big_ids_found_through_indexed_store_reads` (real store: the oldest order behind newer legs is found by 2^63+5 exchange id, 2^64+1 trade id and CID; a float-rounded near miss matches nothing; failed before), `::test_journal_pages_reach_the_true_end`, `test_ngweb_truncation.py::test_gateway_calls_indexed_reads_with_exact_types` |
+| 6 | Store-parsed Decimal times were rendered as «—» | `views.for_display` converts Decimal and numeric-string time fields; tested on a real store snapshot. | `test_ngweb_store_gateway.py::test_real_store_snapshot_times_render_as_numbers` |
+| 7 | The browser test raced its 5 s staleness window against cold Chrome start | `FakeGateway.live_clock` commits fresh snapshots like a running engine; a deliberate 6 s delay reproduces the old failure and now passes. | B: `test_browser_truthful_state_security_and_keyboard`, `test_browser_contrast_and_mobile_layout[*]` |
+| 8 | The lag assertions passed without any injected lag | API e2e requires lag ≥ 10 s, the target entry's fill not credited during the lag, and credit of exactly the lagged quantity afterwards (the demo action now returns the filled CID and quantity). The browser check requires ≥ 10 s. Mutation check: with `history_lag_on` set to 1 s the API test fails ("timeout waiting for history lag >= 10 s"). | `test_ngweb_demo_engine.py::test_demo_engine_full_operator_flow`, B: `test_browser_flow_on_offline_demo_engine` |
+
+Contract names coded ahead of WS-D/WS-B publication (tests use snapshots carrying them):
+- `summary.engine_config` (all GridConfig fields + `fingerprint`);
+- `summary.runtime_rules.supports_limit`, `.supports_post_only` and `.fetched_at`;
+- `<db>.health.json` = `{persistence_error, fatal_reason, at, engine_revision}`;
+- store indexed reads listed in #5: done, WS-B merged.
+
+Until the engine publishes `engine_config` and the rules flags, attach-mode preview shows an explicit error and
+Start is refused (fail-closed). The rules-freshness conflict is resolved by decision (b): the gate now uses the engine-published
+`runtime_rules.max_age_s`.
+
+
+## Orchestrator decisions (b), (c), (d)
+
+| Decision | Implementation | Tests |
+|---|---|---|
+| (b) Rules freshness uses the engine-published `summary.runtime_rules.max_age_s`, not `history_freshness_s` | `snapshot_market` fails closed when `max_age_s` is absent or non-positive, or when `now - fetched_at > max_age_s`. History freshness stays separate: snapshot staleness and lag. | `test_ngweb_attach.py::test_attach_market_rules_flags_and_freshness[*]` (older than max age; missing max age), `::test_rules_freshness_uses_engine_max_age_not_history_freshness` (60 s old rules are fresh under 180 s even though history freshness is 10 s; failed before) |
+| (c) Strict 409 for all four commands; operator-driven one-click re-issue, never automatic | After a 409 the command dialog stays open with the fresh state, uses the revisions from the 409 body, and keeps every operator input (reason/B/confirm/action/observed/note/ack/cid) plus a new key. Nothing is re-sent until the operator clicks. Start keeps B and the acknowledgements only when the preview `material_id` (config + rules, no revisions) is unchanged; otherwise the risk acknowledgement must be redone. | B: `test_ngweb_browser.py::test_browser_409_is_reissued_by_one_operator_click_never_automatically` (Stop: reason kept, nothing sent for 3 s, one click → expected_engine_revision=2; Start revision-only → one click; Start with changed rules → acknowledgements reset, submit disabled; failed before) |
+| (d) WS-B indexed reads | Merged `codex/ng-store@3d0a4d162` (`381192b04`); gateway switched in `08bf75dda` (see review fix #5). | `test_ngweb_drilldown_store.py::test_more_than_5000_rows_old_trade_and_oldest_journal_rows_reachable` (6000 newer fills, commands and audit rows; the oldest trade found by its 2^64+1 id; commands and audit paged through the web API down to id 1 with `truncated=false`), `::test_old_big_ids_found_through_indexed_store_reads`, `::test_journal_pages_reach_the_true_end` |
+
+
+## Single-run gate hygiene
+
+Tests no longer import from `conftest`: `ACCESS_TOKEN` now lives in the uniquely named helper `ngweb_fakes.py`.
+Before this, a combined pytest run resolved `conftest` to `engine/conftest.py` and hit two collection errors.
+Now `pytest --collect-only test/hummingbot/strategy_v2/executors/neutral_grid_executor test/web/neutral_grid`
+collects 655 tests with 0 errors, and the combined run gives 655 passed, 230 subtests passed.

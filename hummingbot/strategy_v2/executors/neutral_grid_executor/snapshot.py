@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import grid, risk
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import OrderState
-from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import SNAPSHOT_VERSION
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import SNAPSHOT_VERSION, grid_config_to_json
 
 ZERO = Decimal("0")
 _UNKNOWN_STATES = (OrderState.INTENT, OrderState.SUBMIT_UNKNOWN, OrderState.CANCEL_UNKNOWN,
@@ -162,8 +162,13 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
             "tick_size": str(rules.tick_size), "size_step": str(rules.size_step), "min_base": str(rules.min_base),
             "min_notional": str(rules.min_notional), "max_base": _s(rules.max_base),
             "max_leverage": _s(rules.max_leverage), "max_active_orders_venue": rules.max_active_orders_venue,
+            "supports_limit": bool(rules.supports_limit), "supports_post_only": bool(rules.supports_post_only),
             "fetched_at": _s(rules.fetched_at),
+            # the engine's own staleness bound for these rules (the UI's attach/preview gate, W2)
+            "max_age_s": str(engine.options.rules_max_age_published_s),
         },
+        # exactly the GridConfig the engine runs (decimals as strings) + the core fingerprint (W2)
+        "engine_config": dict(grid_config_to_json(engine.config), fingerprint=engine.fingerprint),
         "dust_total": str(dust_total),
         "freezes": dict(engine.meta.freezes),
         "store_blockers": list(engine.store_entry_blockers),
@@ -174,7 +179,7 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
         "persistence_error": engine.persistence_error,
         "fatal_reason": engine.fatal_reason,
         "operator_paused": engine.meta.operator_paused,
-        "started": engine.meta.started,
+        "started": bool(engine.meta.started),
         "stop_outcome": engine.meta.stop_outcome,
         "tp_dispatch": {
             "slo_s": str(engine.options.tp_dispatch_slo_s),
@@ -288,6 +293,13 @@ def format_status(snapshot: Optional[Dict[str, Any]], *, stale_after_s: float = 
     h = s["history"]
     lines.append(f"  history complete={h['complete']} reason={h['incomplete_reason']} lag={h['lag_s']}s "
                  f"last_full_scan={h['last_full_scan_at']} weight60s={h['weight_used_60s']}")
+    progress = h.get("progress") or {}
+    walk = ", ".join(f"{name} pages {p.get('pages_read')} done={p.get('done')} oldest={p.get('oldest_ts_ms')}"
+                     for name, p in sorted((progress.get("streams") or {}).items()))
+    lines.append(f"  trades cursor {h.get('trades_cursor')} | orders cursor {h.get('orders_cursor')} | pages "
+                 f"{h.get('pages_read')} | walk {'resumable' if progress.get('resumable') else 'idle'}"
+                 + (f" ({walk})" if walk else "")
+                 + (f" | backoff until {progress.get('backoff_until')}" if progress.get("backoff_until") else ""))
     sl = s["slots"]
     lines.append(f"  slots actual {sl['actual']} reserved {sl['reserved']} free {sl['free']} cap {sl['cap']} | "
                  f"armed {s['armed']} queued {s['queued']} | owned active {s['owned_active']} unknown "
@@ -305,8 +317,8 @@ def format_status(snapshot: Optional[Dict[str, Any]], *, stale_after_s: float = 
         if cell["state"] in ("IDLE", "QUEUED") and not cell["blocker"] and cell["obligation"]["dust"] == "0":
             continue
         e = cell["entry"] or {}
-        tp_text = ",".join(f"{t['cid']}/{t['exchange_id']}:{t['filled']}/{t['requested']} {t['state']}"
-                           for t in cell["tp_children"])
+        tp_text = ",".join(f"{t['cid']}/{t['exchange_id']}:{t['filled']}/{t['requested']} remaining {t['remaining']} "
+                           f"{t['state']}" for t in cell["tp_children"])
         lines.append(
             f"  cell {cell['cell_id']:>3} {cell['low']}-{cell['high']} {cell['entry_side']:<4} g{cell['generation']} "
             f"{cell['state']:<22} entry {e.get('cid')}/{e.get('exchange_id')} {e.get('filled')}/{e.get('requested')} "

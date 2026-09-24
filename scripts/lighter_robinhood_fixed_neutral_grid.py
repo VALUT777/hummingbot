@@ -1,6 +1,6 @@
 """Thin Robinhood Lighter launcher for the generic fixed-cell neutral grid (NG-ARCH-001/003).
 
-It pins the Robinhood profile (``lighter_perpetual_robinhood``, ``LIT-USDG``, ONEWAY, 5x, 1000 LIT caps) on top
+It pins the Robinhood profile (``lighter_perpetual_robinhood``, ``LIT-USDG``, ONEWAY, 5x; 1000 LIT default caps) on top
 of the generic ``controllers/generic/neutral_grid.py`` controller, which runs exactly ONE
 ``NeutralGridExecutor`` hosting the engine. Credentials come only from Hummingbot's existing encrypted connector
 config; the API private key is validated with the existing setup validator (80 hex chars, optional ``0x``,
@@ -17,6 +17,7 @@ lost-order paths never cancel them. The only stop path for those orders is the e
 import asyncio
 import os
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional
 
@@ -24,7 +25,12 @@ from pydantic import model_validator
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import PositionMode
-from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import register_durable_cids
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import (
+    durable_stop_ms,
+    engine_db_path,
+    register_durable_cids,
+)
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
 from scripts.v2_with_controllers import V2WithControllers, V2WithControllersConfig
 
@@ -40,7 +46,8 @@ ROBINHOOD_PROFILE = {
 }
 DEFAULT_CAPS = {"max_abs_net_position": Decimal("1000"), "max_gross_position": Decimal("1000")}
 EXECUTOR_TYPE = "neutral_grid_executor"
-STOP_DRAIN_TIMEOUT_S = 90.0
+# The drain waits at least until the engine itself would declare STOP_UNCERTAIN (plus a margin).
+STOP_DRAIN_TIMEOUT_S = EngineOptions().stop_uncertain_after_s + 30.0
 
 
 def confirmation_phrase(grid_id: str, expected_initial_position: Optional[Decimal]) -> str:
@@ -48,19 +55,71 @@ def confirmation_phrase(grid_id: str, expected_initial_position: Optional[Decima
     return f"START {grid_id} ON {CONNECTOR_NAME} {TRADING_PAIR} WITH B={expected_initial_position}"
 
 
+def resume_phrase(grid_id: str, stop_ms: int) -> str:
+    """The exact phrase that resumes trading after the durable stop recorded at ``stop_ms``."""
+    return f"RESUME {grid_id} AFTER STOP {stop_ms}"
+
+
+def migration_phrase(grid_id: str) -> str:
+    """The exact phrase that authorizes an audited migration of the quiescent grid on this market to ``grid_id``."""
+    return f"MIGRATE {CONNECTOR_NAME} {TRADING_PAIR} TO {grid_id}"
+
+
 def validate_profile(controller) -> List[str]:
-    """Robinhood policy on top of the generic controller validation (never silently fixed)."""
+    """Robinhood policy on top of the generic controller validation (never silently fixed). The caps are the
+    operator's own positive limits (the profile values are only defaults, NG-ARCH-003)."""
     errors = []
     for field, value in ROBINHOOD_PROFILE.items():
         if getattr(controller, field) != value:
             errors.append(f"{field} must be {getattr(value, 'name', value)}")
-    for field, value in DEFAULT_CAPS.items():
+    for field in DEFAULT_CAPS:
         current = getattr(controller, field)
-        if current > value:
-            errors.append(f"{field} {current} exceeds the Robinhood profile cap {value} LIT")
+        if not isinstance(current, Decimal) or not current.is_finite() or current <= 0:
+            errors.append(f"{field} must be a finite positive LIT limit")
     if controller.db_path is not None and "://" in str(controller.db_path):
         errors.append("db_path must be a local file path")
     return errors
+
+
+def profile_warnings(controller) -> List[str]:
+    return [f"{field} {getattr(controller, field)} differs from the profile default {value} LIT"
+            for field, value in DEFAULT_CAPS.items() if getattr(controller, field) != value]
+
+
+@dataclass
+class LaunchDecision:
+    refusal: Optional[str] = None
+    resume_stop_ms: Optional[int] = None
+    migrate: bool = False
+    notice: Optional[str] = None
+
+
+def evaluate_launch(ccfg, config, connector, durable_stop_ms: Optional[int]) -> LaunchDecision:
+    """Every launcher gate in one place: profile, enabled, the explicit start phrase, the API key, and the
+    explicit phrases that alone may resume a durable stop or migrate a quiescent grid."""
+    decision = LaunchDecision()
+    errors = validate_profile(ccfg)
+    if errors:
+        decision.refusal = "; ".join(errors)
+    elif not ccfg.enabled:
+        decision.refusal = "enabled=false: live start refused (example config)"
+    elif config.live_start_confirmation != confirmation_phrase(ccfg.grid_id, ccfg.expected_initial_position):
+        decision.refusal = ("explicit confirmation missing: set live_start_confirmation to exactly "
+                            f"'{confirmation_phrase(ccfg.grid_id, ccfg.expected_initial_position)}'")
+    else:
+        decision.refusal = validate_api_credentials(connector) if connector is not None else \
+            "Robinhood connector is not configured"
+    if decision.refusal is not None:
+        return decision
+    if durable_stop_ms is not None:
+        wanted = resume_phrase(ccfg.grid_id, durable_stop_ms)
+        if config.resume_after_stop_confirmation == wanted:
+            decision.resume_stop_ms = durable_stop_ms
+        else:
+            decision.notice = (f"a durable STOP is recorded: the engine stays stopped; to resume trading set "
+                               f"resume_after_stop_confirmation to exactly '{wanted}'")
+    decision.migrate = config.migrate_grid_confirmation == migration_phrase(ccfg.grid_id)
+    return decision
 
 
 def validate_api_credentials(connector: ConnectorBase) -> Optional[str]:
@@ -84,6 +143,8 @@ class LighterRobinhoodFixedNeutralGridConfig(V2WithControllersConfig):
     script_file_name: str = os.path.basename(__file__)
     controllers_config: List[str] = [CONTROLLER_CONFIG_NAME]
     live_start_confirmation: Optional[str] = None
+    resume_after_stop_confirmation: Optional[str] = None      # "RESUME <grid_id> AFTER STOP <stop_ms>"
+    migrate_grid_confirmation: Optional[str] = None           # "MIGRATE lighter_perpetual_robinhood LIT-USDG TO <id>"
 
     @model_validator(mode="after")
     def validate_runner(self):
@@ -101,37 +162,35 @@ class LighterRobinhoodFixedNeutralGrid(V2WithControllers):
         super().__init__(connectors, config)
         self.config = config
         self.refusal: Optional[str] = None
+        self.registered_cids: List[int] = []
+        self.last_drain_outcome: Optional[str] = None
+        connector = connectors.get(CONNECTOR_NAME)
         for controller in self.controllers.values():
             ccfg = controller.config
-            errors = validate_profile(ccfg)
-            if errors:
-                self.refusal = "; ".join(errors)
-            elif not ccfg.enabled:
-                self.refusal = "enabled=false: live start refused (example config)"
-            elif config.live_start_confirmation != confirmation_phrase(ccfg.grid_id, ccfg.expected_initial_position):
-                self.refusal = ("explicit confirmation missing: set live_start_confirmation to exactly "
-                                f"'{confirmation_phrase(ccfg.grid_id, ccfg.expected_initial_position)}'")
+            db_path = None
+            stop_ms = None
+            if connector is not None:
+                try:
+                    db_path = engine_db_path(ccfg.db_path, ccfg.connector_name, ccfg.trading_pair, connector)
+                    # Before the connector's polling loops start: engine-owned CIDs of any previous run (even a
+                    # refused start protects them from Hummingbot's generic cancel paths).
+                    self.registered_cids += register_durable_cids(connector, db_path)
+                    stop_ms = durable_stop_ms(db_path)
+                except Exception as exc:  # noqa: BLE001 - the engine itself fails closed on an unreadable ledger
+                    self.logger().error(f"Neutral grid: could not read the durable ledger: {type(exc).__name__}: {exc}")
+            decision = evaluate_launch(ccfg, config, connector, stop_ms)
+            for warning in profile_warnings(ccfg):
+                self.logger().warning(f"Neutral grid profile: {warning}")
+            if decision.notice:
+                self.logger().warning(f"Neutral grid: {decision.notice}")
+            if decision.refusal is None:
+                ccfg.mark_operator_confirmed(start=True, baseline=True, migration=decision.migrate,
+                                             resume_stop_ms=decision.resume_stop_ms)
             else:
-                error = validate_api_credentials(connectors[CONNECTOR_NAME]) if CONNECTOR_NAME in connectors else \
-                    "Robinhood connector is not configured"
-                if error:
-                    self.refusal = error
-            if self.refusal is None:
-                ccfg.operator_confirmed_start = True
-                ccfg.operator_confirmed_baseline = True
-            else:
+                self.refusal = decision.refusal
                 ccfg.enabled = False                   # the controller then creates no executor at all
         if self.refusal:
             self.logger().error(f"Fixed neutral grid refused to start: {self.refusal}")
-        self.registered_cids: List[int] = []
-        connector = connectors.get(CONNECTOR_NAME)
-        for controller in self.controllers.values():
-            # Even a refused start protects the orders of a previous run from Hummingbot's generic cancel paths.
-            try:
-                self.registered_cids += register_durable_cids(connector, controller.config.resolved_db_path())
-            except Exception as exc:  # noqa: BLE001 - the engine itself fails closed on an unreadable ledger
-                self.logger().error(f"Neutral grid: could not read durable CIDs for connector ownership: "
-                                    f"{type(exc).__name__}: {exc}")
 
     def apply_initial_setting(self):
         if self.refusal is None:
@@ -173,13 +232,27 @@ class LighterRobinhoodFixedNeutralGrid(V2WithControllers):
         for controller_id, executors in list(self.executor_orchestrator.active_executors.items()):
             for executor in list(executors):
                 if executor.config.type == EXECUTOR_TYPE:
+                    self.last_drain_outcome = self._durable_stop_outcome(executor)
                     if not executor.is_closed:
                         clean = False
-                        self.logger().warning("Neutral grid did not prove a clean stop in time; its durable state "
-                                              "(STOP_UNCERTAIN) will be reconciled on the next start.")
+                        self.logger().warning(
+                            f"Neutral grid did not prove a clean stop in time; durable engine state: "
+                            f"{self.last_drain_outcome}. Engine-owned orders stay under engine control and are "
+                            f"reconciled on the next start (a durable STOP is never resumed automatically).")
                         executor.stop()
                     executors.remove(executor)
         return clean
+
+    @staticmethod
+    def _durable_stop_outcome(executor) -> str:
+        """The stop state the engine actually committed (never a claim about a STOP that was not applied)."""
+        engine = getattr(executor, "engine", None)
+        if engine is None:
+            return "NO_ENGINE"
+        meta = engine.meta
+        if meta.stop_requested_ms is None:
+            return "STOP_NOT_APPLIED"
+        return meta.stop_outcome or "STOPPING"
 
     def format_status(self) -> str:
         lines = []

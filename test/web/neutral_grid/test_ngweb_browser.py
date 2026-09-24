@@ -8,11 +8,11 @@ layout has no horizontal page scroll.
 from __future__ import annotations
 
 import time
+from decimal import Decimal
 
 import pytest
-from conftest import ACCESS_TOKEN
 from ngweb_cdp import CONTRAST_JS, Browser, find_chrome
-from ngweb_fakes import sample_snapshot
+from ngweb_fakes import ACCESS_TOKEN, sample_rules, sample_snapshot
 
 CHROME = find_chrome()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chrome/Chromium binary for headless browser tests")
@@ -46,8 +46,10 @@ def _snapshot_with_engine_fields(state="NORMAL"):
 @pytest.mark.asyncio
 async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
     web = await make_web(_snapshot_with_engine_fields("NORMAL"), stale_after_s=5)
+    web.gateway.live_clock = True  # a running engine commits fresh snapshots; Chrome start-up time must not matter
     browser, page = await _open(tmp_path, web)
     try:
+        await page.eval("new Promise(r => setTimeout(r, 6000))")  # slower than stale_after_s, like a cold Chrome
         # token left the URL, nothing persisted client-side, the session cookie is not script-readable
         assert await page.eval("location.hash") == ""
         assert await page.eval("localStorage.length + sessionStorage.length") == 0
@@ -96,11 +98,18 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
         await page.wait_for("document.getElementById('state-badge').dataset.state === 'STOP_UNCERTAIN'")
         assert await page.eval("document.getElementById('state-text').textContent") == "Остановка не подтверждена"
 
-        # stale snapshot: no current state claimed, last known kept separately
+        # stale snapshot: the engine stops committing -> no current state claimed, last known kept separately
+        web.gateway.live_clock = False
         web.gateway.snapshot["committed_at"] = time.time() - 60
         await page.wait_for("document.getElementById('state-badge').dataset.state === 'STALE'")
         assert "STOP_UNCERTAIN" in await page.eval("document.getElementById('state-code').textContent")
         assert await page.eval("!document.getElementById('stale-banner').hidden")
+        # persistence failure the engine could not commit: shown from the uncommitted health channel
+        web.ctx.health_provider = lambda: {"source": "health_file", "known": True,
+                                           "persistence_error": "database or disk is full", "at": time.time()}
+        await page.eval("document.getElementById('tab-overview').click()")
+        await page.wait_for("document.getElementById('persistence-banner').textContent.includes('disk is full')")
+        assert "не зафиксировано" in await page.eval("document.getElementById('persistence-banner').textContent")
         assert await page.eval("localStorage.length + sessionStorage.length") == 0
     finally:
         await browser.close()
@@ -110,6 +119,7 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
 @pytest.mark.parametrize("scheme", ["light", "dark"])
 async def test_browser_contrast_and_mobile_layout(make_web, tmp_path, scheme):
     web = await make_web(_snapshot_with_engine_fields("PAUSED"))
+    web.gateway.live_clock = True
     browser, page = await _open(tmp_path, web, scheme)
     try:
         assert await page.eval(f"matchMedia('(prefers-color-scheme: {scheme})').matches") is True
@@ -218,8 +228,9 @@ async def test_browser_flow_on_offline_demo_engine(tmp_path):
         # history lag becomes visible in the history card
         await _demo_click(page, "Задержка истории")
         await _demo_click(page, "Частично исполнить ближайший вход")
+        # >= 10 s: only the injected 30 s lag gets there (normal poll coalescing stays well below)
         await page.wait_for("(() => { const dd = [...document.querySelectorAll('#history-kv dd')][2];"
-                            " return dd && /^[1-9][0-9]* с/.test(dd.textContent); })()", 30)
+                            " return dd && /^([1-9][0-9]+ с|[0-9]+ мин)/.test(dd.textContent); })()", 30)
         await _demo_click(page, "Убрать задержку")
         # stop with cancels that never prove terminal -> STOP_UNCERTAIN, never STOPPED
         await _demo_click(page, "Отмены")
@@ -238,3 +249,72 @@ async def test_browser_flow_on_offline_demo_engine(tmp_path):
         await browser.close()
         await client.close()
         await bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_409_is_reissued_by_one_operator_click_never_automatically(make_web, tmp_path):
+    """Orchestrator (c): a stale revision gives 409 + fresh state; inputs survive, one click re-issues with the
+    fresh revisions, and nothing is resubmitted on its own."""
+    web = await make_web(_snapshot_with_engine_fields("NORMAL"))
+    web.gateway.live_clock = True
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'NORMAL'")
+        await page.eval("document.querySelector('[data-cmd=stop]').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        await page.eval("document.getElementById('f-reason').value = 'плановая остановка'")
+        web.gateway.snapshot["engine_revision"] = 2  # the engine commits a real transition meanwhile
+        await page.eval("document.getElementById('cmd-submit').click()")
+        await page.wait_for("document.getElementById('cmd-error').textContent.includes('409')")
+        assert await page.eval("document.getElementById('cmd-dialog').open") is True
+        assert await page.eval("document.getElementById('f-reason').value") == "плановая остановка"
+        assert "engine r2" in await page.eval("document.getElementById('cmd-context').textContent")
+        await page.eval("new Promise(r => setTimeout(r, 3000))")
+        assert web.gateway.commands == []  # never re-sent automatically
+        await page.eval("document.getElementById('cmd-submit').click()")  # the single operator click
+        await page.wait_for("!document.getElementById('cmd-dialog').open")
+        [row] = web.gateway.commands
+        assert row["kind"] == "stop" and row["expected_engine_revision"] == 2
+        assert row["payload"] == {"reason": "плановая остановка"}
+
+        # Start: a revision-only conflict keeps B and both acknowledgements -> one click with the fresh preview
+        web.gateway.snapshot.update(engine_state="STOPPED", engine_revision=3)
+        web.gateway.commands.clear()
+        await page.eval("document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-cards').textContent.includes('56 / 55')")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        await page.eval("document.getElementById('start-baseline').value = '0';"
+                        "document.getElementById('start-ack-baseline').checked = true;"
+                        "document.getElementById('start-ack-risk').checked = true;"
+                        "document.getElementById('start-baseline').dispatchEvent(new Event('input'))")
+        web.gateway.snapshot["engine_revision"] = 4
+        await page.eval("document.getElementById('start-submit').click()")
+        await page.wait_for("document.getElementById('start-error').textContent.includes('409')")
+        assert await page.eval("document.getElementById('start-ack-risk').checked") is True
+        assert await page.eval("document.getElementById('start-baseline').value") == "0"
+        assert web.gateway.commands == []
+        await page.eval("document.getElementById('start-submit').click()")
+        await page.wait_for("!document.getElementById('start-dialog').open")
+        [start] = web.gateway.commands
+        assert start["kind"] == "start" and start["expected_engine_revision"] == 4
+        # material change (runtime rules) behind the conflict: the risk acknowledgement must be redone
+        web.gateway.snapshot.update(engine_state="STOPPED", engine_revision=5)
+        web.gateway.commands.clear()
+        await page.eval("document.getElementById('tab-overview').click(); document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-cards').textContent.includes('56 / 55')")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        await page.eval("document.getElementById('start-baseline').value = '0';"
+                        "document.getElementById('start-ack-baseline').checked = true;"
+                        "document.getElementById('start-ack-risk').checked = true;"
+                        "document.getElementById('start-baseline').dispatchEvent(new Event('input'))")
+        web.market["rules"] = sample_rules(min_base=Decimal("4"))
+        web.gateway.snapshot["engine_revision"] = 6
+        await page.eval("document.getElementById('start-submit').click()")
+        await page.wait_for("document.getElementById('start-error').textContent.includes('409')")
+        assert await page.eval("document.getElementById('start-ack-risk').checked") is False
+        assert await page.eval("document.getElementById('start-submit').disabled") is True
+        assert web.gateway.commands == []
+    finally:
+        await browser.close()

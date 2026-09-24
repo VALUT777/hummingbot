@@ -12,7 +12,7 @@ Command rows are plain dicts::
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 
 class EngineGateway(Protocol):
@@ -50,7 +50,8 @@ TERMINAL_ENGINE_STATES = frozenset({"STOPPED", "STOPPED_WITH_INVENTORY"})
 
 
 MAX_CID = (1 << 48) - 1
-_SCAN_LIMIT = 5000
+_MAX_PAGE = 1000          # store keyset page bound
+_QUEUED_SCAN = 1000       # only QUEUED rows are scanned for the Start guard (a handful at most)
 
 
 def _ms_to_s(value: Optional[int]) -> Optional[float]:
@@ -75,10 +76,13 @@ def command_to_dict(record: Any) -> Dict[str, Any]:
 def _plain(value: Any) -> Any:
     """Dataclass record -> JSON-ready dict; Decimals stay Decimal (jsonsafe renders them as strings)."""
     import dataclasses
+    import types
     from enum import Enum
 
     if dataclasses.is_dataclass(value):
         return {f.name: _plain(getattr(value, f.name)) for f in dataclasses.fields(value)}
+    if isinstance(value, types.SimpleNamespace):
+        return {k: _plain(v) for k, v in vars(value).items()}
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):
@@ -133,8 +137,9 @@ class StoreGateway:
 
     def list_commands(self, *, limit: int, before: Optional[str] = None, kind: Optional[str] = None,
                       status: Optional[str] = None) -> List[Dict[str, Any]]:
-        fetch = limit if (before is None and kind is None) else _SCAN_LIMIT
-        rows = [command_to_dict(r) for r in self._store.list_commands(limit=fetch, status=status)]
+        if kind is None and status is None:
+            return self.commands_page(before=before, limit=limit)[0]
+        rows = [command_to_dict(r) for r in self._store.list_commands(limit=_QUEUED_SCAN, status=status)]
         if before is not None:
             if not before.isdigit():
                 return []
@@ -143,24 +148,24 @@ class StoreGateway:
             rows = [r for r in rows if r["kind"] == kind]
         return rows[:limit]
 
+    # ------------------------------------------------------------------ drill-down (indexed store reads)
+    def lookup(self, id_str: str) -> Dict[str, Any]:
+        """Exact-string lookup through the store's indexed reads: complete, never a scan window.
+
+        ``truncated`` stays in the response contract and is always False with the indexed store.
+        """
+        return {"orders": self.find_orders(id_str), "trades": self.find_trades(id_str), "truncated": False}
+
     def find_orders(self, id_str: str) -> List[Dict[str, Any]]:
-        found: List[Dict[str, Any]] = []
-        if id_str.isdigit() and int(id_str) <= MAX_CID:
-            cid = int(id_str)
-            leg, order = self._store.leg(cid), self._store.order(cid)
-            if leg is not None or order is not None:
-                found.append({"match": "client_order_id", "leg": _plain(leg), "order": _plain(order)})
-        for leg in self._store.legs()[-_SCAN_LIMIT:]:
-            order = self._store.order(leg.cid)
-            if order is not None and id_str in (order.exchange_order_id, order.order_index) \
-                    and not any(f["leg"] and f["leg"]["cid"] == leg.cid for f in found):
-                found.append({"match": "exchange_order_id", "leg": _plain(leg), "order": _plain(order)})
-        return found
+        return [{"match": "indexed", "matched_on": list(m.matched_on), "leg": _plain(m.leg), "order": _plain(m.order)}
+                for m in self._store.find_orders_by_id(id_str)]
 
     def find_trades(self, id_str: str) -> List[Dict[str, Any]]:
-        fills = self._store.fills()[-_SCAN_LIMIT:]
-        found = [dict(_plain(f), match="fill") for f in fills
-                 if id_str in (f.trade_id_str, f.own_exchange_order_id) or str(f.cid) == id_str]
+        fills = {f.dedupe_key: f for f in self._store.find_fills_by_trade_id(id_str)}
+        for match in self._store.find_orders_by_id(id_str):  # fills of an order found by its client/exchange id
+            for f in self._store.fills(match.leg.cid):
+                fills.setdefault(f.dedupe_key, f)
+        found = [dict(_plain(f), match="fill") for f in fills.values()]
         for rec in self._store.unmatched_evidence(include_resolved=True):
             if id_str in {str(v) for v in (rec.payload or {}).values() if isinstance(v, (str, int))}:
                 found.append({"match": "unmatched_evidence", "inbox_id": rec.id, "stream": rec.stream,
@@ -168,11 +173,35 @@ class StoreGateway:
                               "received_at": _ms_to_s(rec.received_at_ms)})
         return found
 
+    # ------------------------------------------------------------------ keyset pages (indexed store reads)
+    @staticmethod
+    def _before_id(before: Optional[str]) -> Optional[int]:
+        if before is None:
+            return None
+        if not before.isdigit() or int(before) < 1:
+            raise ValueError("bad cursor")
+        return int(before)
+
+    def commands_page(self, *, before: Optional[str], limit: int) -> Tuple[List[Dict[str, Any]], bool]:
+        try:
+            before_id = self._before_id(before)
+        except ValueError:
+            return [], False
+        rows = self._store.commands_page(before_id=before_id, limit=max(1, min(limit, _MAX_PAGE)))
+        return [command_to_dict(r) for r in rows], False
+
+    def audit_page(self, *, before: Optional[str], limit: int) -> Tuple[List[Dict[str, Any]], bool]:
+        try:
+            before_id = self._before_id(before)
+        except ValueError:
+            return [], False
+        rows = self._store.audit_page(before_id=before_id, limit=max(1, min(limit, _MAX_PAGE)))
+        return [self._audit_dict(e) for e in rows], False
+
+    @staticmethod
+    def _audit_dict(e: Any) -> Dict[str, Any]:
+        return {"id": str(e.id), "at": _ms_to_s(e.at_ms), "kind": e.kind, "actor": e.actor,
+                "engine_revision": e.engine_revision, "detail": e.payload}
+
     def audit_events(self, *, limit: int, before: Optional[str] = None) -> List[Dict[str, Any]]:
-        fetch = limit if before is None else _SCAN_LIMIT
-        rows = [{"id": str(e.id), "at": _ms_to_s(e.at_ms), "kind": e.kind, "actor": e.actor,
-                 "engine_revision": e.engine_revision, "detail": e.payload}
-                for e in self._store.audit_events(limit=fetch)]
-        if before is not None:
-            rows = [r for r in rows if before.isdigit() and int(r["id"]) < int(before)]
-        return rows[:limit]
+        return self.audit_page(before=before, limit=limit)[0]

@@ -302,7 +302,7 @@ def test_ac34_runtime_minimum_change_blocks_invalid_submits_without_resize(tmp_p
     h = Harness(tmp_path, options=None)
     try:
         _started(h)
-        h.engine.options = type(h.engine.options)(rules_refresh_s=1.0)
+        h.engine.options = type(h.engine.options)(rules_refresh_s=1.0, weight_budget_per_min=100000)
         cell = h.buy_cells()[-1]
         entry = h.live_order(cell, LegRole.ENTRY)
         h.fx.set_rules(min_base=D("20"))                                 # Q=10 now invalid, TP 6 too
@@ -407,7 +407,7 @@ def test_ac44_full_cap_tp_priority_cancels_cap_consuming_entry(tmp_path):
         h.tick(2)
         assert len(_live_entries(h)) == 4
         h.fx.set_rules(max_active_orders_venue=4)                    # venue cap reduced below reservations
-        h.engine.options = type(h.engine.options)(rules_refresh_s=1.0)
+        h.engine.options = type(h.engine.options)(rules_refresh_s=1.0, weight_budget_per_min=100000)
         cell = h.buy_cells()[-1]
         h.fx.fill(h.live_order(cell, LegRole.ENTRY).cid, D("5"))
         for _ in range(30):
@@ -490,7 +490,9 @@ def test_ac45_observed_position_must_equal_confirmed_b(tmp_path):
 ])
 def test_untradable_market_blocks_new_exposure_and_presend(tmp_path, rules, blocker, tp_blocked):
     from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
-    h = Harness(tmp_path, options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0))
+    # rules re-read every tick (a runtime rules change is the subject, not the request-weight budget)
+    h = Harness(tmp_path, options=EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0, rules_refresh_s=1.0,
+                                                weight_budget_per_min=100000))
     try:
         _started(h)
         cell = h.buy_cells()[-1]

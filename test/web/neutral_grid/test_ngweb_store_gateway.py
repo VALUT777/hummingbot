@@ -164,3 +164,19 @@ async def test_audit_action_reaches_store_queue(make_web, store_pair):
     assert resp.status == 202, await resp.text()
     [row] = writer.list_commands()
     assert row.kind == "baseline_audit" and row.payload["action"] == "ack_history_conflict"
+
+
+@pytest.mark.asyncio
+async def test_real_store_snapshot_times_render_as_numbers(make_web, store_pair):
+    """Review #6: float times come back from the store as Decimal; the API must serve display numbers."""
+    import time as _time
+
+    writer, gateway = store_pair
+    at = _time.time() - 3
+    _commit_snapshot(writer, errors=[{"at": at, "code": "X", "message": "m"}])
+    web = await make_web(gateway=gateway)
+    await web.login()
+    state = json.loads(await (await web.get("/api/state")).text())
+    assert isinstance(state["errors"][0]["at"], float) and abs(state["errors"][0]["at"] - at) < 0.01
+    assert isinstance(state["snapshot"]["committed_at"], float)
+    assert isinstance(state["freshness"]["committed_at"], float)

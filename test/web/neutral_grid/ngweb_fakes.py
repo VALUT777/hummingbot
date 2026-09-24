@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import GridConfig, TradingRules
 
+ACCESS_TOKEN = "test-access-token-0123456789abcdef"  # shared by conftest and tests; never import from conftest
 BIG_BASE = (1 << 53) + 1  # every fake id is beyond the JS safe-integer range (AC-22)
 
 
@@ -93,9 +94,12 @@ class FakeGateway:
         self.trades: List[Dict[str, Any]] = []
         self.events: List[Dict[str, Any]] = []
         self.enqueue_calls = 0
+        self.live_clock = False  # True: behave like a running engine that commits a fresh snapshot every tick
 
     # read side
     def latest_snapshot(self):
+        if self.live_clock and self.snapshot is not None:
+            self.snapshot["committed_at"] = time.time()
         return copy.deepcopy(self.snapshot)
 
     def get_command(self, command_id):

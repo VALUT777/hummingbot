@@ -7,6 +7,7 @@ outbox (intent before transport). A forced shutdown therefore does NOT run a bes
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -24,6 +25,43 @@ from hummingbot.strategy_v2.models.executors import CloseType
 
 EXECUTOR_TYPE = "neutral_grid_executor"
 _TRANSIENT_BASELINE_ERRORS = {"BOOTSTRAP_NOT_READY", None}
+
+
+def launcher_start_payload(config: NeutralGridExecutorConfig) -> Dict[str, Any]:
+    """START as the launcher sends it after the operator typed the exact confirmation phrase (grid id + signed B):
+    the same acknowledgement fields as the web START (AC-47). The launcher has no web preview; its preview id is a
+    stable digest of what the operator confirmed."""
+    digest = hashlib.sha256(f"{config.grid_id}|{config.expected_initial_position}|{config.id}".encode()).hexdigest()
+    payload = {"source": "launcher", "risk_acknowledged": True, "baseline_acknowledged": True,
+               "expected_initial_position": str(config.expected_initial_position), "preview_id": digest[:24]}
+    if config.operator_resume_stop_ms is not None:
+        # the operator typed the resume phrase naming exactly this durable stop (NG-OPS-003, AC-36)
+        payload["resume_stop_ms"] = int(config.operator_resume_stop_ms)
+    return payload
+
+
+def engine_db_path(db_path: Optional[str], connector_name: str, trading_pair: str, connector: Any) -> str:
+    """The engine ledger: an explicit path, else the store's default per account/market (the same identity as the
+    host lock and prior-run marker, so a new grid there is an audited migration, never a second database)."""
+    if db_path:
+        return str(db_path)
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import EngineIdentity, default_db_path
+    return str(default_db_path(EngineIdentity(connector_name=connector_name, connector_domain=connector.domain,
+                                              account_index=connector.account_index, trading_pair=trading_pair)))
+
+
+def durable_stop_ms(db_path: Optional[str]) -> Optional[int]:
+    """``stop_requested_ms`` of a durable STOP in an existing ledger (read-only, no lock), else None."""
+    if not db_path or not Path(db_path).exists():
+        return None
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
+    store = NeutralGridStore.open_readonly(db_path)
+    try:
+        meta = store.kv_get("engine_meta") or {}
+    finally:
+        store.close()
+    value = meta.get("stop_requested_ms")
+    return int(value) if value is not None else None
 
 
 def has_cid_ownership(owner: Any) -> bool:
@@ -86,7 +124,14 @@ class NeutralGridExecutor(ExecutorBase):
         self.registered_cids: List[int] = []
         self.engine = None
         self.start_error: Optional[str] = None
-        self._stop_command_sent = False
+        self._stop_requested = False        # Hummingbot asked this executor to stop (operator's own CLI intent)
+        self._stop_command_sent = False     # ... and a STOP row was APPLIED by the engine (only then durable)
+        self._stop_keys: List[str] = []
+        self._start_key: Optional[str] = None
+        self._start_refused = False
+        self._migration_key: Optional[str] = None
+        self._migration_attempts = 0
+        self._migration_refused = False
         self._bootstrap_attempts = 0
         self._baseline_key: Optional[str] = None
         self._baseline_refused = False
@@ -120,7 +165,8 @@ class NeutralGridExecutor(ExecutorBase):
             # A refused store (missing/corrupt DB with prior-run evidence, lock held, config mutation) yields
             # a fail-closed DEGRADED engine: never a fresh bootstrap (AC-54).
             self.engine = open_engine(grid_config, self.config.db_path, port, clock=clock, options=self._options,
-                                      offline_demo=self._offline_demo)
+                                      offline_demo=self._offline_demo,
+                                      allow_grid_migration=self.config.operator_confirmed_migration)
         if self.engine.fatal_reason is not None:
             self.start_error = self.engine.fatal_reason
             self.logger().error(f"Neutral grid engine is fail-closed: {self.start_error}")
@@ -128,7 +174,8 @@ class NeutralGridExecutor(ExecutorBase):
         self._take_cid_ownership(port)
         self._subscribe_wakeups(port)
         if self.config.operator_confirmed_start:
-            self._enqueue(CommandKind.START, {"source": "launcher"}, key=f"launcher-start-{self.config.id}")
+            self._start_key = f"launcher-start-{self.config.id}"
+            self._enqueue(CommandKind.START, launcher_start_payload(self.config), key=self._start_key)
 
     def _resolve_cid_owner(self, port) -> Any:
         if self._cid_owner is not None:
@@ -187,15 +234,77 @@ class NeutralGridExecutor(ExecutorBase):
     async def control_task(self):
         if self.engine is None:
             return
-        if self._stop_command_sent and self.engine.fatal_reason is not None:
+        if self._stop_requested and self.engine.fatal_reason is not None:
             self.close_type = CloseType.EARLY_STOP
             self.stop()
             return
         await self.engine.tick()
+        self._track_stop()
+        self._track_start()
+        self._maybe_migrate()
         self._maybe_confirm_baseline()
         if self.engine.is_stopped and self._stop_command_sent:
             self.close_type = CloseType.EARLY_STOP
             self.stop()
+
+    def _track_stop(self) -> None:
+        """The Hummingbot stop is the operator's own CLI intent: it is re-sent with fresh revisions and a NEW key
+        until a STOP row is APPLIED (a PAUSE/RESUME/state change in between makes the queued row CONFLICT; web
+        commands keep the strict 409). Only an APPLIED row is durable (NG-OPS-003, AC-35/36)."""
+        engine = self.engine
+        if not self._stop_requested or self._stop_command_sent or engine is None or engine.store is None \
+                or engine.store.closed or not self._stop_keys:
+            return
+        record = engine.store.get_command(idempotency_key=self._stop_keys[-1])
+        if record is None or record.status == CommandStatus.QUEUED:
+            return
+        if record.status == CommandStatus.APPLIED:
+            self._stop_command_sent = True
+            return
+        self.logger().warning(f"Neutral grid STOP was {record.status.value} ({record.result}); re-sending it")
+        self._send_stop()
+
+    def _send_stop(self) -> None:
+        key = f"executor-stop-{self.config.id}-{os.getpid()}-{len(self._stop_keys) + 1}"
+        self._stop_keys.append(key)
+        self._enqueue(CommandKind.STOP, {"reason": "hummingbot stop (executor early_stop)", "keep_position": True},
+                      key=key)
+
+    def _track_start(self) -> None:
+        engine = self.engine
+        if self._start_key is None or self._start_refused or engine.store is None or engine.store.closed:
+            return
+        record = engine.store.get_command(idempotency_key=self._start_key)
+        if record is not None and record.status == CommandStatus.REJECTED:
+            self._start_refused = True
+            error = (record.result or {}).get("error")
+            self.start_error = f"launcher START refused: {error}"
+            self.logger().error(f"Neutral grid: {self.start_error} ({record.result})")
+
+    def _maybe_migrate(self) -> None:
+        """Launcher-confirmed audited grid migration (AC-52): sent once the engine has fresh market data; the
+        engine re-verifies quiescence and rules and refuses otherwise."""
+        engine = self.engine
+        if not self.config.operator_confirmed_migration or self._migration_refused or engine.store is None \
+                or engine.store.closed or "CONFIG_MISMATCH" not in engine.meta.freezes:
+            return
+        if self._migration_key is not None:
+            record = engine.store.get_command(idempotency_key=self._migration_key)
+            if record is None or record.status == CommandStatus.QUEUED:
+                return
+            error = (record.result or {}).get("error")
+            if record.status == CommandStatus.REJECTED and error != "MARKET_DATA_NOT_READY":
+                self._migration_refused = True
+                self.start_error = f"grid migration refused: {error}"
+                self.logger().error(f"Neutral grid: {self.start_error} ({record.result})")
+                return
+        if engine.rules is None or engine.mid is None:
+            return
+        self._migration_attempts += 1
+        self._migration_key = f"launcher-migrate-{self.config.id}-{self._migration_attempts}"
+        self._enqueue(CommandKind.BASELINE_AUDIT, {"action": "migrate_grid", "actor": "launcher-confirmed-operator",
+                                                   "note": f"launcher-confirmed migration to {self.config.grid_id}"},
+                      key=self._migration_key)
 
     def _maybe_confirm_baseline(self) -> None:
         """Launcher-confirmed B is sent only once the engine reports a stable snapshot + history cut."""
@@ -232,10 +341,9 @@ class NeutralGridExecutor(ExecutorBase):
             self.close_type = CloseType.EARLY_STOP
             self.stop()
             return
-        if not self._stop_command_sent:
-            self._stop_command_sent = True
-            self._enqueue(CommandKind.STOP, {"reason": "executor early_stop", "keep_position": True},
-                          key=f"executor-stop-{self.config.id}-{os.getpid()}")
+        if not self._stop_requested:
+            self._stop_requested = True
+            self._send_stop()
 
     def _collect_held_position_orders(self) -> List[Dict]:
         # Inventory stays in the engine ledger; the orchestrator must not build a PositionHold from it.

@@ -318,6 +318,10 @@
     tickAge();
     var engine = st.engine || {};
     var summary = st.summary || {};
+    // confirm_baseline only after an applied Start (the backend refuses it otherwise, 409 start_required)
+    var confirmBtn = document.querySelector("[data-cmd=confirm_baseline]");
+    confirmBtn.disabled = !(st.engine_started === true && (summary.baseline === null || summary.baseline === undefined));
+    confirmBtn.title = confirmBtn.disabled ? "Доступно после применённого «Старта» и до подтверждения baseline" : "";
     var boot = summary.bootstrap || {};
     var next = null;
     if (st.engine_started === false) next = "Следующий шаг: проверьте превью и отправьте «Старт» (вкладка «Превью и старт»).";
@@ -411,9 +415,13 @@
   }
   function renderBlockers(s) {
     var banner = $("persistence-banner");
-    banner.hidden = !s.persistence_error;
-    banner.textContent = s.persistence_error ? "Сбой записи состояния (persistence): " + s.persistence_error +
-      ". Новые submit/cancel не отправляются без зафиксированного намерения." : "";
+    var health = (S.state && S.state.health) || {};
+    var texts = [];
+    if (s.persistence_error) texts.push("Сбой записи состояния (из снимка): " + s.persistence_error +
+      ". Новые submit/cancel не отправляются без зафиксированного намерения.");
+    if (health.banner) texts.push(health.banner + (typeof health.age_s === "number" ? " Данные " + fmtAge(health.age_s) + " назад." : ""));
+    banner.hidden = !texts.length;
+    banner.textContent = texts.join(" ");
     var boot = s.bootstrap || {};
     var tp = s.tp_dispatch || {};
     kv($("blockers-kv"), [
@@ -503,10 +511,10 @@
     return { cfg: snap ? snap.config_revision : 0, eng: snap ? snap.engine_revision : 0 };
   }
 
-  function openCommand(kind) {
+  function openCommand(kind, prefill, revs) {
     S.dialogKind = kind;
     S.dialogKey = newKey();
-    S.dialogRevs = currentRevs();
+    S.dialogRevs = revs || currentRevs();
     $("cmd-title").textContent = COMMAND_NAMES[kind] || kind;
     $("cmd-desc").textContent = COMMAND_HELP[kind] || "";
     $("cmd-error").textContent = "";
@@ -554,7 +562,21 @@
       fields.appendChild(el("label", { for: "f-reason", text: "Комментарий (необязательно)" }));
       fields.appendChild(el("input", { id: "f-reason", maxlength: "500" }));
     }
-    $("cmd-dialog").showModal();
+    if (prefill) applyPrefill(prefill);
+    if (!$("cmd-dialog").open) $("cmd-dialog").showModal();
+  }
+
+  // After a 409 the operator's inputs survive, so the re-issue with fresh revisions is a single click.
+  var PREFILL_IDS = { reason: "f-reason", expected_initial_position: "f-baseline", confirm: "f-confirm",
+    action: "f-action", observed_position: "f-observed", note: "f-note", acknowledge: "f-ack", cid: "f-cid" };
+  function applyPrefill(payload) {
+    Object.keys(payload).forEach(function (k) {
+      var node = PREFILL_IDS[k] && $(PREFILL_IDS[k]);
+      if (!node) return;
+      if (node.type === "checkbox") node.checked = payload[k] === true;
+      else node.value = payload[k];
+      if (node.tagName === "SELECT") node.dispatchEvent(new Event("change"));
+    });
   }
 
   function commandPayload(kind) {
@@ -594,7 +616,7 @@
       if (r.data.engine_identity) msg += " Движок: " + txt(r.data.engine_identity.grid_id) + ".";
       if (r.data.preview) { S.preview = r.data.preview; renderPreview(); }
       await refreshState();
-      return { conflict: true, message: msg, code: r.data.error };
+      return { conflict: true, message: msg, code: r.data.error, current: r.data.current || null };
     }
     if (r.data && r.data.errors) msg += " " + r.data.errors.join(" ");
     errorNode.textContent = msg;
@@ -641,10 +663,13 @@
       if (res.ok) { $("cmd-dialog").close(); toast("Команда записана в очередь движка."); }
       else if (res.retry) btn.textContent = "Повторить (тот же ключ)";
       else if (res.conflict) {
-        // never auto-applied: the operator re-reads the fresh state and confirms again with a brand-new key
-        openCommand(S.dialogKind);
+        // Never auto-applied and never re-sent by itself: the dialog shows the fresh state and revisions,
+        // keeps the operator's inputs, and one explicit click re-issues with a brand-new key.
+        var prev = commandPayload(S.dialogKind);
+        var fresh = res.current ? { cfg: res.current.config_revision, eng: res.current.engine_revision } : null;
+        openCommand(S.dialogKind, prev, fresh);
         $("cmd-error").textContent = "Команда НЕ поставлена в очередь (409). " + res.message +
-          " Проверьте актуальные данные выше и подтвердите заново.";
+          " Проверьте свежие данные выше; повторная отправка — одна кнопка, уже с новыми ревизиями.";
       }
     });
   }
@@ -782,18 +807,24 @@
         risk_acknowledged: $("start-ack-risk").checked,
         preview_id: p.preview_id
       };
+      var ackedMaterial = p.material_id;
       var res = await sendCommand("start", payload, { cfg: p.config_revision, eng: p.engine_revision }, S.startKey, $("start-error"));
       btn.disabled = false;
       if (res.ok) { $("start-dialog").close(); selectTab("overview", true); toast("Старт записан в очередь движка."); }
       else if (res.retry) btn.textContent = "Повторить (тот же ключ)";
       else if (res.conflict) {
         S.startKey = newKey();
-        $("start-ack-baseline").checked = false;
-        $("start-ack-risk").checked = false;
+        var sameMaterial = res.code === "stale_revision" && S.preview && S.preview.material_id === ackedMaterial;
+        if (!sameMaterial) {
+          // grid/rules changed (stale_preview) or engine already running: the acknowledgements must be redone
+          $("start-ack-baseline").checked = false;
+          $("start-ack-risk").checked = false;
+        }
         updateStartButton();
         $("start-error").textContent = "Старт НЕ поставлен в очередь (409). " + res.message +
-          (res.code === "stale_preview" || res.code === "stale_revision"
-            ? " Превью обновлено; проверьте его и подтвердите заново." : "");
+          (sameMaterial ? " Сетка и правила те же, изменились только ревизии: превью обновлено, " +
+            "повторная отправка — одна кнопка." : (res.code === "stale_preview" || res.code === "stale_revision"
+            ? " Превью изменилось; проверьте его и подтвердите риск заново." : ""));
         if (S.preview) openStartSummaryOnly();
       }
     });
@@ -923,6 +954,8 @@
       var d = r.data;
       var total = d.snapshot_matches.length + d.orders.length + d.trades.length;
       out.appendChild(el("p", { text: "ID " + d.id + ": найдено " + total + " (сравнение строк, без преобразования в число)." }));
+      if (d.truncated) out.appendChild(el("p", { cls: "form-error", text: "Внимание: поиск ордеров охватил не все записи " +
+        "журнала (ограниченное окно). «Не найдено» здесь не доказывает отсутствие." }));
       d.snapshot_matches.forEach(function (m) {
         var title = m.source === "snapshot_leg" ? "Нога " + m.role + " ячейки " + m.cell_id + " (поколение " + txt(m.generation) + ")" : "Несопоставленные данные";
         out.appendChild(el("article", { cls: "card" }, [el("h3", { text: title }), objectDl(m.leg || m.evidence)]));
@@ -952,6 +985,8 @@
     });
     S.commandsCursor = r.data.next_cursor;
     $("journal-commands-more").hidden = !r.data.next_cursor;
+    if (r.data.truncated) body.appendChild(el("tr", {}, [el("td", { colspan: "7", cls: "form-error",
+      text: "Дальше история команд не прочитана (ограниченное окно) — это не конец журнала." })]));
   }
   async function loadAudit(reset) {
     if (reset) { S.auditCursor = null; clear($("journal-audit").tBodies[0]); }
@@ -969,6 +1004,8 @@
     });
     S.auditCursor = r.data.next_cursor;
     $("journal-audit-more").hidden = !r.data.next_cursor;
+    if (r.data.truncated) body.appendChild(el("tr", {}, [el("td", { colspan: "4", cls: "form-error",
+      text: "Дальше аудит не прочитан (ограниченное окно) — это не конец журнала." })]));
   }
   function wireJournal() {
     $("journal-commands-more").addEventListener("click", function () { loadCommands(false); });

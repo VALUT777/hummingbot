@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
+import os
+import re
 import time
 from collections import deque
 from decimal import Decimal
@@ -42,7 +45,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import (
 )
 from hummingbot.strategy_v2.executors.neutral_grid_executor.commands import (
     AUDIT_ACTION_BASELINE,
-    AUDIT_ACTIONS,
+    ALL_AUDIT_ACTIONS,
     CommandOutcome,
 )
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
@@ -91,7 +94,9 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     STREAM_INACTIVE_ORDERS as B_ORDERS,
     STREAM_TRADES as B_TRADES,
     BootstrapRecord,
+    GridMigration,
     CidAllocationError,
+    CidCollisionError,
     CursorUpdate,
     EngineIdentity as StoreIdentity,
     EntryBlockedError,
@@ -114,9 +119,14 @@ FREEZE_RISK_BLOCKED = "RISK_BLOCKED"
 FREEZE_INVARIANT = "LEDGER_INVARIANT"
 FREEZE_CID = "CID_ALLOCATION"
 FREEZE_CONFIG_MISMATCH = "CONFIG_MISMATCH"
-_FREEZES_BLOCKING_TP = {FREEZE_INVARIANT, FREEZE_CID, FREEZE_CONFIG_MISMATCH}
+# Engine-wide TP blockers. History conflicts and ledger-invariant freezes are scoped to the affected cells
+# (``tp_blocked_cells``): TPs of exact cells and risk-reducing cancels keep flowing, new entries stop globally.
+_FREEZES_BLOCKING_TP = {FREEZE_CID, FREEZE_CONFIG_MISMATCH}
 
 CANCELLABLE = {OrderState.LIVE}
+_LOOKBACK_STATES = {OrderState.SUBMIT_UNKNOWN, OrderState.TERMINAL_UNKNOWN, OrderState.CANCEL_PENDING,
+                    OrderState.CANCEL_UNKNOWN}
+_PREVIEW_ID = re.compile(r"[0-9a-f]{24}")
 STOPPED_OUTCOMES = {EngineState.STOPPED.value, EngineState.STOPPED_WITH_INVENTORY.value}
 _C_TO_B = {STREAM_TRADES: B_TRADES, STREAM_ORDERS: B_ORDERS}
 
@@ -158,6 +168,25 @@ def order_row_from_json(d: Dict[str, Any]) -> ExchangeOrderRow:
     )
 
 
+def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, target)
+    try:
+        dir_fd = os.open(str(target.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 # ------------------------------------------------------------------------------------------ store opening
 def transport_cids_of(store: NeutralGridStore) -> List[int]:
     """Durable CIDs that may have reached transport (see ``NeutralGridEngine.transport_cids``); works on a
@@ -173,29 +202,49 @@ def engine_store_identity(connector_name: str, trading_pair: str, port: Exchange
 def open_engine_store(db_path: Optional[str], config: Any, port: ExchangePort, *, create_if_missing: bool = True,
                       lock_dir: Optional[str] = None, fault_hooks: Any = None,
                       clock: Callable[[], float] = time.time,
-                      prior_run_markers: Optional[Callable] = None) -> NeutralGridStore:
-    """Open the single-writer store (fails closed on missing/corrupt DB with prior-run evidence, AC-54)."""
+                      prior_run_markers: Optional[Callable] = None,
+                      allow_grid_migration: bool = False) -> NeutralGridStore:
+    """Open the single-writer store (fails closed on missing/corrupt DB with prior-run evidence, AC-54).
+
+    A changed grid (dimensions/Q) is refused (``ConfigMutationError``, AC-52) unless the operator explicitly
+    confirmed a migration: then the store opens without the fingerprint check, the engine stays frozen
+    (CONFIG_MISMATCH) and only the audited ``migrate_grid`` command can replace the quiescent grid."""
     grid_config = config if isinstance(config, GridConfig) else config.to_grid_config(port.account_index)
     identity = engine_store_identity(grid_config.connector_name, grid_config.trading_pair, port)
     return NeutralGridStore.open(
         Path(db_path) if db_path else None, identity, create_if_missing=create_if_missing,
         prior_run_markers=prior_run_markers, lock_dir=lock_dir,
-        config_fingerprint=grid.config_fingerprint(grid_config), fault_hooks=fault_hooks,
-        clock_ms=lambda: _ms(clock()))
+        config_fingerprint=None if allow_grid_migration else grid.config_fingerprint(grid_config),
+        fault_hooks=fault_hooks, clock_ms=lambda: _ms(clock()))
 
 
 def open_engine(config: GridConfig, db_path: Optional[str], port: ExchangePort, *,
                 clock: Callable[[], float] = time.time, options: Optional[EngineOptions] = None,
                 lock_dir: Optional[str] = None, fault_hooks: Any = None, create_if_missing: bool = True,
-                offline_demo: bool = False, prior_run_markers: Optional[Callable] = None) -> "NeutralGridEngine":
+                offline_demo: bool = False, prior_run_markers: Optional[Callable] = None,
+                allow_grid_migration: bool = False) -> "NeutralGridEngine":
     """Open store + engine. Any store refusal yields a fail-closed engine (never a fresh bootstrap)."""
     try:
         store = open_engine_store(db_path, config, port, create_if_missing=create_if_missing, lock_dir=lock_dir,
-                                  fault_hooks=fault_hooks, clock=clock, prior_run_markers=prior_run_markers)
+                                  fault_hooks=fault_hooks, clock=clock, prior_run_markers=prior_run_markers,
+                                  allow_grid_migration=allow_grid_migration)
     except (StoreError, PersistenceError, OSError) as exc:
         return NeutralGridEngine(config, None, port, clock, options=options, offline_demo=offline_demo,
-                                 fatal_reason=f"STORE_OPEN_REFUSED:{type(exc).__name__}: {exc}")
+                                 fatal_reason=f"STORE_OPEN_REFUSED:{type(exc).__name__}: {exc}",
+                                 health_path=_health_path(db_path, config, port))
     return NeutralGridEngine(config, store, port, clock, options=options, offline_demo=offline_demo)
+
+
+def _health_path(db_path: Optional[str], config: GridConfig, port: ExchangePort) -> Optional[str]:
+    """``<db_path>.health.json`` (the default database path when none is configured)."""
+    try:
+        if db_path:
+            return str(db_path) + ".health.json"
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.store import default_db_path
+        return str(default_db_path(engine_store_identity(config.connector_name, config.trading_pair, port))) \
+            + ".health.json"
+    except Exception:  # noqa: BLE001 - no sidecar rather than no engine
+        return None
 
 
 class _CursorView:
@@ -226,7 +275,7 @@ class NeutralGridEngine:
     def __init__(self, config: GridConfig, store: Optional[NeutralGridStore], port: ExchangePort,
                  clock: Callable[[], float] = time.time, scanner: Optional[HistoryScanner] = None, *,
                  options: Optional[EngineOptions] = None, offline_demo: bool = False,
-                 fatal_reason: Optional[str] = None):
+                 fatal_reason: Optional[str] = None, health_path: Optional[str] = None):
         self.config = config
         self.port = port
         self.clock = clock
@@ -274,6 +323,8 @@ class NeutralGridEngine:
         # evidence): input of the settlement predicate.
         self.complete_scans: Deque[ScanRecord] = deque(maxlen=64)
         self._walk_started_at: Optional[float] = None
+        self._walk_start_seq = 0
+        self._last_walk_start_seq = 0                          # causal start of the latest complete walk
         self.weight_log: Deque[Tuple[float, int]] = deque()
         self.position_gap_since: Optional[float] = None
         self.unknown_active: List[ExchangeOrderRow] = []
@@ -307,6 +358,26 @@ class NeutralGridEngine:
         # Connector CID ownership: called once per CID after its leg is proven final (stop tracking only).
         self.leg_final_hook: Optional[Callable[[int], None]] = None
         self._released_cids: Set[int] = set()
+        # Causal order of reads and commits inside and across ticks (REST reads are not atomic with each other):
+        # a position/active list is only compared with a ledger whose fills were committed BEFORE it was requested.
+        self._seq = 0
+        self.position_seq = 0
+        self.active_seq = 0
+        self.fills_commit_seq = 0
+        self.terminal_commit_seq: Dict[int, int] = {}
+        self._cell_fill_commit_ms: Dict[int, int] = {}        # cell -> latest history commit with its new fills
+        self._committed_trade_ids: Set[str] = set()
+        self._rules_failures = 0
+        self._rules_retry_at: Optional[float] = None
+        self._rules_weight_log: Deque[Tuple[float, int]] = deque()
+        self._hold_normal_until_tick = 0                       # anti-flap after DEGRADED (W4)
+        self._sticky_freezes: Dict[str, str] = {}              # freezes to persist across a reload
+        self._sticky_meta: Dict[str, Any] = {}                 # meta fields to persist across a reload
+        self._invariant_cells_cache: Optional[Dict[int, str]] = None
+        self.tp_blocked_cells: Dict[int, str] = {}
+        self.health_path: Optional[str] = health_path or (
+            str(store.path) + ".health.json" if store is not None and getattr(store, "path", None) else None)
+        self._health_written: Optional[Tuple[Optional[str], Optional[str]]] = None
         if self.fatal_reason is None:
             try:
                 self._load()
@@ -454,6 +525,7 @@ class NeutralGridEngine:
                         size=Decimal(str(p["size"])), price=Decimal(str(p["price"])), is_maker=p["is_maker"],
                         timestamp_ms=int(p["timestamp_ms"]), raw_json=rec.raw_json)
                     self.committed[STREAM_TRADES][row.dedupe_key(domain)] = trade_payload_fingerprint(row)
+                    self._committed_trade_ids.add(row.trade_id_str)
                 else:
                     p["raw_json"] = rec.raw_json
                     p["client_order_id"] = None if p["client_order_id"] is None else str(p["client_order_id"])
@@ -470,11 +542,26 @@ class NeutralGridEngine:
         self.unmatched = s.unmatched_evidence()
 
     def _reload(self) -> None:
-        """After a failed transaction memory may be ahead of disk: rebuild everything from the store."""
+        """After a failed transaction memory may be ahead of disk: rebuild everything from the store. A freeze raised
+        by the failure itself (LEDGER_INVARIANT) is re-applied and persisted: only an operator ack clears it."""
         self._load()
         self.reload_needed = False
         self._active_evidence_cache = {}
         self._active_reconciled_at = None
+        self._invariant_cells_cache = None
+        if self._sticky_freezes or self._sticky_meta:
+            for code, detail in self._sticky_freezes.items():
+                self.meta.freezes.setdefault(code, detail)
+            for name, value in self._sticky_meta.items():
+                setattr(self.meta, name, value)
+            with self.store.transaction() as tx:
+                self.store.kv_set(tx, "engine_meta", self.meta.to_json())
+            self._sticky_freezes = {}
+            self._sticky_meta = {}
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
 
     # ================================================================================== lookups / mirror
     def leg_by_cid(self, cid: int) -> Optional[Leg]:
@@ -545,7 +632,11 @@ class NeutralGridEngine:
         return [leg for ledger in self.cells.values() for leg in ledger.non_final_legs()]
 
     def oldest_unresolved_ms(self) -> Optional[int]:
-        times = [self.order_meta[leg.cid].intent_ms for leg in self.non_final_legs() if leg.cid in self.order_meta]
+        """History lookback for legs that can have old-dated evidence still missing (unknown submit/terminal,
+        cancel in flight, terminal row awaiting settlement). A proven-LIVE resting order produces only new-dated
+        rows, which the overlap from the high-water covers, so it never forces a walk back to its intent."""
+        times = [self.order_meta[leg.cid].intent_ms for leg in self.non_final_legs()
+                 if leg.cid in self.order_meta and (leg.state in _LOOKBACK_STATES or leg.cid in self.terminal_rows)]
         return min(times) if times else None
 
     @property
@@ -585,8 +676,12 @@ class NeutralGridEngine:
         self.last_ws_event_at = now
         self.scanner.wake()
         if event.get("type") == "trade":
-            label = str(event.get("trade_id") or event.get("client_order_id"))
-            self.ws_pending.setdefault(label, now)
+            trade_id = event.get("trade_id")
+            if trade_id is not None and str(trade_id) in self._committed_trade_ids:
+                return                                  # already in committed history: no lag (AC-13)
+            label = trade_id if trade_id is not None else event.get("client_order_id")
+            if label is not None:
+                self.ws_pending.setdefault(str(label), now)
 
     def history_lag_s(self, now: Optional[float] = None) -> float:
         """Age of the oldest WS trade signal not yet reflected in committed history (AC-13)."""
@@ -606,6 +701,12 @@ class NeutralGridEngine:
         self.ticks += 1
         self._submits_this_tick = 0
         self.last_tick_at = now
+        try:
+            await self._tick_body(now)
+        finally:
+            self._write_health()
+
+    async def _tick_body(self, now: float) -> None:
         if self.fatal_reason is not None:
             self._evaluate_state(now)
             return
@@ -620,6 +721,7 @@ class NeutralGridEngine:
             self._process_commands(now)
             await self._refresh_account(now)
             await self._scan_history(now)
+            await self._reread_position_for_release(now)
             self._reconcile_active(now)
             self._settle(now)
             self._detect_drift(now)
@@ -634,10 +736,31 @@ class NeutralGridEngine:
             raise
         except (StoreError, LedgerError) as exc:
             LOGGER.exception("neutral grid store/ledger refusal")
-            self._error("STORE_REFUSED", f"{type(exc).__name__}: {exc}", now)
-            self.meta.freezes.setdefault(FREEZE_INVARIANT, f"{type(exc).__name__}: {exc}")
+            detail = f"{type(exc).__name__}: {exc}"
+            self._error("STORE_REFUSED", detail, now)
+            self.meta.freezes.setdefault(FREEZE_INVARIANT, detail)
+            self._sticky_freezes.setdefault(FREEZE_INVARIANT, detail)   # survives the reload, persisted there
             self.reload_needed = True
             self._evaluate_state(now)
+
+    # ================================================================================== health sidecar (W3)
+    def health(self) -> Dict[str, Any]:
+        """In-process health for a host (same content as the ``<db_path>.health.json`` sidecar)."""
+        return {"persistence_error": self.persistence_error, "fatal_reason": self.fatal_reason,
+                "at": str(self.clock()),
+                "engine_revision": self.b_engine.engine_revision if self.b_engine is not None else 0}
+
+    def _write_health(self) -> None:
+        """Atomic write+fsync+replace of the health sidecar whenever the persistence/fatal status changes: the UI
+        cannot otherwise see a failing store, because no snapshot can commit (AC-55)."""
+        status = (self.persistence_error, self.fatal_reason)
+        if self.health_path is None or status == self._health_written:
+            return
+        try:
+            _atomic_write_json(self.health_path, self.health())
+            self._health_written = status
+        except OSError:
+            LOGGER.exception("neutral grid: health sidecar %s could not be written", self.health_path)
 
     def _probe_persistence(self, now: float) -> bool:
         """Degraded store: try an audited ``clear_degraded`` at most every 5 s; reload on success."""
@@ -723,15 +846,45 @@ class NeutralGridEngine:
             if not (self.config.enabled or self.offline_demo):
                 return CommandOutcome(CommandStatus.REJECTED, {"error": "CONFIG_DISABLED",
                                                                "detail": "enabled=false refuses live start"})
+            preview_id = payload.get("preview_id")
+            if payload.get("risk_acknowledged") is not True or not isinstance(preview_id, str) \
+                    or not _PREVIEW_ID.fullmatch(preview_id):
+                return CommandOutcome(CommandStatus.REJECTED, {
+                    "error": "START_NOT_ACKNOWLEDGED",
+                    "detail": "START needs risk_acknowledged=true and the preview_id of the viewed preview (AC-47)"})
+            if "expected_initial_position" in payload:
+                try:
+                    typed = Decimal(str(payload["expected_initial_position"]))
+                except ArithmeticError:
+                    typed = None
+                if typed is None or typed != self.config.expected_initial_position:
+                    return CommandOutcome(CommandStatus.REJECTED, {
+                        "error": "BASELINE_CONFIG_MISMATCH", "config": str(self.config.expected_initial_position),
+                        "command": str(payload["expected_initial_position"])})
+            if self.meta.stop_requested_ms is not None and payload.get("source") == "launcher" \
+                    and payload.get("resume_stop_ms") != self.meta.stop_requested_ms:
+                # An automatic launcher START (every process start, new random key) never overrides a durable
+                # STOP / STOPPING / STOP_UNCERTAIN: only an explicit operator START (web: key + expected revisions
+                # of a viewed snapshot) or a launcher resume naming this very stop may (NG-OPS-003, AC-36).
+                return CommandOutcome(CommandStatus.REJECTED, {
+                    "error": "DURABLE_STOP_ACTIVE", "stop_requested_ms": self.meta.stop_requested_ms,
+                    "stop_outcome": self.meta.stop_outcome,
+                    "detail": "an explicit operator START or a launcher resume naming this stop is required"})
             if self.meta.started and self.meta.stop_requested_ms is None:
                 return CommandOutcome(CommandStatus.APPLIED, {"already_started": True, "grid_id": self.grid_id,
                                                               "engine_state": self.engine_state.value})
+            resumed = {"resumed_stop_ms": self.meta.stop_requested_ms,
+                       "stop_outcome": self.meta.stop_outcome} if self.meta.stop_requested_ms is not None else {}
             self.meta.started = True
+            self.meta.start_preview_id = preview_id
             self.meta.stop_requested_ms = None
             self.meta.stop_outcome = None
             self.meta.stop_reason = None
             return CommandOutcome(CommandStatus.APPLIED, {"started": True, "grid_id": self.grid_id},
-                                  audit=("start", {"grid_id": self.grid_id}))
+                                  audit=("start", dict({"grid_id": self.grid_id, "preview_id": preview_id,
+                                                        "risk_acknowledged": True,
+                                                        "source": payload.get("source") or "operator"},
+                                                       **resumed)))
         if kind == CommandKind.PAUSE.value:
             self.meta.operator_paused = True
             self.meta.pause_reason = str(payload.get("reason") or "operator pause")
@@ -795,6 +948,13 @@ class NeutralGridEngine:
         return True, "ready"
 
     def _cmd_confirm_baseline(self, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
+        if not (self.config.enabled or self.offline_demo):
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "CONFIG_DISABLED",
+                                                           "detail": "enabled=false refuses live start"})
+        if not self.meta.started:
+            return CommandOutcome(CommandStatus.REJECTED, {
+                "error": "START_REQUIRED",
+                "detail": "an acknowledged START (risk + preview) must be applied before the baseline confirmation"})
         if self.bootstrapped:
             return CommandOutcome(CommandStatus.REJECTED, {
                 "error": "BASELINE_ALREADY_CONFIRMED", "baseline": str(self.baseline),
@@ -836,7 +996,6 @@ class NeutralGridEngine:
             confirmation=f"operator confirmed signed baseline {expected} == observed {observed}",
             trades_cut=trades_hw, orders_cut=orders_hw)
         self.store.bootstrap(tx, record)
-        self.meta.started = True
         buy = sum(1 for c in specs if c.entry_side == Side.BUY)
         return CommandOutcome(
             CommandStatus.APPLIED,
@@ -866,6 +1025,12 @@ class NeutralGridEngine:
         if observed != venue:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "AUDIT_STALE_OBSERVATION",
                                                            "observed_position": str(venue)})
+        unsettled = self._audit_evidence_unsettled(now)
+        if unsettled:
+            # Retryable: a rebase on a position that may contain an own fill history has not delivered would put
+            # that fill into B and count it twice (NG-RISK-003, AC-30).
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "AUDIT_EVIDENCE_NOT_SETTLED",
+                                                           "reasons": unsettled, "retryable": True})
         unresolved = [leg.cid for leg in self.non_final_legs() if leg.state != OrderState.LIVE]
         if unresolved:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "AUDIT_UNRESOLVED_ORDERS",
@@ -887,6 +1052,22 @@ class NeutralGridEngine:
         return CommandOutcome(CommandStatus.APPLIED, {
             "observed_position": str(venue), "old_effective_baseline": str(old),
             "new_effective_baseline": str(new_baseline), "acknowledged_unmatched": inbox_ids}, reload=True)
+
+    def _audit_evidence_unsettled(self, now: float) -> List[str]:
+        """Why the current venue position cannot yet be compared with the ledger for a baseline rebase."""
+        reasons = []
+        if self.position_seq < self.fills_commit_seq:
+            reasons.append("position read predates the latest committed fill")
+        if self.ws_pending:
+            reasons.append(f"{len(self.ws_pending)} WS trade signal(s) not yet in committed history")
+        if self.history_lag_s(now) > 0:
+            reasons.append(f"history lag {self.history_lag_s(now):.1f} s")
+        if self._last_walk_start_seq < self.position_seq:
+            reasons.append("no complete history walk started after the position read")
+        live = [leg.cid for leg in self.non_final_legs() if leg.state != OrderState.LIVE]
+        if live:
+            reasons.append(f"unresolved own orders {[str(c) for c in live[:5]]}")
+        return reasons
 
     def _acknowledge_scan_conflicts(self, now: float) -> None:
         """The operator audited the current scanner conflicts: they are not re-flagged, and the walk boundary is
@@ -943,6 +1124,7 @@ class NeutralGridEngine:
         accepted = self._withheld_late_trades()
         if accepted:
             res = s.apply_history_batch(tx, accepted, (), None, batch_id=f"late-audit-{_ms(now)}")
+            self.fills_commit_seq = self._next_seq()
             for fill in res.new_fills:
                 ledger = self.cells.get(fill.cell_id)
                 identity = s.identity_for_cid(fill.cid)
@@ -993,8 +1175,42 @@ class NeutralGridEngine:
             "resolved_conflicts": ids, "accepted_trades": [r.trade_id_str for r in accepted],
             "corrected_legs": corrected, "audited_cycles": cycles}, reload=True)
 
+    def _cmd_migrate_grid(self, actor: str, note: str, now: float, tx) -> CommandOutcome:
+        """AC-52 audited grid replacement: only when the configured dimensions differ from the stored grid, the old
+        grid is quiescent (``grid_mutation_blockers() == []``) and fresh market data allows a valid new grid. Old
+        grid, cells and cycles are preserved (RETIRED); baseline, fills and cursors are untouched (no reset)."""
+        s = self.store
+        if self.grid_record is None or self.grid_record.fingerprint == self.fingerprint:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "NOTHING_TO_MIGRATE"})
+        blockers = s.grid_mutation_blockers()
+        if blockers:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "GRID_NOT_QUIESCENT", "blockers": blockers[:20]})
+        if self.config.grid_id == self.grid_record.grid_id:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "NEW_GRID_ID_REQUIRED",
+                                                           "detail": "a migrated grid needs a new grid_id"})
+        if self.rules is None or grid.rules_blockers(self.rules) or self.mid is None or self._rules_stale(now):
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "MARKET_DATA_NOT_READY"})
+        errors = grid.validate_config(self.config, self.rules, self.mid, bootstrap=True)
+        if errors:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "CONFIG_INVALID", "errors": errors})
+        prices = grid.build_grid(self.config.lower_price, self.config.upper_price, self.config.cell_count, self.rules)
+        anchor = grid.compute_anchor(self.mid, self.config.lower_price, self.config.upper_price)
+        specs = grid.assign_cells(prices, anchor)
+        old = self.grid_record
+        s.migrate_grid(tx, GridMigration(
+            new_grid_id=self.config.grid_id, config_fingerprint=self.fingerprint,
+            config=grid_config_to_json(self.config), lower_price=self.config.lower_price,
+            upper_price=self.config.upper_price, order_amount_base=self.config.order_amount_base, prices=prices,
+            cells=specs, anchor=anchor, actor=actor, reason=note))
+        self.meta.freezes.pop(FREEZE_CONFIG_MISMATCH, None)
+        self.meta.obligations = {}
+        self.meta.reject_latches = {}
+        return CommandOutcome(CommandStatus.APPLIED, {
+            "old_grid_id": old.grid_id, "new_grid_id": self.config.grid_id, "anchor": str(anchor),
+            "cells": len(specs)}, reload=True)
+
     def _cmd_reconcile(self, action: str, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
-        if action not in AUDIT_ACTIONS:
+        if action not in ALL_AUDIT_ACTIONS:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "UNKNOWN_AUDIT_ACTION", "action": action})
         s = self.store
         actor = str(payload.get("actor") or "operator")
@@ -1020,8 +1236,21 @@ class NeutralGridEngine:
             self.meta.history_reset = {STREAM_TRADES: floor, STREAM_ORDERS: floor}
             return CommandOutcome(CommandStatus.APPLIED, {"history_reset_floor_ms": floor,
                                                           "resolved_retention_gaps": gaps}, reload=True)
+        if action == "retire_colliding_cid":
+            cid = payload.get("cid", self.meta.colliding_cid)
+            if cid is None or FREEZE_CID not in self.meta.freezes:
+                return CommandOutcome(CommandStatus.REJECTED, {"error": "NO_CID_COLLISION"})
+            cid = int(cid)
+            s.retire_cid(tx, cid, actor, note)                 # audited; never allocated from now on (AC-43)
+            detail = self.meta.freezes.pop(FREEZE_CID, None)
+            self.meta.colliding_cid = None
+            return CommandOutcome(CommandStatus.APPLIED, {"retired_cid": str(cid), "cleared": FREEZE_CID,
+                                                          "detail": detail}, reload=True)
+        if action == "migrate_grid":
+            return self._cmd_migrate_grid(actor, note, now, tx)
         if action == "ack_risk_blocked":
             detail = self.meta.freezes.pop(FREEZE_RISK_BLOCKED, None)
+            self.meta.risk_blocked = {}
             return CommandOutcome(CommandStatus.APPLIED, {"cleared": FREEZE_RISK_BLOCKED, "detail": detail},
                                   audit=("ack_risk_blocked", {"detail": detail, "note": note}))
         if action == "resolve_unknown_submit":
@@ -1029,14 +1258,36 @@ class NeutralGridEngine:
             leg = self.leg_by_cid(cid)
             if leg is None or leg.state != OrderState.SUBMIT_UNKNOWN or leg.filled != 0:
                 return CommandOutcome(CommandStatus.REJECTED, {"error": "NOT_AN_UNRESOLVED_ZERO_FILL_SUBMIT"})
-            if not self.history_complete or any(r.client_order_id == cid for r in (self.active_rows or [])) \
-                    or cid in self.terminal_rows:
+            if not self.history_complete or self._history_stale(now) or cid in self.terminal_rows:
                 return CommandOutcome(CommandStatus.REJECTED, {"error": "EVIDENCE_EXISTS_OR_HISTORY_INCOMPLETE"})
+            not_fresh = self._absence_not_proven(cid, now)
+            if not_fresh:
+                return CommandOutcome(CommandStatus.REJECTED, {"error": "ABSENCE_NOT_PROVEN", "detail": not_fresh})
+            if any(r.client_order_id == cid for r in self.active_rows):
+                return CommandOutcome(CommandStatus.REJECTED, {"error": "ORDER_IS_ACTIVE_ON_VENUE"})
             s.record_manual_reconciliation(tx, actor, note, dict(evidence, cid=str(cid)),
                                            leg_resolutions={cid: OrderState.REJECTED_ZERO_FILL},
                                            clear_manual_reconcile=False)
             return CommandOutcome(CommandStatus.APPLIED, {"cid": str(cid), "resolution": "not_landed"}, reload=True)
         return CommandOutcome(CommandStatus.REJECTED, {"error": "UNKNOWN_AUDIT_ACTION", "action": action})
+
+    def _absence_not_proven(self, cid: int, now: float) -> Optional[str]:
+        """An unknown submit may be audited as "never landed" only against evidence taken AFTER it was dispatched:
+        a fresh active-orders list read after the dispatch and a complete history walk started after it."""
+        dispatched = [o.dispatched_at_ms for o in self.store.outbox_for_cid(cid)
+                      if o.kind == "SUBMIT" and o.dispatched_at_ms is not None]
+        if not dispatched:
+            return "no dispatch recorded"
+        sent_ms = max(dispatched)
+        if self.active_rows is None or self.active_at is None:
+            return "active orders unknown"
+        if _ms(self.active_at) <= sent_ms:
+            return "active orders list predates the dispatch"
+        if now - self.active_at > float(self.config.history_freshness_s):
+            return "active orders list is stale"
+        if not self.complete_scans or _ms(self.complete_scans[-1].started_at) <= sent_ms:
+            return "no complete history walk started after the dispatch"
+        return None
 
     # ================================================================================== account reads
     def _history_stale(self, now: float) -> bool:
@@ -1055,15 +1306,30 @@ class NeutralGridEngine:
         except Exception as exc:  # noqa: BLE001
             self.bid = self.ask = None
             self._error("BOOK_UNAVAILABLE", f"{type(exc).__name__}: {exc}", now)
-        if self.rules is None or now - (self.rules_at or 0) >= self.options.rules_refresh_s:
+        if (self.rules is None or now - (self.rules_at or 0) >= self.options.rules_refresh_s) \
+                and (self._rules_retry_at is None or now >= self._rules_retry_at):
             weight = self.port.request_weight(ENDPOINT_TRADING_RULES)
-            if self._can_spend(now, weight):
+            # Lower priority than history and account reads: it only runs while one page of each history stream
+            # and one account poll still fit the budget (a failing rules endpoint never starves proofs).
+            reserve = (self.port.request_weight(ENDPOINT_TRADES) + self.port.request_weight(ENDPOINT_INACTIVE_ORDERS)
+                       + self.port.request_weight(ENDPOINT_ACCOUNT) + self.port.request_weight(ENDPOINT_ACTIVE_ORDERS))
+            while self._rules_weight_log and self._rules_weight_log[0][0] <= now - 60:
+                self._rules_weight_log.popleft()
+            rules_used = sum(w for _, w in self._rules_weight_log)
+            if self._can_spend(now, weight + reserve) and rules_used + weight <= self._rules_allowance(weight):
                 self._charge(now, weight)
+                self._rules_weight_log.append((now, weight))
                 try:
                     self.rules = await self.port.trading_rules()
-                    self.rules_at = now
+                    self.rules_at = self.clock()
+                    self._rules_failures = 0
+                    self._rules_retry_at = None
                 except Exception as exc:  # noqa: BLE001
-                    self._error("RULES_UNAVAILABLE", f"{type(exc).__name__}: {exc}", now)
+                    self._rules_failures += 1
+                    delay = min(self.options.rules_retry_initial_s * 2 ** (self._rules_failures - 1),
+                                self.options.rules_retry_max_s)
+                    self._rules_retry_at = now + delay
+                    self._error("RULES_UNAVAILABLE", f"{type(exc).__name__}: {exc} (retry in {delay:g} s)", now)
         due = (self._last_account_poll_at is None
                or now - self._last_account_poll_at >= float(self.config.poll_interval_s)
                or (not self.startup_reconciled
@@ -1076,17 +1342,57 @@ class NeutralGridEngine:
             return
         self._charge(now, weight)
         self._last_account_poll_at = now
-        try:
-            self.position = await self.port.position()
-            self.position_at = now
-        except Exception as exc:  # noqa: BLE001
-            self._error("POSITION_UNAVAILABLE", f"{type(exc).__name__}: {exc}", now)
+        await self._read_position(now)
+        issued, seq = self.clock(), self._next_seq()
         try:
             self.active_rows = await self.port.active_orders()
-            self.active_at = now
+            self.active_at, self.active_seq = issued, seq
         except Exception as exc:  # noqa: BLE001
             self.active_rows = None
             self._error("ACTIVE_ORDERS_UNAVAILABLE", f"{type(exc).__name__}: {exc}", now)
+
+    def _rules_allowance(self, rules_weight: int) -> float:
+        """Per-minute weight the rules refresh may use: what the account-poll and history-scan cadence leaves of
+        the budget, but at least one read per minute (rules are lower priority than proofs, NG-HIST-003)."""
+        per_poll = sum(self.port.request_weight(e) for e in (ENDPOINT_ACCOUNT, ENDPOINT_ACTIVE_ORDERS,
+                                                             ENDPOINT_TRADES, ENDPOINT_INACTIVE_ORDERS))
+        need = 60.0 / max(float(self.config.poll_interval_s), 1.0) * per_poll
+        return max(float(rules_weight), self.options.weight_budget_per_min - need)
+
+    async def _read_position(self, now: float) -> None:
+        """The read is stamped with the time and causal sequence at which it was *requested*: it reflects at least
+        every fill committed before that point."""
+        issued, seq = self.clock(), self._next_seq()
+        try:
+            self.position = await self.port.position()
+            self.position_at, self.position_seq = issued, seq
+        except Exception as exc:  # noqa: BLE001
+            self._error("POSITION_UNAVAILABLE", f"{type(exc).__name__}: {exc}", now)
+
+    def _position_fresh_for_ledger(self, now: float) -> bool:
+        """A known position requested after the latest committed fill (and within the freshness bound)."""
+        return (self.position is not None and not self._position_stale(now)
+                and self.position_seq > self.fills_commit_seq)
+
+    def _position_reconciled_now(self, now: float) -> bool:
+        """NG-CELL-001 (5): account position == ledger P, judged on a read that postdates the ledger's fills."""
+        if not self.bootstrapped or not self._position_fresh_for_ledger(now):
+            return False
+        ep = risk.endpoints_from_ledgers(self.effective_baseline, list(self.cells.values()))
+        return self.position.net_base == ep.P and not self.store_entry_blockers
+
+    async def _reread_position_for_release(self, now: float) -> None:
+        """A history commit with new fills makes the tick's earlier position read unusable for release; when a
+        cell waits only for condition (5), read the position again now (bounded by the weight budget) instead of
+        starving releases while fills keep arriving."""
+        if not self.bootstrapped or self.position_seq > self.fills_commit_seq:
+            return
+        waiting = any(ledger.current is not None and not _retry_only(ledger.current)
+                      and ledger.can_release(True).ok for ledger in self.cells.values())
+        weight = self.port.request_weight(ENDPOINT_ACCOUNT)
+        if waiting and self._can_spend(now, weight):
+            self._charge(now, weight)
+            await self._read_position(now)
 
     # ================================================================================== history
     async def _scan_history(self, now: float) -> None:
@@ -1099,6 +1405,7 @@ class NeutralGridEngine:
             return
         if self._walk_started_at is None:
             self._walk_started_at = now
+            self._walk_start_seq = self._next_seq()
         result = await self.scanner.scan()
         self._charge(now, result.weight_used)
         for stream, pages in result.pages_read.items():
@@ -1115,8 +1422,13 @@ class NeutralGridEngine:
             floor = _ms(walk_started) if walk_started is not None else _ms(now)
             self.meta.history_reset = {STREAM_TRADES: floor, STREAM_ORDERS: floor}
         if result.complete:
-            self.complete_scans.append(ScanRecord(started_at=walk_started if walk_started is not None else now,
-                                                  completed_at=now))
+            started = walk_started if walk_started is not None else now
+            self.complete_scans.append(ScanRecord(started_at=started, completed_at=now))
+            self._last_walk_start_seq = self._walk_start_seq
+            # A client-id-only WS signal cannot be matched to one trade row: a complete walk that started after it
+            # covered it (a trade-id signal stays until its row is committed, so real lag stays visible, AC-13).
+            self.ws_pending = {label: at for label, at in self.ws_pending.items()
+                               if at >= started or self._is_trade_label(label)}
         if self.bootstrapped:
             self._apply_history(result, now, in_progress)
         else:
@@ -1152,10 +1464,15 @@ class NeutralGridEngine:
                 return False
         return True
 
+    def _is_trade_label(self, label: str) -> bool:
+        """A ws_pending label is a trade id unless it names one of our CIDs."""
+        return not (label.isdigit() and int(label) in self.order_meta)
+
     def _remember_committed(self, result) -> None:
         domain = self.port.domain
         for row in result.new_trades:
             self.committed[STREAM_TRADES][row.dedupe_key(domain)] = trade_payload_fingerprint(row)
+            self._committed_trade_ids.add(row.trade_id_str)
             self.ws_pending.pop(row.trade_id_str, None)
             if row.own_client_order_id is not None:
                 self.ws_pending.pop(str(row.own_client_order_id), None)
@@ -1236,9 +1553,6 @@ class NeutralGridEngine:
                                                                         OrderState.INTENT):
                     s.set_leg_state(tx, rec.cid, OrderState.TERMINAL_UNKNOWN, reason="exact terminal row seen")
                 touched_terminal[rec.cid] = row
-            for fill in res.new_fills:
-                if fill.role == LegRole.ENTRY:
-                    self.meta.obligations.setdefault(f"{fill.cell_id}:{fill.generation}", now_ms)
             gaps = [c for c in conflicts if c.startswith("retention_gap")]
             others = [c for c in conflicts if not c.startswith("retention_gap")
                       and c not in self.meta.acknowledged_conflicts]
@@ -1257,6 +1571,15 @@ class NeutralGridEngine:
 
         res = s.apply_history_batch(None, rows, cursor_updates, transitions, batch_id=f"scan-{now_ms}")
         # Projection only after the commit succeeded.
+        committed_at = self.clock()
+        if res.new_fills:
+            self.fills_commit_seq = self._next_seq()           # the ledger P moved: earlier position reads are stale
+            for fill in res.new_fills:
+                self._cell_fill_commit_ms[fill.cell_id] = _ms(committed_at)
+        if touched_terminal:
+            seq = self._next_seq()
+            for cid in touched_terminal:
+                self.terminal_commit_seq[cid] = seq
         late_cids = {f.cid for f in res.late_fills}
         for fill in res.new_fills:
             ledger = self.cells.get(fill.cell_id)
@@ -1287,7 +1610,7 @@ class NeutralGridEngine:
                     del self.meta.history_reset[c_stream]
                 with s.transaction() as tx:
                     s.kv_set(tx, "engine_meta", self.meta.to_json())
-        self.last_history_commit_at = now
+        self.last_history_commit_at = committed_at
         self._refresh_store_facts()
 
     # ================================================================================== active list
@@ -1322,6 +1645,15 @@ class NeutralGridEngine:
                     continue
                 row = owned.get(leg.cid)
                 if row is not None:
+                    if leg.cid in self.terminal_rows:
+                        # The exact terminal row is committed: an active row requested before that commit is stale
+                        # (REST reads are not atomic) and is never recorded as live evidence against it.
+                        if self.active_seq < self.terminal_commit_seq.get(leg.cid, 0):
+                            continue
+                        if leg.state in FINAL_STATES:
+                            s.mark_manual_reconcile_required(
+                                tx, f"final order {leg.cid} ({leg.state.value}) is still active on the venue")
+                        continue
                     if leg.state in FINAL_STATES:
                         s.mark_manual_reconcile_required(tx, f"final order {leg.cid} ({leg.state.value}) is still "
                                                              f"active on the venue")
@@ -1391,12 +1723,15 @@ class NeutralGridEngine:
         dust_changes: List[Tuple[int, int, Decimal]] = []
         releases: List[int] = []
         rules_ok = not grid.rules_blockers(self.rules)
+        # NG-CELL-001 (5) judged now, on a position read that postdates every committed fill (not last tick's flag)
+        reconciled = self._position_reconciled_now(now)
+        self.position_reconciled = reconciled
         for ledger in self.cells.values():
             if rules_ok:
                 for gen, dust in ledger.refresh_dust(self.rules).items():
                     dust_changes.append((ledger.cell_id, gen, dust))
             if ledger.current is not None and not _retry_only(ledger.current) \
-                    and ledger.can_release(self.position_reconciled).ok:
+                    and ledger.can_release(reconciled).ok:
                 releases.append(ledger.cell_id)
         if not dust_changes and not releases:
             return
@@ -1412,7 +1747,7 @@ class NeutralGridEngine:
                 released.append((cell_id, gen))
             s.kv_set(tx, "engine_meta", self.meta.to_json())
         for cell_id, gen in released:
-            self.cells[cell_id].release(self.position_reconciled)
+            self.cells[cell_id].release(reconciled)
             self.reservations[cell_id] = 0
             self.persisted_cell_state[cell_id] = (CellState.IDLE.value, None, 0)
 
@@ -1437,9 +1772,9 @@ class NeutralGridEngine:
             self.position_reconciled = False
             return
         self.endpoints = risk.endpoints_from_ledgers(self.effective_baseline, list(self.cells.values()))
-        if self.position is None or self._position_stale(now) or (
-                self.last_history_commit_at is not None and self.position_at < self.last_history_commit_at):
-            # A position read older than the ledger cannot be compared with it (it may predate a committed fill).
+        if not self._position_fresh_for_ledger(now):
+            # A position requested before the latest fill commit cannot be compared with the ledger (it may predate
+            # a committed fill); the next read decides (NG-RISK-003).
             self.position_reconciled = False
             return
         venue = self.position.net_base
@@ -1455,7 +1790,7 @@ class NeutralGridEngine:
             self.position_gap_since = None
         elif self.position_gap_since is None:
             self.position_gap_since = now
-        self.position_reconciled = venue == ep.P and not self.store_entry_blockers
+        self.position_reconciled = self._position_reconciled_now(now)
 
     # ================================================================================== state
     def _outside_bounds(self) -> bool:
@@ -1481,8 +1816,7 @@ class NeutralGridEngine:
             if code in _FREEZES_BLOCKING_TP:
                 tp.append(f"FROZEN:{code}")
         entry.extend(f"STORE:{b}" for b in self.store_entry_blockers)
-        if any(c.kind != "LATE_FILL" for c in self.open_conflicts):
-            tp.append("HISTORY_CONFLICT")
+        self.tp_blocked_cells = self._scoped_tp_blocks()
         if not self.bootstrapped:
             entry.append("BASELINE_NOT_CONFIRMED")
             tp.append("BASELINE_NOT_CONFIRMED")
@@ -1577,10 +1911,51 @@ class NeutralGridEngine:
             state = EngineState.PAUSED
         else:
             state = EngineState.NORMAL
+        # Anti-flap (W4): after DEGRADED the engine returns to NORMAL only after N consecutive clean ticks; until
+        # then it stays DEGRADED (STABILIZING) and opens no new exposure, so engine_revision does not churn.
+        if state == EngineState.DEGRADED:
+            self._hold_normal_until_tick = self.ticks + self.options.normal_hysteresis_ticks
+        elif state == EngineState.NORMAL and self.ticks < self._hold_normal_until_tick:
+            state = EngineState.DEGRADED
+            entry.append("STABILIZING")
+        if state == EngineState.NORMAL:
             self.meta.ever_normal = True
             self.normal_since_start = True
         self.engine_state = state
-        self.reasons = sorted(set(entry) | set(tp))
+        self.reasons = sorted(set(entry) | set(tp) | {f"CELL_TP_BLOCKED:{c}:{why}"
+                                                      for c, why in sorted(self.tp_blocked_cells.items())})
+
+    def _scoped_tp_blocks(self) -> Dict[int, str]:
+        """Cells whose TPs must wait: a store conflict naming one of their CIDs, or (under a ledger-invariant
+        freeze) a cell whose own ledger or durable quantities are inconsistent. A conflict without an own CID and
+        an unattributable invariant freeze block only new entries (FROZEN); the store still refuses any TP above
+        the history-confirmed obligation."""
+        blocked: Dict[int, str] = {}
+        for c in self.open_conflicts:
+            if c.kind == "LATE_FILL" or c.cid not in self.order_meta:
+                continue
+            blocked.setdefault(self.order_meta[c.cid].cell_id, f"HISTORY_CONFLICT:{c.kind}")
+        if FREEZE_INVARIANT in self.meta.freezes:
+            for cell_id, why in self._invariant_cells().items():
+                blocked.setdefault(cell_id, f"FROZEN:LEDGER_INVARIANT:{why}")
+        return blocked
+
+    def _invariant_cells(self) -> Dict[int, str]:
+        if self._invariant_cells_cache is None:
+            bad: Dict[int, str] = {}
+            for cell_id, ledger in self.cells.items():
+                errors = ledger.check_invariants()
+                if errors:
+                    bad[cell_id] = errors[0][:200]
+            for problem in (self.store.verify_ledger() if self.store is not None else []):
+                m = re.match(r"leg (\d+):", problem) or None
+                if m and int(m.group(1)) in self.order_meta:
+                    bad.setdefault(self.order_meta[int(m.group(1))].cell_id, problem[:200])
+                m = re.match(r"cycle [^/]+/(\d+)/\d+:", problem)
+                if m:
+                    bad.setdefault(int(m.group(1)), problem[:200])
+            self._invariant_cells_cache = bad
+        return self._invariant_cells_cache
 
     # ================================================================================== planning
     def _slot_admission(self) -> Optional[admission.AdmissionPlan]:
@@ -1613,28 +1988,151 @@ class NeutralGridEngine:
             ledger.next_entry_identity()
         except LedgerError as exc:
             return False, f"LOCKED:{exc}"
+        # (the full-Q quantity check is admission's FULL_Q_INVALID, also before any intent)
+        why = self._latched(ledger.cell_id, LegRole.ENTRY) or self._off_tick(spec.entry_price)
+        if why:
+            self.cell_blockers[ledger.cell_id] = why
+            return False, why
         if spec.entry_side == Side.BUY and (self.ask is None or spec.entry_price >= self.ask):
             return False, "ENTRY_WOULD_CROSS"
         if spec.entry_side == Side.SELL and (self.bid is None or spec.entry_price <= self.bid):
             return False, "ENTRY_WOULD_CROSS"
         return True, None
 
+    def _qty_blocker(self, qty: Decimal, price: Decimal) -> Optional[str]:
+        """The pre-send quantity check, run in planning before any intent/CID (never discovered after commit)."""
+        if self.rules is None or grid.rules_blockers(self.rules):
+            return None
+        why = grid.order_qty_blocker(qty, price, self.rules)
+        return None if why is None else f"PRESEND_QTY:{why}"
+
+    def _off_tick(self, price: Decimal) -> Optional[str]:
+        """A fixed grid price that is not on the venue's current tick can never be placed: blocked in planning,
+        never re-issued as a dead intent every tick (NG-DB-005, AC-34)."""
+        if self.rules is None or grid.rules_blockers(self.rules):
+            return None
+        try:
+            grid.to_ticks(price, self.rules.tick_size)
+        except grid.GridValidationError:
+            return f"PRICE_NOT_ON_TICK:{price}@{self.rules.tick_size}"
+        return None
+
+    # ------------------------------------------------------------------ reject latches (NG-DB-005)
+    def _rules_fingerprint(self) -> str:
+        r = self.rules
+        if r is None:
+            return f"none|{self.fingerprint}"
+        return "|".join(str(x) for x in (r.tick_size, r.size_step, r.min_base, r.min_notional, r.max_base,
+                                         r.supports_limit, r.supports_post_only, self.fingerprint))
+
+    def _latch(self, cid: int, reason: str) -> None:
+        """A pre-send rejection or a definitive venue reject latches the cell/role: no new revision until the
+        trading rules/config change or an exponential backoff elapses (never a new dead intent every tick)."""
+        meta = self.order_meta.get(cid)
+        if meta is None:
+            return
+        key = f"{meta.cell_id}:{meta.role}"
+        previous = self.meta.reject_latches.get(key) or {}
+        failures = int(previous.get("failures", 0)) + 1
+        venue = reason.startswith("VENUE_REJECT")
+        # A first definitive venue reject may be transient (e.g. post-only would cross): one immediate new revision
+        # (AC-56); repeated rejects and deterministic pre-send refusals back off exponentially.
+        exponent = failures - 2 if venue else failures - 1
+        backoff = 0.0 if exponent < 0 else min(self.options.reject_backoff_initial_s * 2 ** exponent,
+                                               self.options.reject_backoff_max_s)
+        self.meta.reject_latches[key] = {"reason": reason[:300], "fingerprint": self._rules_fingerprint(),
+                                         "retry_at_ms": self._now_ms() + int(backoff * 1000), "failures": failures}
+
+    def _unlatch(self, cid: int) -> None:
+        meta = self.order_meta.get(cid)
+        if meta is not None:
+            self.meta.reject_latches.pop(f"{meta.cell_id}:{meta.role}", None)
+
+    def _latched(self, cell_id: int, role: LegRole) -> Optional[str]:
+        key = f"{cell_id}:{role.value}"
+        latch = self.meta.reject_latches.get(key)
+        if latch is None:
+            return None
+        if latch.get("fingerprint") != self._rules_fingerprint():
+            del self.meta.reject_latches[key]               # rules/config changed: try again
+            return None
+        if str(latch.get("reason", "")).startswith("PRESEND"):
+            # deterministic pre-send refusal: no new revision until the rules/config fingerprint changes
+            return f"{latch.get('reason')} (until the trading rules or config change)"
+        wait_ms = int(latch.get("retry_at_ms", 0)) - self._now_ms()
+        if wait_ms <= 0:
+            return None                                     # backoff elapsed: one more attempt (failures kept)
+        return f"{latch.get('reason')} (retry in {wait_ms / 1000:g} s)"
+
+    def _arming_min(self, entry: Leg) -> Optional[Decimal]:
+        meta = self.order_meta.get(entry.cid) if entry.cid is not None else None
+        return None if meta is None or meta.arming_min_tp is None else Decimal(meta.arming_min_tp)
+
     def _tp_candidates(self, now_ms: int) -> List[Tuple[router.RouterIntent, int, Any]]:
-        """TP dispatch items (an aggregate item carries its exact per-generation ``allocation``, AC-39); the
-        router's TP FIFO sequence is the persisted time the oldest covered obligation appeared."""
+        """TP dispatch items (an aggregate item carries its exact per-generation ``allocation``, AC-39).
+
+        The router's TP FIFO sequence / SLO clock is the moment the obligation became dispatchable: the history
+        commit of the fill that made it dispatchable (not the first below-minimum fill). While the cell's entry is
+        live, a TP smaller than the minimum valid at arming time accumulates inside the cell's reserved slots
+        (a runtime minimum decrease must not create more concurrent TPs than were reserved, nor emergency-cancel
+        other cells' entries); once the entry is final everything is dispatched."""
         out = []
         for cell_id, ledger in sorted(self.cells.items()):
             plan = ledger.tp_obligation_to_dispatch(self.rules)
             if plan.blocker:
                 self.cell_blockers[cell_id] = plan.blocker
+            if cell_id in self.tp_blocked_cells:
+                self.cell_blockers[cell_id] = self.tp_blocked_cells[cell_id]
+                continue
+            if not plan.items:
+                continue
+            why = (self._latched(cell_id, LegRole.TP)
+                   or self._off_tick(ledger.spec.tp_price))
+            if why:
+                # durable, visible blocker; the obligation keeps its queue age (NG-CELL-002, AC-34)
+                self.cell_blockers[cell_id] = why
+                for item in plan.items:
+                    for g in ([g for g, _ in item.allocation] if item.allocation else [item.generation]):
+                        self.meta.obligations.setdefault(f"{cell_id}:{g}",
+                                                         self._cell_fill_commit_ms.get(cell_id, now_ms))
+                continue
             for index, item in enumerate(plan.items):
+                qty_why = self._qty_blocker(item.qty, ledger.spec.tp_price)
+                if qty_why:
+                    self.cell_blockers[cell_id] = qty_why
+                    continue
+                if not item.allocation:
+                    cycle = next(c for c in ledger.cycles if c.generation == item.generation)
+                    live_entry = next((e for e in cycle.entries if not e.is_final), None)
+                    arming = self._arming_min(live_entry) if live_entry is not None else None
+                    if arming is not None and item.qty < arming:
+                        self.cell_blockers[cell_id] = f"TP_ACCUMULATING:{item.qty}<{arming} while entry live"
+                        continue
                 gens = [g for g, _ in item.allocation] if item.allocation else [item.generation]
-                since = min(self.meta.obligations.setdefault(f"{cell_id}:{g}", now_ms) for g in gens)
+                start = self._cell_fill_commit_ms.get(cell_id, now_ms)
+                since = min(self.meta.obligations.setdefault(f"{cell_id}:{g}", start) for g in gens)
                 intent = router.RouterIntent(key=f"tp:{cell_id}:{item.generation}:{index}",
                                              side=ledger.spec.tp_side, price=ledger.spec.tp_price, qty=item.qty,
                                              role=LegRole.TP, cell_id=cell_id, seq=since)
                 out.append((intent, cell_id, item))
         return out
+
+    def _pending_cancel_outbox(self, cid: int) -> bool:
+        return any(o.kind == "CANCEL" and o.status == "PENDING" for o in self.store.outbox_for_cid(cid))
+
+    def _risk_reducing_cancels(self, cancels: Dict[int, str], now: float) -> None:
+        """Cancels that only reduce exposure: allowed while frozen/blocked (never while persistence fails or before
+        startup reconciliation): outside-bounds entries, due cancel retries, committed-but-unsent cancels."""
+        outside = self._outside_bounds()
+        for leg in self.non_final_legs():
+            if leg.cid is None:
+                continue
+            if outside and leg.identity.role == LegRole.ENTRY and leg.state in CANCELLABLE:
+                cancels.setdefault(leg.cid, "OUTSIDE_BOUNDS")
+            elif self._cancel_retry_due(leg, now):
+                cancels.setdefault(leg.cid, "CANCEL_RETRY")
+            elif leg.state == OrderState.CANCEL_PENDING and self._pending_cancel_outbox(leg.cid):
+                cancels.setdefault(leg.cid, "RESUME_PENDING_CANCEL")
 
     async def _act(self, now: float) -> None:
         self.cell_blockers = {}
@@ -1646,7 +2144,8 @@ class NeutralGridEngine:
         if self.meta.stop_requested_ms is not None:
             await self._withdraw_pending_intents("STOP")
             for leg in self.non_final_legs():
-                if leg.state in CANCELLABLE or self._cancel_retry_due(leg, now):
+                if leg.state in CANCELLABLE or self._cancel_retry_due(leg, now) or (
+                        leg.state == OrderState.CANCEL_PENDING and self._pending_cancel_outbox(leg.cid)):
                     cancels[leg.cid] = "STOP"
             await self._dispatch_cancels(cancels, now)
             self.admission_plan = self._slot_admission()
@@ -1654,26 +2153,18 @@ class NeutralGridEngine:
         if self.tp_blockers:
             self.admission_plan = self._slot_admission()
             if "PERSISTENCE_FAILURE" not in self.tp_blockers and self.startup_reconciled:
-                for leg in self.non_final_legs():
-                    if self._cancel_retry_due(leg, now):
-                        cancels[leg.cid] = "CANCEL_RETRY"
+                self._risk_reducing_cancels(cancels, now)
                 await self._dispatch_cancels(cancels, now)
             return
-        await self._resume_pending_intents(now)
-        if self._outside_bounds():
-            for leg in self.non_final_legs():
-                if leg.identity.role == LegRole.ENTRY and leg.state in CANCELLABLE:
-                    cancels[leg.cid] = "OUTSIDE_BOUNDS"
-        for leg in self.non_final_legs():
-            if self._cancel_retry_due(leg, now):
-                cancels[leg.cid] = "CANCEL_RETRY"
+        self._risk_reducing_cancels(cancels, now)
         plan = self._slot_admission()
         self.admission_plan = plan
         if plan is None:
+            await self._resume_pending_intents(now)
             await self._dispatch_cancels(cancels, now)
             return
         self._persist_reservations(plan)
-        now_ms = _ms(now)
+        now_ms = self._now_ms()
         tp_items = self._tp_candidates(now_ms)
         entry_items = []
         for rank, cell_id in enumerate(plan.newly_armed):
@@ -1693,17 +2184,23 @@ class NeutralGridEngine:
                                     else "ENTRIES_BLOCKED",
                                     owed=risk.obligation_totals(list(self.cells.values())))
         self.router_plan = rplan
+        blocked_now: Dict[str, str] = {}
         for action in rplan.actions:
             if action.kind == router.ActionKind.CANCEL:
                 cancels.setdefault(int(action.key), action.reason)
             elif action.kind == router.ActionKind.BLOCKED:
-                self.meta.freezes.setdefault(FREEZE_RISK_BLOCKED, action.reason)
+                self.cell_blockers[int(action.key.split(":")[1])] = action.reason
+                blocked_now[action.key] = action.reason
             elif action.kind == router.ActionKind.WAIT:
                 self.cell_blockers.setdefault(int(action.key.split(":")[1]), action.reason)
-        for key in rplan.withdraws:
-            await self._withdraw(int(key), "ROUTER_WITHDRAW")
-        await self._dispatch_cancels(cancels, now)
+        if blocked_now:
+            # Operator-required freeze, detailed per obligation (TP key -> reason), cleared by ack_risk_blocked.
+            self.meta.risk_blocked.update(blocked_now)
+            self.meta.freezes[FREEZE_RISK_BLOCKED] = "; ".join(
+                f"{k}={v}" for k, v in sorted(self.meta.risk_blocked.items()))[:1900]
         submits = set(rplan.submits)
+        # 1. Every router-approved TP intent is committed durably BEFORE any transport is awaited (NG-CELL-002 SLO).
+        ready: List[Tuple[int, int, SubmitRequest]] = []
         for intent, cell_id, item in tp_items:
             if intent.key not in submits:
                 continue
@@ -1713,8 +2210,17 @@ class NeutralGridEngine:
             if len(self.non_final_legs()) >= plan.slots.cap:
                 self.cell_blockers.setdefault(cell_id, "TP_WAITS_VENUE_CAP")
                 continue
-            await self._submit(self.cells[cell_id], LegRole.TP, item.generation, item.qty, now, since_ms=intent.seq,
-                               allocation=item.allocation)
+            committed = self._commit_intent(self.cells[cell_id], LegRole.TP, item.generation, item.qty, now,
+                                            since_ms=intent.seq, allocation=item.allocation)
+            if committed is not None:
+                ready.append(committed)
+        # 2. Transports: exits first, then withdrawals, resumed intents, cancels and finally new entries.
+        for cid, outbox_id, req in ready:
+            await self._dispatch_intent(cid, outbox_id, req)
+        for key in rplan.withdraws:
+            await self._withdraw(int(key), "ROUTER_WITHDRAW")
+        await self._resume_pending_intents(now)
+        await self._dispatch_cancels(cancels, now)
         for intent in entry_items:
             if intent.key not in submits:
                 continue
@@ -1784,14 +2290,26 @@ class NeutralGridEngine:
     async def _submit(self, ledger: CellLedger, role: LegRole, generation: Optional[int], qty: Decimal, now: float,
                       since_ms: Optional[int] = None, reserved_slots: int = 0,
                       allocation: Optional[Tuple[Tuple[int, Decimal], ...]] = None) -> bool:
-        """Intent + CID + reservation committed BEFORE transport; result committed after (NG-DB-002).
+        committed = self._commit_intent(ledger, role, generation, qty, now, since_ms=since_ms,
+                                        reserved_slots=reserved_slots, allocation=allocation)
+        if committed is None:
+            return False
+        await self._dispatch_intent(*committed)
+        return True
+
+    def _commit_intent(self, ledger: CellLedger, role: LegRole, generation: Optional[int], qty: Decimal, now: float,
+                       since_ms: Optional[int] = None, reserved_slots: int = 0,
+                       allocation: Optional[Tuple[Tuple[int, Decimal], ...]] = None
+                       ) -> Optional[Tuple[int, int, SubmitRequest]]:
+        """Intent + CID + reservation committed BEFORE transport; the result is committed after (NG-DB-002).
+        Returns ``(cid, outbox_id, request)`` to dispatch, or None when the store refused the intent.
 
         An aggregate TP (``allocation``) is hosted by its newest generation; the exact per-generation shares are
         stored durably with the intent (``allocations`` rows) and mirrored on the WS-A leg (AC-39)."""
         s = self.store
         rules = self.rules
         spec = ledger.spec
-        now_ms = _ms(now)
+        now_ms = self._now_ms()
         if role == LegRole.ENTRY:
             order_type = self.config.entry_order_type
             side, price, expiry_ms = spec.entry_side, spec.entry_price, None
@@ -1825,6 +2343,8 @@ class NeutralGridEngine:
                     raise LedgerError(f"identity drift {leg.identity} != {identity}")
                 meta = OrderMeta(cid=cid, cell_id=ledger.cell_id, generation=identity.generation, role=role.value,
                                  intent_ms=now_ms, seq=seq, obligation_ms=since_ms)
+                if role == LegRole.ENTRY:
+                    meta.arming_min_tp = str(grid.min_valid_order_qty(rules, spec.tp_price))
                 if role == LegRole.TP:
                     remaining = ledger.tp_obligation_to_dispatch(rules)
                     still_owed = {g for i in remaining.items
@@ -1837,19 +2357,23 @@ class NeutralGridEngine:
         except EntryBlockedError as exc:
             self.reload_needed = True
             self.cell_blockers[ledger.cell_id] = f"STORE_ENTRY_BLOCKED:{exc}"
-            return False
+            return None
         except InvalidTransitionError as exc:
             # The durable ledger refuses this intent (e.g. a TP for a released cycle re-opened by late evidence):
             # nothing was sent; keep the obligation visible on the cell instead of freezing every cell.
             self.reload_needed = True
             self.cell_blockers[ledger.cell_id] = f"STORE_REFUSED_INTENT:{exc}"
             self._error("STORE_REFUSED_INTENT", f"cell {ledger.cell_id}: {exc}", now)
-            return False
+            return None
         except CidAllocationError as exc:
             self.reload_needed = True
             self.meta.freezes[FREEZE_CID] = f"{type(exc).__name__}: {exc}"
+            self._sticky_freezes[FREEZE_CID] = self.meta.freezes[FREEZE_CID]
+            if isinstance(exc, CidCollisionError):
+                self.meta.colliding_cid = exc.cid
+                self._sticky_meta["colliding_cid"] = exc.cid
             self._error("CID_ALLOCATION", str(exc), now)
-            return False
+            return None
         except (StoreError, LedgerError):
             self.reload_needed = True
             raise
@@ -1860,17 +2384,18 @@ class NeutralGridEngine:
                                                          self.reservations[ledger.cell_id])
         self._submits_this_tick += 1
         if role == LegRole.TP and since_ms is not None:
-            self.tp_latencies.append((cid, (now_ms - since_ms) / 1000))
-        await self._dispatch_intent(cid, intent.outbox_id, req)
-        return True
+            # measured at the actual durable commit, against the moment the obligation became dispatchable
+            self.tp_latencies.append((cid, max(0, self._now_ms() - since_ms) / 1000))
+        return cid, intent.outbox_id, req
 
     async def _dispatch_intent(self, cid: int, outbox_id: int, req: SubmitRequest) -> None:
         s = self.store
         blocker = self._pre_send_blocker(req)
         if blocker is not None:
-            # Proven no transport call: the intent is released (NG-DB-005, AC-56).
+            # Proven no transport call: the intent is released (NG-DB-005, AC-56) and the cell/role latched.
             s.record_transport_result(None, cid, TransportResult(TransportOutcome.NOT_SENT,
                                                                  f"pre-send validation: {blocker}"), kind="SUBMIT")
+            self._latch(cid, f"PRESEND:{blocker}")
             self._mirror(cid)
             return
         with s.transaction() as tx:
@@ -1883,6 +2408,10 @@ class NeutralGridEngine:
         meta = self.order_meta.get(cid)
         if meta is not None and result.detail:
             meta.transport_detail = result.detail[:500]
+        if result.outcome == TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL:
+            self._latch(cid, f"VENUE_REJECT:{result.detail or 'definitive zero-fill reject'}")
+        elif result.outcome == TransportOutcome.ACCEPTED:
+            self._unlatch(cid)
         self._mirror(cid)
 
     async def _withdraw(self, cid: int, reason: str) -> None:
@@ -1916,10 +2445,6 @@ class NeutralGridEngine:
                 await self._withdraw(leg.cid, "entries blocked after restart")
                 continue
             await self._dispatch_intent(leg.cid, pending.id, self.store.leg(leg.cid).submit_request())
-        for leg in self.non_final_legs():
-            if leg.cid is not None and leg.state == OrderState.CANCEL_PENDING and any(
-                    o.kind == "CANCEL" and o.status == "PENDING" for o in self.store.outbox_for_cid(leg.cid)):
-                await self._dispatch_cancels({leg.cid: "RESUME_PENDING_CANCEL"}, now)
 
     async def _dispatch_cancels(self, cancels: Dict[int, str], now: float) -> None:
         s = self.store
@@ -1956,9 +2481,10 @@ class NeutralGridEngine:
             return
         open_legs = self.non_final_legs()
         previous = self.meta.stop_outcome
-        if not open_legs and self.history_complete:
+        if not open_legs and self.history_complete and self._position_fresh_for_ledger(now):
+            # STOPPED / STOPPED_WITH_INVENTORY only on a fresh known position; the baseline B counts as inventory.
             inventory = any(c.E != c.X or c.dust > 0 for ledger in self.cells.values() for c in ledger.cycles)
-            if self.position is not None and self.position.net_base != 0:
+            if self.position.net_base != 0 or (self.effective_baseline or ZERO) != 0:
                 inventory = True
             outcome: Optional[EngineState] = (EngineState.STOPPED_WITH_INVENTORY if inventory
                                               else EngineState.STOPPED)

@@ -25,6 +25,13 @@ AUDIT_ACTIONS = (
     "ack_risk_blocked",         # NG-RISK-002: operator acknowledged a cap/obligation conflict
     "resolve_unknown_submit",   # AC-16/17: audited "did not land" for a zero-fill SUBMIT_UNKNOWN
 )
+# Audited operator actions of the launcher / CLI path that the web UI does not offer (yet): same semantics,
+# accepted by the engine; ``AUDIT_ACTIONS`` stays the web contract.
+EXTENDED_AUDIT_ACTIONS = (
+    "retire_colliding_cid",     # AC-43: audited retire of a CID a foreign order owns; clears the CID freeze
+    "migrate_grid",             # AC-52: audited replacement of a quiescent grid (old cycles kept, no reset)
+)
+ALL_AUDIT_ACTIONS = AUDIT_ACTIONS + EXTENDED_AUDIT_ACTIONS
 
 ALL_KINDS = tuple(k.value for k in CommandKind)
 
@@ -49,8 +56,8 @@ def validate_kind(kind: str, payload: Dict[str, Any]) -> Optional[str]:
         return "confirm_baseline requires expected_initial_position"
     if kind == CommandKind.BASELINE_AUDIT.value:
         action = payload.get("action", AUDIT_ACTION_BASELINE)
-        if action not in AUDIT_ACTIONS:
-            return f"baseline_audit action must be one of {AUDIT_ACTIONS}"
+        if action not in ALL_AUDIT_ACTIONS:
+            return f"baseline_audit action must be one of {ALL_AUDIT_ACTIONS}"
         if action == AUDIT_ACTION_BASELINE and "observed_position" not in payload:
             return "baseline audit requires observed_position"
         if action == "resolve_unknown_submit" and "cid" not in payload:
