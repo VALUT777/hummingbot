@@ -42,13 +42,13 @@
   var COMMAND_STATUS = { QUEUED: "в очереди", APPLIED: "применена", REJECTED: "отклонена", CONFLICT: "конфликт ревизий" };
   var COMMAND_NAMES = {
     start: "Старт", pause: "Пауза", resume: "Продолжить", stop: "Стоп",
-    confirm_baseline: "Подтверждение baseline", baseline_audit: "Аудит baseline", manual_reconcile: "Ручная сверка"
+    confirm_baseline: "Подтверждение baseline", baseline_audit: "Аудит / ручная сверка"
   };
-  var RECONCILE_ACTIONS = {
+  var AUDIT_ACTIONS = {
+    baseline: "Позиция после ручной сделки/дрейфа: пересверить baseline (rebase)",
     ack_late_evidence: "Поздние исполнения проверены (снять заморозку LATE_EVIDENCE)",
     ack_history_conflict: "Конфликт истории проверен (HISTORY_CONFLICT)",
     ack_retention_gap: "Разрыв хранения истории: ручная сверка без сброса (RETENTION_GAP)",
-    ack_invariant: "Нарушение инварианта журнала проверено (LEDGER_INVARIANT)",
     ack_risk_blocked: "Блокировка по риску проверена (RISK_BLOCKED)",
     resolve_unknown_submit: "Ордер с неизвестным итогом не попал на биржу (по CID)"
   };
@@ -60,10 +60,8 @@
       "ордеров по истории; иначе — STOP_UNCERTAIN.",
     confirm_baseline: "Подтвердите, что фактическая позиция после стабильного снимка и полного среза истории равна B. " +
       "Это делается один раз при первом bootstrap.",
-    baseline_audit: "Аудит после ручной сделки/дрейфа позиции. Он не меняет обязательства ячеек и не скрывает " +
-      "неизвестные исполнения.",
-    manual_reconcile: "Снимает заморозку только после вашего аудита; запись попадает в журнал. Позиция, обязательства " +
-      "и журнал не сбрасываются."
+    baseline_audit: "Аудит оператора после ручной сделки, дрейфа позиции или заморозки. Запись попадает в журнал " +
+      "аудита; обязательства ячеек, позиция и журнал не сбрасываются, неизвестные исполнения не скрываются."
   };
 
   var S = {
@@ -512,23 +510,25 @@
       fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-confirm" }),
         "Подтверждаю: фактическая позиция равна B."]));
     } else if (kind === "baseline_audit") {
-      fields.appendChild(el("label", { for: "f-observed", text: "Наблюдаемая позиция на бирже, со знаком" }));
-      fields.appendChild(el("input", { id: "f-observed", inputmode: "decimal", spellcheck: "false" }));
-      fields.appendChild(el("label", { for: "f-note", text: "Причина (обязательно)" }));
-      fields.appendChild(el("input", { id: "f-note", maxlength: "500" }));
-      fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-ack" }),
-        "Понимаю: аудит не меняет обязательства ячеек и не скрывает неизвестные исполнения."]));
-    } else if (kind === "manual_reconcile") {
       fields.appendChild(el("label", { for: "f-action", text: "Что проверено" }));
       var sel = el("select", { id: "f-action" });
-      Object.keys(RECONCILE_ACTIONS).forEach(function (a) { sel.appendChild(el("option", { value: a, text: RECONCILE_ACTIONS[a] })); });
+      Object.keys(AUDIT_ACTIONS).forEach(function (a) { sel.appendChild(el("option", { value: a, text: AUDIT_ACTIONS[a] })); });
       fields.appendChild(sel);
-      fields.appendChild(el("label", { for: "f-cid", text: "Client order ID (только для «не попал на биржу»)" }));
-      fields.appendChild(el("input", { id: "f-cid", inputmode: "numeric", spellcheck: "false", maxlength: "20" }));
+      var obsLabel = el("label", { for: "f-observed", text: "Наблюдаемая позиция на бирже, со знаком (для rebase)" });
+      var obs = el("input", { id: "f-observed", inputmode: "decimal", spellcheck: "false" });
+      var cidLabel = el("label", { for: "f-cid", text: "Client order ID (для «не попал на биржу»)" });
+      var cid = el("input", { id: "f-cid", inputmode: "numeric", spellcheck: "false", maxlength: "20" });
+      [obsLabel, obs, cidLabel, cid].forEach(function (n) { fields.appendChild(n); });
+      var sync = function () {
+        obsLabel.hidden = obs.hidden = sel.value !== "baseline";
+        cidLabel.hidden = cid.hidden = sel.value !== "resolve_unknown_submit";
+      };
+      sel.addEventListener("change", sync);
+      sync();
       fields.appendChild(el("label", { for: "f-note", text: "Что именно проверено (обязательно)" }));
       fields.appendChild(el("input", { id: "f-note", maxlength: "500" }));
       fields.appendChild(el("label", { cls: "check" }, [el("input", { type: "checkbox", id: "f-ack" }),
-        "Подтверждаю, что аудит проведён по истории биржи."]));
+        "Подтверждаю: аудит проведён по истории биржи и не меняет обязательства ячеек."]));
     } else {
       fields.appendChild(el("label", { for: "f-reason", text: "Комментарий (необязательно)" }));
       fields.appendChild(el("input", { id: "f-reason", maxlength: "500" }));
@@ -541,12 +541,9 @@
       return { expected_initial_position: $("f-baseline").value.trim(), confirm: $("f-confirm").checked };
     }
     if (kind === "baseline_audit") {
-      return { observed_position: $("f-observed").value.trim(), note: $("f-note").value.trim(), acknowledge: $("f-ack").checked };
-    }
-    if (kind === "manual_reconcile") {
       var payload = { action: $("f-action").value, note: $("f-note").value.trim(), acknowledge: $("f-ack").checked };
-      var cid = $("f-cid").value.trim();
-      if (cid) payload.cid = cid;
+      if (payload.action === "baseline") payload.observed_position = $("f-observed").value.trim();
+      if (payload.action === "resolve_unknown_submit") payload.cid = $("f-cid").value.trim();
       return payload;
     }
     var reason = $("f-reason") ? $("f-reason").value.trim() : "";

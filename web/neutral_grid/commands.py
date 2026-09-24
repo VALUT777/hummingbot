@@ -31,14 +31,14 @@ from web.neutral_grid.views import is_engine_active, snapshot_revisions
 
 IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_\-]{16,128}\Z")
 MAX_NOTE = 500
-# Engine-level extra kind (engine ``commands.EXTRA_KIND_MANUAL_RECONCILE``; contracts.CommandKind is frozen).
-MANUAL_RECONCILE = "manual_reconcile"
-MANUAL_RECONCILE_ACTIONS = (
-    "ack_late_evidence", "ack_history_conflict", "ack_retention_gap", "ack_invariant", "ack_risk_blocked",
+# Operator audits are ``baseline_audit`` commands whose payload ``action`` selects what was audited (engine
+# ``commands.AUDIT_ACTIONS``; the store accepts only ``contracts.CommandKind``). None of them resets the ledger.
+AUDIT_ACTION_BASELINE = "baseline"
+AUDIT_ACTIONS = (
+    AUDIT_ACTION_BASELINE, "ack_late_evidence", "ack_history_conflict", "ack_retention_gap", "ack_risk_blocked",
     "resolve_unknown_submit",
 )
 COMMAND_KINDS = {k.value: k.value for k in CommandKind}
-COMMAND_KINDS[MANUAL_RECONCILE] = MANUAL_RECONCILE
 MAX_CID = (1 << 48) - 1
 
 
@@ -107,8 +107,7 @@ class CommandService:
             return self._error(400, "bad_payload", "payload должен быть объектом.")
         supported = getattr(self._gateway, "supported_kinds", None)
         if supported is not None and kind_raw not in supported:
-            return self._error(422, "unsupported_kind",
-                               "Хранилище движка не принимает эту команду (см. trace: manual_reconcile).",
+            return self._error(422, "unsupported_kind", "Хранилище движка не принимает эту команду.",
                                allowed=sorted(supported))
 
         async with self._lock:
@@ -209,23 +208,18 @@ class CommandService:
                 raise ValueError("Нужно явное подтверждение (confirm=true).")
             return {"expected_initial_position": format(baseline, "f"), "confirm": True}
         if kind == CommandKind.BASELINE_AUDIT.value:
-            observed = parse_signed_decimal(payload.get("observed_position"))
+            action = payload.get("action", AUDIT_ACTION_BASELINE)
+            if action not in AUDIT_ACTIONS:
+                raise ValueError("Недопустимое действие аудита.")
             note = _note(payload)
             if not note:
-                raise ValueError("Для аудита baseline нужна причина (note).")
+                raise ValueError("Для аудита нужна причина (note) для журнала.")
             if payload.get("acknowledge") is not True:
-                raise ValueError("Нужно подтвердить, что аудит не меняет обязательства ячеек (acknowledge=true).")
-            return {"observed_position": format(observed, "f"), "note": note, "acknowledge": True}
-        if kind == MANUAL_RECONCILE:
-            action = payload.get("action")
-            if action not in MANUAL_RECONCILE_ACTIONS:
-                raise ValueError("Недопустимое действие ручной сверки.")
-            note = _note(payload)
-            if not note:
-                raise ValueError("Для ручной сверки нужна причина (note) для журнала аудита.")
-            if payload.get("acknowledge") is not True:
-                raise ValueError("Нужно подтвердить проведённый аудит (acknowledge=true).")
+                raise ValueError("Нужно подтвердить, что аудит проведён и не меняет обязательства ячеек "
+                                 "(acknowledge=true).")
             normalized = {"action": action, "note": note, "acknowledge": True}
+            if action == AUDIT_ACTION_BASELINE:
+                normalized["observed_position"] = format(parse_signed_decimal(payload.get("observed_position")), "f")
             if action == "resolve_unknown_submit":
                 cid = payload.get("cid")
                 if not isinstance(cid, str) or not cid.isdigit() or int(cid) > MAX_CID:

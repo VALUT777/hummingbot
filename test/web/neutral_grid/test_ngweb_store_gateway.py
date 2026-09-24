@@ -154,12 +154,13 @@ async def test_audit_events_from_store_paginate(make_web, store_pair):
 
 
 @pytest.mark.asyncio
-async def test_manual_reconcile_kind_rejected_when_store_does_not_accept_it(make_web, store_pair):
+async def test_audit_action_reaches_store_queue(make_web, store_pair):
     writer, gateway = store_pair
     _commit_snapshot(writer, "FROZEN")
     web = await make_web(gateway=gateway)
     await web.login()
-    resp = await web.command("manual_reconcile", "store-reconcile-001",
-                             {"action": "ack_invariant", "note": "x", "acknowledge": True}, cfg=0, eng=0)
-    assert resp.status == 422 and (await resp.json())["error"] == "unsupported_kind"
-    assert writer.list_commands() == []
+    resp = await web.command("baseline_audit", "store-audit-000001",
+                             {"action": "ack_history_conflict", "note": "проверено", "acknowledge": True}, cfg=0, eng=0)
+    assert resp.status == 202, await resp.text()
+    [row] = writer.list_commands()
+    assert row.kind == "baseline_audit" and row.payload["action"] == "ack_history_conflict"

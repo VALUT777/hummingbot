@@ -278,7 +278,8 @@ async def test_all_operator_commands_enqueue_normalized_payloads(make_web):
         "confirm_baseline": ({"expected_initial_position": "0.00", "confirm": True},
                              {"expected_initial_position": "0.00", "confirm": True}),
         "baseline_audit": ({"observed_position": "+10", "note": "ручная сделка", "acknowledge": True},
-                           {"observed_position": "10", "note": "ручная сделка", "acknowledge": True}),
+                           {"action": "baseline", "observed_position": "10", "note": "ручная сделка",
+                            "acknowledge": True}),
     }
     for i, (kind, (payload, expected)) in enumerate(cases.items()):
         resp = await web.command(kind, f"op-cmd-{kind}-{i}".ljust(20, "0"), payload)
@@ -341,33 +342,40 @@ async def test_explicit_started_flag_wins_over_reasons(make_web):
 
 
 @pytest.mark.asyncio
-async def test_manual_reconcile_commands(make_web):
+async def test_audit_actions_are_baseline_audit_commands(make_web):
     web = await make_web(sample_snapshot("FROZEN"))
     await web.login()
-    ok = await web.command("manual_reconcile", "reconcile-late-0001",
+    ok = await web.command("baseline_audit", "audit-late-00000001",
                            {"action": "ack_late_evidence", "note": "проверено по истории", "acknowledge": True})
     assert ok.status == 202
     expected = {"action": "ack_late_evidence", "note": "проверено по истории", "acknowledge": True}
     assert (await ok.json())["command"]["payload"] == expected
-    cid = await web.command("manual_reconcile", "reconcile-cid-00001",
+    cid = await web.command("baseline_audit", "audit-cid-000000001",
                             {"action": "resolve_unknown_submit", "note": "нет в истории", "acknowledge": True,
                              "cid": "281474976710600"})
     assert cid.status == 202
-    for bad in ({"action": "flatten", "note": "x", "acknowledge": True},
-                {"action": "ack_invariant", "acknowledge": True},
-                {"action": "ack_invariant", "note": "x"},
-                {"action": "resolve_unknown_submit", "note": "x", "acknowledge": True, "cid": str(1 << 48)},
-                {"action": "resolve_unknown_submit", "note": "x", "acknowledge": True, "cid": 5}):
-        resp = await web.command("manual_reconcile", "reconcile-bad-" + str(abs(hash(str(bad))))[:8].ljust(8, "0"),
-                                 bad)
+    assert (await cid.json())["command"]["payload"]["cid"] == "281474976710600"
+    for i, bad in enumerate(({"action": "flatten", "note": "x", "acknowledge": True},
+                             {"action": "ack_risk_blocked", "acknowledge": True},
+                             {"action": "ack_risk_blocked", "note": "x"},
+                             {"action": "baseline", "note": "x", "acknowledge": True},
+                             {"action": "resolve_unknown_submit", "note": "x", "acknowledge": True, "cid": str(1 << 48)},
+                             {"action": "resolve_unknown_submit", "note": "x", "acknowledge": True, "cid": 5})):
+        resp = await web.command("baseline_audit", f"audit-bad-{i:09d}", bad)
         assert resp.status == 422, bad
+    legacy = await web.command("manual_reconcile", "legacy-kind-0000001", {"action": "ack_late_evidence"})
+    assert legacy.status == 400 and (await legacy.json())["error"] == "bad_kind"
 
 
-def test_manual_reconcile_actions_match_engine_when_available():
-    try:
-        from hummingbot.strategy_v2.executors.neutral_grid_executor import commands as engine_commands
-    except ImportError:
-        pytest.skip("engine commands module not merged yet")
-    from web.neutral_grid.commands import MANUAL_RECONCILE, MANUAL_RECONCILE_ACTIONS
-    assert engine_commands.EXTRA_KIND_MANUAL_RECONCILE == MANUAL_RECONCILE
-    assert tuple(engine_commands.MANUAL_RECONCILE_ACTIONS) == MANUAL_RECONCILE_ACTIONS
+def test_audit_actions_match_engine():
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import commands as engine_commands
+    from web.neutral_grid.commands import AUDIT_ACTION_BASELINE, AUDIT_ACTIONS
+    assert tuple(engine_commands.AUDIT_ACTIONS) == AUDIT_ACTIONS
+    assert engine_commands.AUDIT_ACTION_BASELINE == AUDIT_ACTION_BASELINE
+    for action in AUDIT_ACTIONS:
+        payload = {"action": action, "note": "n", "acknowledge": True}
+        if action == "baseline":
+            payload["observed_position"] = "0"
+        if action == "resolve_unknown_submit":
+            payload["cid"] = "1"
+        assert engine_commands.validate_kind("baseline_audit", payload) is None, action

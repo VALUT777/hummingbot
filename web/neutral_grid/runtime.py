@@ -198,8 +198,10 @@ class DemoDriver:
         fake = self.fake
         if action in ("partial_entry", "fill_entry_rest", "dust"):
             entries = self._owned_open(LegRole.ENTRY)
+            if action == "dust":  # a pristine entry, so the exact partial fill is what stays below the floor
+                entries = [o for o in entries if o.filled == 0]
             if not entries:
-                return {"ok": False, "message": "нет активных входов (движок ещё не выставил ордера?)"}
+                return {"ok": False, "message": "нет подходящих активных входов (движок ещё не выставил ордера?)"}
             order = entries[0]
             qty = {"partial_entry": min(Decimal(3), order.remaining), "fill_entry_rest": order.remaining,
                    "dust": min(Decimal(2), order.remaining)}[action]
@@ -242,9 +244,9 @@ class DemoDriver:
 
 
 async def build_demo(args: Any) -> Bundle:
-    from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as engine_module
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.engine import open_engine
     from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeExchange
-    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import EngineIdentity, NeutralGridStore
     from web.neutral_grid.host import EngineHost
 
     data_dir = Path(args.data_dir) if getattr(args, "data_dir", None) else Path(tempfile.mkdtemp(prefix="ng-web-demo-"))
@@ -253,25 +255,20 @@ async def build_demo(args: Any) -> Bundle:
     config = GridConfig(**DEMO_CONFIG)
     fake = FakeExchange(clock, account_index=config.account_index, history_lag_s=1.0)
     fake.auto_fill_crossing_limit = True
-    identity = EngineIdentity(connector_name=config.connector_name, connector_domain=fake.domain,
-                              account_index=config.account_index, trading_pair=config.trading_pair)
     db_path = data_dir / "neutral_grid_demo.sqlite3"
-    writer = NeutralGridStore.open(db_path, identity, create_if_missing=True, lock_dir=data_dir / "locks")
-    options = None
-    options_cls = getattr(engine_module, "EngineOptions", None)
-    if options_cls is None:
-        try:
-            from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions as options_cls
-        except ImportError:  # pragma: no cover - engine without options
-            options_cls = None
-    if options_cls is not None:
-        options = options_cls(stop_uncertain_after_s=30.0, cancel_retry_s=5.0)
-    engine = engine_module.NeutralGridEngine(config, writer, fake, clock, options=options, offline_demo=True)
+    options = EngineOptions(stop_uncertain_after_s=30.0, cancel_retry_s=5.0)
+    # The engine's own factory opens the single-writer store (host lock + owner fencing); the web never does.
+    engine = open_engine(config, str(db_path), fake, clock=clock, options=options, lock_dir=str(data_dir / "locks"),
+                         create_if_missing=True, offline_demo=True)
+    if engine.store is None:
+        raise RuntimeError(f"demo engine store refused: {engine.fatal_reason}")
+    writer = engine.store
+    identity_id = f"{fake.domain}:{config.account_index}:{config.trading_pair}"
+    await engine.tick()  # first committed snapshot (AWAITING_START) before the UI connects
     wake = getattr(engine, "wake", None)
     if callable(wake) and hasattr(fake, "add_ws_listener"):
         fake.add_ws_listener(wake)  # WS signal only wakes the history scan; it is never proof (NG-HIST-001)
-    host = EngineHost(engine, identity.engine_id, tick_interval_s=1.0)
-    await engine.tick()  # first committed snapshot (AWAITING_START) before the UI connects
+    host = EngineHost(engine, identity_id, tick_interval_s=options.tick_interval_s)
     host.start()
     gateway = StoreGateway.open(db_path)
 
