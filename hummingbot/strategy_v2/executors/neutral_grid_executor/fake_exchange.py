@@ -143,6 +143,7 @@ class FakeOrder:
     history_visible_at: Optional[float] = None
     # Rows exposed via inactive-order history may be overridden to exercise conflicts.
     history_override: Optional[Dict[str, object]] = None
+    active_override: Optional[Dict[str, object]] = None       # raw fields a (buggy) active-orders row reports
 
     @property
     def remaining(self) -> Decimal:
@@ -282,6 +283,7 @@ class FakeExchange:
         self.duplicate_boundary: Dict[str, bool] = {TRADES_ENDPOINT: False, INACTIVE_ENDPOINT: False}
         self.reorder_pages: Dict[str, bool] = {TRADES_ENDPOINT: False, INACTIVE_ENDPOINT: False}
         self._conflicting_trades: Dict[str, Decimal] = {}      # trade id -> conflicting size
+        self._persistent_conflicts: set = set()
         self.fail_endpoints: Dict[str, int] = {}                  # endpoint -> remaining failures
         self.rules_available = True
         self.position_available = True
@@ -331,9 +333,12 @@ class FakeExchange:
             raise ValueError(kind)
         self._page_faults[endpoint].append(_PageFault(kind=kind, page=page, times=times, value=value))
 
-    def inject_conflicting_trade(self, trade_id: str, size: Decimal) -> None:
-        """Future pages repeat ``trade_id`` with a different size (same dedupe key, other payload)."""
+    def inject_conflicting_trade(self, trade_id: str, size: Decimal, persistent: bool = False) -> None:
+        """Future pages repeat ``trade_id`` with a different size (same dedupe key, other payload); once, or on
+        every page that serves the row (``persistent``)."""
         self._conflicting_trades[trade_id] = Decimal(size)
+        if persistent:
+            self._persistent_conflicts.add(trade_id)
 
     def fail_next(self, endpoint: str, times: int = 1) -> None:
         self.fail_endpoints[endpoint] = self.fail_endpoints.get(endpoint, 0) + times
@@ -496,8 +501,10 @@ class FakeExchange:
             raw.update(order.history_override)
         return raw
 
-    def _order_row(self, order: FakeOrder) -> ExchangeOrderRow:
+    def _order_row(self, order: FakeOrder, active: bool = False) -> ExchangeOrderRow:
         raw = self._order_raw(order)
+        if active and order.active_override:
+            raw.update(order.active_override)
         cid = raw["client_order_index"]
         return ExchangeOrderRow(
             client_order_id=None if cid is None else int(cid),
@@ -522,7 +529,7 @@ class FakeExchange:
         self._charge(ACTIVE_ENDPOINT)
         self._process_time()
         now = self.clock.now()
-        rows = [self._order_row(o) for o in self.orders.values()
+        rows = [self._order_row(o, active=True) for o in self.orders.values()
                 if o.is_open and o.active_visible_at <= now]
         return sorted(rows, key=lambda r: int(r.order_index))
 
@@ -584,7 +591,8 @@ class FakeExchange:
             # The same dedupe key with a different payload, served right next to the original row.
             for item in chunk:
                 leg = item[2]
-                size = self._conflicting_trades.pop(leg.trade_id, None)
+                size = (self._conflicting_trades.get(leg.trade_id) if leg.trade_id in self._persistent_conflicts
+                        else self._conflicting_trades.pop(leg.trade_id, None))
                 if size is not None:
                     rows.append(self._trade_row(leg, size_override=size))
         if self.reorder_pages[endpoint]:
