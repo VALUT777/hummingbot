@@ -131,6 +131,35 @@ def endpoints_from_ledgers(baseline: Decimal, ledgers: Sequence[Any],
     return endpoints(baseline, buys, sells, legs, unpaired=unpaired)
 
 
+def obligation_totals(ledgers: Sequence[Any]) -> Tuple[Decimal, Decimal]:
+    """``(owed_buy, owed_sell)``: open TP obligations that are not (yet) an order (``unassigned + dust``).
+
+    TP priority (NG-RISK-002): these exits are owed, so entries must not consume the net headroom they need.
+    """
+    owed_buy = ZERO
+    owed_sell = ZERO
+    for ledger in ledgers:
+        for cycle in ledger.open_cycles():
+            b = cycle.buckets()
+            owed = max(b.unassigned, ZERO) + b.dust
+            if owed <= 0:
+                continue
+            if ledger.spec.tp_side == Side.BUY:
+                owed_buy += owed
+            else:
+                owed_sell += owed
+    return owed_buy, owed_sell
+
+
+def with_obligations(ep: RiskEndpoints, owed_buy: Decimal, owed_sell: Decimal) -> RiskEndpoints:
+    """Endpoints that also include every owed exit as if it were a live order (used to admit entries).
+
+    Fills never widen this interval and TP dispatch only turns an obligation into an order, so as long as every
+    entry is admitted against it, no TP can be cap-blocked by headroom that entries consumed.
+    """
+    return ep._replace(P_max=ep.P_max + _dec(owed_buy, "owed_buy"), P_min=ep.P_min - _dec(owed_sell, "owed_sell"))
+
+
 def reachable_interval(baseline: Decimal, cells: Sequence[CellSpec], order_amount_base: Decimal
                        ) -> Tuple[Decimal, Decimal]:
     """Preview interval with every cell's full entry resting: ``[B - Q*#SELL, B + Q*#BUY]``."""
