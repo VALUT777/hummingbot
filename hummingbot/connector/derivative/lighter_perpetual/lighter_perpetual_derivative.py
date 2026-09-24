@@ -3,7 +3,7 @@ import time
 from decimal import Decimal
 from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple
 
-from lighter import SignerClient
+from lighter import AccountApi, SignerClient
 
 from hummingbot.connector.constants import s_decimal_NaN
 from hummingbot.connector.derivative.lighter_perpetual import (
@@ -123,6 +123,10 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def account_index(self) -> int:
         return self._account_index
+
+    @property
+    def api_key_index(self) -> int:
+        return self._api_key_index
 
     @property
     def name(self) -> str:
@@ -257,6 +261,33 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         for market in perpetual_markets_from_exchange_info(exchange_info, domain=self.domain):
             prices.append({"symbol": market.exchange_symbol, "price": str(market.raw_info["last_trade_price"])})
         return prices
+
+    async def fetch_maker_only_api_key_indexes(self) -> frozenset[int]:
+        """Read the account's maker-only API key set without changing key settings.
+
+        The endpoint is private and typed by lighter-sdk. Its response is still checked explicitly because generated
+        models can be constructed without validation by ``from_dict``. Unknown or malformed capability must never be
+        interpreted as ordinary LIMIT support by a caller.
+        """
+        if self._account_index is None or type(self._api_key_index) is not int \
+                or not 0 <= self._api_key_index <= CONSTANTS.MAX_API_KEY_INDEX \
+                or self._signer_client is None or self._auth is None:
+            raise IOError("Lighter maker-only capability requires a resolved trading account and API key.")
+        account_api = AccountApi(self._signer_client.api_client)
+        async with self._throttler.execute_task(limit_id=CONSTANTS.GET_MAKER_ONLY_API_KEYS_PATH_URL):
+            authorization = await self._auth._get_auth_token()
+            response = await account_api.get_maker_only_api_keys(
+                authorization=authorization, account_index=self._account_index)
+        code = getattr(response, "code", None)
+        if type(code) is not int:
+            raise IOError("Lighter maker-only capability response has an invalid code.")
+        if code != 200:
+            raise IOError(f"Lighter maker-only capability response failed with code {code}.")
+        indexes = getattr(response, "api_key_indexes", None)
+        if not isinstance(indexes, list) or any(
+                type(index) is not int or not 0 <= index <= CONSTANTS.MAX_API_KEY_INDEX for index in indexes):
+            raise IOError("Lighter maker-only capability response has invalid API key indexes.")
+        return frozenset(indexes)
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
         return False

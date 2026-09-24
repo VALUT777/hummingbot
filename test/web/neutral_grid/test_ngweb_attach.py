@@ -13,7 +13,6 @@ from aiohttp.test_utils import TestClient, TestServer
 from ngweb_fakes import FakeGateway, sample_config, sample_snapshot
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import grid as core_grid
-from web.neutral_grid.keystore import KeystoreService
 from web.neutral_grid.runtime import attach_context, engine_config_from_snapshot
 from web.neutral_grid.security import AccessGate
 from web.neutral_grid.server import create_app
@@ -65,7 +64,6 @@ async def attach_web():
         args = types.SimpleNamespace(host="127.0.0.1", stale_after=15.0, allowed_host=[], attach_db="unused")
         ctx = attach_context(gateway, args, health_provider=lambda: {})
         ctx.access = AccessGate(TOKEN)
-        ctx.keystore = KeystoreService(demo=False)
         client = TestClient(TestServer(create_app(ctx), host="127.0.0.1"))
         await client.start_server()
         clients.append(client)
@@ -106,6 +104,49 @@ async def test_attach_preview_identity_and_baseline_come_from_engine_config(atta
     assert resp.status == 422 and "330" in (await resp.json())["message"]
     resp = await web.command("start", "attach-start-right-b", dict(start, expected_initial_position="330"))
     assert resp.status == 202, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_attach_credentials_are_read_only_and_bound_to_snapshot_identity(attach_web):
+    web = await attach_web(attach_snapshot())
+    body = await (await web.client.get("/api/keystore")).json()
+    assert body == {
+        "mutable": False,
+        "attached_identity": {
+            "grid_id": "ng-engine-grid",
+            "connector_name": "lighter_perpetual_robinhood",
+            "trading_pair": "LIT-USDG",
+            "account_index": "7",
+        },
+        "credential_owner": "hummingbot_host",
+        "message": (
+            "Выбор и разблокировка ключей выполняются в Hummingbot. "
+            "Панель показывает привязку по последнему снимку движка и не меняет её."
+        ),
+    }
+    origin = f"http://127.0.0.1:{web.client.port}"
+    # Use the fixture's authenticated request helper shape directly: both mutation routes must refuse before
+    # reading a password or local connector profile.
+    csrf = (await (await web.client.get("/api/session")).json())["csrf_token"]
+    headers = {"Origin": origin, "X-CSRF-Token": csrf}
+    for path, payload in (
+        ("/api/keystore/select", {"profile": "lighter_perpetual_robinhood"}),
+        ("/api/keystore/unlock", {"password": "must-not-be-read"}),
+    ):
+        resp = await web.client.post(path, json=payload, headers=headers)
+        assert resp.status == 409
+        assert (await resp.json())["error"] == "attached_credentials_read_only"
+
+
+@pytest.mark.asyncio
+async def test_attach_credentials_do_not_invent_identity_when_snapshot_config_is_absent(attach_web):
+    web = await attach_web(attach_snapshot(engine_config=None))
+    body = await (await web.client.get("/api/keystore")).json()
+    assert body["mutable"] is False
+    assert body["attached_identity"]["grid_id"] is None
+    assert "config_error" in body["attached_identity"]
+    assert "connector_name" not in body["attached_identity"]
+    assert "account_index" not in body["attached_identity"]
 
 
 def _drop(key):

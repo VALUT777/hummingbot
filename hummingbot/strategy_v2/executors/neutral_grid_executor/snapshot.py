@@ -164,6 +164,7 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
             "min_notional": str(rules.min_notional), "max_base": _s(rules.max_base),
             "max_leverage": _s(rules.max_leverage), "max_active_orders_venue": rules.max_active_orders_venue,
             "supports_limit": bool(rules.supports_limit), "supports_post_only": bool(rules.supports_post_only),
+            "ordinary_limit_blocker": rules.ordinary_limit_blocker,
             "fetched_at": _s(rules.fetched_at),
             # the engine's own staleness bound for these rules (the UI's attach/preview gate, W2)
             "max_age_s": str(engine.options.rules_max_age_published_s),

@@ -31,10 +31,19 @@ class MockSignerClient:
     CROSS_MARGIN_MODE = 0
 
     def __init__(self):
+        self.api_client = object()
         self.create_order = AsyncMock(return_value=(None, {"code": 200}, None))
         self.create_market_order = AsyncMock(return_value=(None, {"code": 200}, None))
         self.cancel_order = AsyncMock(return_value=(None, {"code": 200}, None))
         self.update_leverage = AsyncMock(return_value=(None, {"code": 200}, None))
+
+
+class AsyncContext:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDerivativeTests):
@@ -138,6 +147,63 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
         self.assertEqual("LIT-USDG", rules[0].trading_pair)
         self.assertEqual("USDG", rules[0].buy_order_collateral_token)
         self.assertEqual("USDG", rules[0].sell_order_collateral_token)
+
+    async def test_fetch_maker_only_api_key_indexes_uses_read_only_sdk_call(self):
+        self.exchange._auth = SimpleNamespace(_get_auth_token=AsyncMock(return_value="auth-token"))
+        self.exchange._throttler.execute_task = MagicMock(return_value=AsyncContext())
+        response = SimpleNamespace(code=200, api_key_indexes=[1, 7])
+        with patch(
+            "hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_derivative.AccountApi"
+        ) as account_api_cls:
+            account_api = account_api_cls.return_value
+            account_api.get_maker_only_api_keys = AsyncMock(return_value=response)
+            account_api.set_maker_only_api_keys = AsyncMock()
+
+            indexes = await self.exchange.fetch_maker_only_api_key_indexes()
+
+        self.assertEqual(frozenset({1, 7}), indexes)
+        account_api_cls.assert_called_once_with(self.exchange._signer_client.api_client)
+        account_api.get_maker_only_api_keys.assert_awaited_once_with(
+            authorization="auth-token", account_index=self.ACCOUNT_INDEX
+        )
+        account_api.set_maker_only_api_keys.assert_not_awaited()
+        self.exchange._throttler.execute_task.assert_called_once_with(
+            limit_id=CONSTANTS.GET_MAKER_ONLY_API_KEYS_PATH_URL
+        )
+
+    async def test_fetch_maker_only_api_key_indexes_rejects_failed_or_malformed_response(self):
+        self.exchange._auth = SimpleNamespace(_get_auth_token=AsyncMock(return_value="auth-token"))
+        self.exchange._throttler.execute_task = MagicMock(return_value=AsyncContext())
+        responses = (
+            None,
+            SimpleNamespace(code="200", api_key_indexes=[]),
+            SimpleNamespace(code=500, api_key_indexes=[]),
+            SimpleNamespace(code=200, api_key_indexes=None),
+            SimpleNamespace(code=200, api_key_indexes=[True]),
+            SimpleNamespace(code=200, api_key_indexes=[-1]),
+            SimpleNamespace(code=200, api_key_indexes=[255]),
+            SimpleNamespace(code=200, api_key_indexes=[999]),
+            SimpleNamespace(code=200, api_key_indexes=[1.5]),
+        )
+        for response in responses:
+            with self.subTest(response=repr(response)), patch(
+                "hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_derivative.AccountApi"
+            ) as account_api_cls:
+                account_api_cls.return_value.get_maker_only_api_keys = AsyncMock(return_value=response)
+                with self.assertRaises(IOError):
+                    await self.exchange.fetch_maker_only_api_key_indexes()
+
+    async def test_fetch_maker_only_api_key_indexes_rejects_reserved_selected_key(self):
+        self.exchange._api_key_index = 255
+        self.exchange._auth = SimpleNamespace(_get_auth_token=AsyncMock(return_value="auth-token"))
+        self.exchange._throttler.execute_task = MagicMock(return_value=AsyncContext())
+
+        with self.assertRaises(IOError), patch(
+            "hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_derivative.AccountApi"
+        ) as account_api_cls:
+            await self.exchange.fetch_maker_only_api_key_indexes()
+
+        account_api_cls.assert_not_called()
 
     def test_grid_account_snapshot_reconciles_account_orders_and_cumulative_fills(self):
         self.exchange._domain = CONSTANTS.ROBINHOOD_DOMAIN

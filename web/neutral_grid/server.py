@@ -49,7 +49,7 @@ class DemoControls:
 class WebContext:
     gateway: EngineGateway
     preview: PreviewService
-    keystore: KeystoreService
+    keystore: Optional[KeystoreService]
     engine_identity: Dict[str, Any]
     mode: str = "demo"                     # demo | attach | live
     bind_host: str = "127.0.0.1"
@@ -278,11 +278,24 @@ async def commands_post(request: web.Request) -> web.Response:
 
 async def keystore_get(request: web.Request) -> web.Response:
     ctx = _ctx(request)
+    if ctx.mode == "attach" or ctx.keystore is None:
+        return _json({
+            "mutable": False,
+            "attached_identity": ctx.identity(),
+            "credential_owner": "hummingbot_host",
+            "message": (
+                "Выбор и разблокировка ключей выполняются в Hummingbot. "
+                "Панель показывает привязку по последнему снимку движка и не меняет её."
+            ),
+        })
     return _json({"status": ctx.keystore.status(), "profiles": ctx.keystore.profiles()})
 
 
 async def keystore_select(request: web.Request) -> web.Response:
     ctx = _ctx(request)
+    if ctx.mode == "attach" or ctx.keystore is None:
+        return json_error(409, "attached_credentials_read_only",
+                          "Ключи принадлежат процессу Hummingbot; attach-панель не меняет профиль.")
     body = await _read_json(request)
     try:
         status = ctx.keystore.select(body.get("profile") if isinstance(body, dict) else None)
@@ -293,6 +306,9 @@ async def keystore_select(request: web.Request) -> web.Response:
 
 async def keystore_unlock(request: web.Request) -> web.Response:
     ctx = _ctx(request)
+    if ctx.mode == "attach" or ctx.keystore is None:
+        return json_error(409, "attached_credentials_read_only",
+                          "Keystore разблокируется в процессе Hummingbot; attach-панель не принимает пароль.")
     body = await _read_json(request)
     password = body.pop("password", None) if isinstance(body, dict) else None
     try:

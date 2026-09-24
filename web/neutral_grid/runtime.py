@@ -264,7 +264,7 @@ def attach_context(gateway: Any, args: Any, *, health_provider: Callable[[], Dic
 
     preview = PreviewService(config_source, snapshot_market(gateway, config_source, args.stale_after), mode="attach")
     return WebContext(
-        gateway=gateway, preview=preview, keystore=KeystoreService(demo=False), engine_identity={},
+        gateway=gateway, preview=preview, keystore=None, engine_identity={},
         identity_provider=identity, mode="attach", bind_host=args.host, stale_after_s=args.stale_after,
         policy=_security_policy(args), health_provider=health_provider)
 

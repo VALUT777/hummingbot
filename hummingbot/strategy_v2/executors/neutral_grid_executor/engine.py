@@ -2304,10 +2304,15 @@ class NeutralGridEngine:
         if self.rules is not None:
             # The connector reports supports_limit/post_only=False unless the market is tradable: no new exposure,
             # and a TP that cannot be placed is visible instead of retried blindly.
-            if not self.rules.supports_limit:
+            ordinary_limit_blocker = self.rules.ordinary_limit_blocker
+            if ordinary_limit_blocker is not None:
+                entry.append(ordinary_limit_blocker)
+                if self.config.tp_order_type == OrderTypePolicy.LIMIT:
+                    tp.append(ordinary_limit_blocker)
+            elif not self.rules.supports_limit:
                 entry.append("MARKET_NOT_TRADABLE")
                 tp.append("MARKET_NOT_TRADABLE")
-            elif self.config.tp_order_type == OrderTypePolicy.LIMIT_MAKER and not self.rules.supports_post_only:
+            if self.config.tp_order_type == OrderTypePolicy.LIMIT_MAKER and not self.rules.supports_post_only:
                 tp.append("POST_ONLY_UNSUPPORTED")
             if self.config.entry_order_type == OrderTypePolicy.LIMIT_MAKER and not self.rules.supports_post_only:
                 entry.append("POST_ONLY_UNSUPPORTED")
@@ -2326,7 +2331,8 @@ class NeutralGridEngine:
             leverage_ok=None if position is None or position.leverage is None
             else position.leverage == self.config.leverage,
             position_mode_ok=None if position is None or position.margin_mode is None else True,
-            market_active=None if self.mid is None or self.rules is None else bool(self.rules.supports_limit),
+            market_active=None if self.mid is None or self.rules is None else bool(
+                self.rules.supports_limit or self.rules.supports_post_only),
             rules=self.rules,
             history_complete=self.history_complete and not self._history_stale(now),
             account_identity_ok=self.port.account_index == self.config.account_index,
@@ -2845,7 +2851,12 @@ class NeutralGridEngine:
         rules = self.rules
         if rules is None or grid.rules_blockers(rules):
             return "RULES_UNKNOWN"
-        if not rules.supports_limit:
+        ordinary_limit_blocker = rules.ordinary_limit_blocker
+        meta = self.order_meta.get(req.client_order_id)
+        if ordinary_limit_blocker is not None \
+                and (meta is None or meta.role == LegRole.ENTRY.value or req.order_type == OrderTypePolicy.LIMIT):
+            return ordinary_limit_blocker
+        if ordinary_limit_blocker is None and not rules.supports_limit:
             return "MARKET_NOT_TRADABLE"
         if req.order_type == OrderTypePolicy.LIMIT_MAKER and not rules.supports_post_only:
             return "POST_ONLY_UNSUPPORTED"

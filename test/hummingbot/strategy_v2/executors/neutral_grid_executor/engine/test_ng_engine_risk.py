@@ -502,6 +502,8 @@ def test_untradable_market_blocks_new_exposure_and_presend(tmp_path, rules, bloc
         h.tick(12)
         assert blocker in h.engine.entry_blockers and h.state == EngineState.DEGRADED, h.engine.reasons
         assert (blocker in h.engine.tp_blockers) is tp_blocked
+        if blocker == "MARKET_NOT_TRADABLE":
+            assert "MARKET_ACTIVE:FALSE" in h.engine.entry_blockers
         assert [c for c in h.fx.submits()
                 if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.ENTRY] == entries
         tps = [c for c in h.fx.submits() if h.engine.leg_by_cid(c.client_order_id).identity.role == LegRole.TP]
@@ -510,5 +512,55 @@ def test_untradable_market_blocks_new_exposure_and_presend(tmp_path, rules, bloc
         req = SubmitRequest(client_order_id=1, side=Side.BUY, price=D("5.3"), amount=D("10"),
                             order_type=OrderTypePolicy.LIMIT_MAKER, reduce_only=False, expiry_ms=None)
         assert h.engine._pre_send_blocker(req) == blocker                # nothing reaches transport
+    finally:
+        h.close()
+
+
+@pytest.mark.parametrize("blocker", ["API_KEY_MAKER_ONLY", "MAKER_ONLY_CAPABILITY_UNKNOWN"])
+def test_maker_only_capability_change_immediately_blocks_entries_and_ordinary_tp_then_recovers(tmp_path, blocker):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+    h = Harness(tmp_path, options=EngineOptions(rules_refresh_s=1.0, weight_budget_per_min=100000))
+    try:
+        _started(h)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, LegRole.ENTRY)
+        h.fx.set_rules(supports_limit=False, supports_post_only=True, ordinary_limit_blocker=blocker)
+        h.fx.fill(entry.cid, D("10"))
+        entries_before = [x for x in h.fx.submits()
+                          if h.engine.leg_by_cid(x.client_order_id).identity.role == LegRole.ENTRY]
+
+        h.tick(4)
+
+        assert blocker in h.engine.entry_blockers
+        assert blocker in h.engine.tp_blockers
+        assert "MARKET_ACTIVE:FALSE" not in h.engine.entry_blockers
+        assert [x for x in h.fx.submits()
+                if h.engine.leg_by_cid(x.client_order_id).identity.role == LegRole.ENTRY] == entries_before
+        assert not h.legs(cell, LegRole.TP)
+        assert h.engine.latest_committed_snapshot()["summary"]["runtime_rules"]["ordinary_limit_blocker"] == blocker
+
+        h.fx.set_rules(supports_limit=True, ordinary_limit_blocker=None)
+        h.run_until(lambda: h.live_order(cell, LegRole.TP) is not None, max_ticks=12)
+        assert blocker not in h.engine.entry_blockers and blocker not in h.engine.tp_blockers
+    finally:
+        h.close()
+
+
+def test_known_maker_only_key_preserves_configured_post_only_exit(tmp_path):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import EngineOptions
+    h = Harness(tmp_path, tp_order_type=OrderTypePolicy.LIMIT_MAKER,
+                options=EngineOptions(rules_refresh_s=1.0, weight_budget_per_min=100000))
+    try:
+        _started(h)
+        cell = h.buy_cells()[-1]
+        h.fx.set_rules(supports_limit=False, supports_post_only=True,
+                       ordinary_limit_blocker="API_KEY_MAKER_ONLY")
+        h.fx.fill(h.live_order(cell, LegRole.ENTRY).cid, D("10"))
+
+        h.run_until(lambda: h.live_order(cell, LegRole.TP) is not None, max_ticks=12)
+
+        assert "API_KEY_MAKER_ONLY" in h.engine.entry_blockers
+        assert "API_KEY_MAKER_ONLY" not in h.engine.tp_blockers
+        assert h.live_order(cell, LegRole.TP).order_type == OrderTypePolicy.LIMIT_MAKER
     finally:
         h.close()

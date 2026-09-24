@@ -228,8 +228,10 @@
 
   function renderIdentity() {
     var id = S.identity || {};
-    $("identity").textContent = [id.connector_name, id.trading_pair, id.account_index !== undefined ? "account " + id.account_index : null, id.grid_id]
-      .filter(Boolean).join(" · ");
+    $("identity").textContent = id.config_error
+      ? "Привязка неизвестна"
+      : [id.connector_name, id.trading_pair, id.account_index !== undefined ? "аккаунт " + id.account_index : null, id.grid_id]
+        .filter(Boolean).join(" · ");
     var chip = $("mode-chip");
     chip.hidden = false;
     chip.setAttribute("data-mode", S.mode === "demo" ? "demo" : "live");
@@ -274,6 +276,10 @@
     if (!isLatest("state", seq)) return;
     if (r.status === 200 && r.data) {
       S.state = r.data;
+      if (r.data.engine_identity) {
+        S.identity = r.data.engine_identity;
+        renderIdentity();
+      }
       S.stateReceivedAt = Date.now();
       S.backendDown = false;
       renderState();
@@ -886,9 +892,14 @@
   function openStart() {
     var p = S.preview;
     if (!p) return;
+    // The confirmation names the identity from this exact validated preview, which is also revision-bound
+    // into the START command.  The periodically refreshed page header may legitimately lag one snapshot.
+    var attached = p.config || {};
     $("start-mode-note").textContent = p.mode === "demo"
       ? "Демо-режим: ордера уходят только в офлайн fake exchange."
-      : "LIVE: движок будет работать с реальной биржей от имени выбранного профиля ключей.";
+      : "LIVE: команда адресована уже запущенному движку " + txt(attached.connector_name) +
+        " · аккаунт " + txt(attached.account_index) + " · " + txt(attached.trading_pair) +
+        ". Выбор и разблокировка ключей выполняются в Hummingbot; панель их не меняет.";
     kv($("start-summary"), [
       ["Сетка", txt(p.grid && p.grid.boundaries) + " цен / " + txt(p.grid && p.grid.cells) + " ячеек"],
       ["BUY / SELL (оценка)", p.sides && p.sides.known ? p.sides.buy + " / " + p.sides.sell : null],
@@ -1146,9 +1157,30 @@
   async function loadKeystore() {
     var r = await api("/api/keystore");
     if (r.status !== 200) return;
+    if (r.data.mutable === false) { renderAttachedCredentials(r.data); return; }
     renderKeystore(r.data.status, r.data.profiles);
   }
+  function renderAttachedCredentials(data) {
+    var identity = data.attached_identity || {};
+    $("keystore-note").textContent = (identity.config_error ? "Привязка неизвестна: " + identity.config_error + ". " : "") + data.message;
+    $("profile-card").hidden = true;
+    $("unlock-card").hidden = true;
+    kv($("keystore-status"), [
+      ["Ключи", "процесс Hummingbot"],
+      ["Подключение", identity.connector_name],
+      ["Аккаунт", identity.account_index],
+      ["Пара", identity.trading_pair],
+      ["Сетка", identity.grid_id],
+      identity.config_error ? ["Ошибка привязки", identity.config_error, "bad"] : null,
+      ["Режим панели", "только управление уже привязанным движком"]
+    ]);
+  }
   function renderKeystore(status, profiles) {
+    $("keystore-note").textContent = status.demo
+      ? "Демо-режим: ключи не используются."
+      : "Используется существующий зашифрованный keystore Hummingbot; значения ключей не показываются.";
+    $("profile-card").hidden = false;
+    $("unlock-card").hidden = false;
     kv($("keystore-status"), [
       ["Режим", status.demo ? "демо (ключи не используются)" : "рабочий"],
       ["Keystore создан", status.keystore_exists],

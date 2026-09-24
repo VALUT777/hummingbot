@@ -52,6 +52,7 @@ ORDER_BOOK_ORDERS_PATH_URL = "/api/v1/orderBookOrders"
 ACCOUNT_PATH_URL = "/api/v1/account"
 ACCOUNT_ACTIVE_ORDERS_PATH_URL = "/api/v1/accountActiveOrders"
 ACCOUNT_INACTIVE_ORDERS_PATH_URL = "/api/v1/accountInactiveOrders"
+GET_MAKER_ONLY_API_KEYS_PATH_URL = "/api/v1/getMakerOnlyApiKeys"
 TRADES_PATH_URL = "/api/v1/trades"
 RECENT_TRADES_PATH_URL = "/api/v1/recentTrades"
 FUNDING_RATES_PATH_URL = "/api/v1/funding-rates"
@@ -64,6 +65,8 @@ SEND_TX_PATH_URL = "/api/v1/sendTx"  # sent by the SDK signer client, not by the
 # Authoritative history pagination (lighter-sdk 1.1.4 OrderApi.trades / account_inactive_orders):
 # `limit` is validated by the SDK as 1..100; `next_cursor` is an opaque string passed back verbatim.
 HISTORY_PAGE_LIMIT_MAX = 100
+# The SDK reserves 255 for an all-keys lookup; real signing keys are indexed 0..254.
+MAX_API_KEY_INDEX = 254
 # Key added to the saved tracking state of orders submitted with a pre-persisted client id, so the
 # history-reconciled treatment (no legacy polling/cancel/re-send) survives a Hummingbot restore.
 HISTORY_RECONCILED_STATE_MARKER = "lighter_history_reconciled"
@@ -300,6 +303,12 @@ def generate_account_limit(account_type: str, staked_lit: int = 0) -> List[RateL
         ),
         RateLimit(
             ACCOUNT_ACTIVE_ORDERS_PATH_URL,
+            limit=WEIGHT_DEFAULT,
+            time_interval=60,
+            linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT, weight=WEIGHT_DEFAULT)],
+        ),
+        RateLimit(
+            GET_MAKER_ONLY_API_KEYS_PATH_URL,
             limit=WEIGHT_DEFAULT,
             time_interval=60,
             linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT, weight=WEIGHT_DEFAULT)],

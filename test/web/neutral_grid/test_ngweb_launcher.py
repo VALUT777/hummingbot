@@ -1,4 +1,4 @@
-"""Launcher: loopback default, secrets never in argv, TTY-only unlock, attach mode serves committed state."""
+"""Launcher: loopback default, no secrets/profile controls, attach mode serves committed state."""
 from __future__ import annotations
 
 import asyncio
@@ -77,34 +77,14 @@ def test_launcher_source_has_no_secret_options():
     assert options and not any(word in line for line in options for word in forbidden)
 
 
-class _FakeTTY(io.StringIO):
-    def isatty(self):
-        return True
-
-
-class _RecordingKeystore:
-    def __init__(self):
-        self.calls = []
-
-    def select(self, name):
-        self.calls.append(("select", name))
-
-    def unlock(self, password):
-        self.calls.append(("unlock", len(password)))
-
-
-def test_unlock_tty_requires_terminal_and_uses_hidden_prompt():
-    ks = _RecordingKeystore()
-    with pytest.raises(launcher.LaunchRefused):
-        launcher.unlock_from_tty(ks, "lighter_perpetual_robinhood", stdin=io.StringIO())
-    prompts = []
-
-    def hidden(prompt):
-        prompts.append(prompt)
-        return "tty-password"
-    launcher.unlock_from_tty(ks, "lighter_perpetual_robinhood", stdin=_FakeTTY(), prompt=hidden)
-    assert ks.calls == [("select", "lighter_perpetual_robinhood"), ("unlock", len("tty-password"))]
-    assert "скрыт" in prompts[0]
+def test_launcher_has_no_detached_keystore_controls(capsys):
+    for option in ("--unlock-tty", "--profile"):
+        with pytest.raises(SystemExit):
+            launcher.parse_args(["--attach-db", "engine.sqlite3", option, "unused"])
+        assert "unused" not in capsys.readouterr().err
+    source = LAUNCHER_PATH.read_text(encoding="utf-8")
+    assert 'add_argument("--unlock-tty"' not in source
+    assert 'add_argument("--profile"' not in source
 
 
 def test_login_url_uses_fragment_not_query():

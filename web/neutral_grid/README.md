@@ -50,13 +50,12 @@ python bin/lighter_robinhood_neutral_grid_web.py --attach-db <путь к sqlite
 * Заголовки: CSP только `'self'` (без inline-скриптов и стилей), `X-Frame-Options: DENY`, `nosniff`,
   `Referrer-Policy: no-referrer`, `Cache-Control: no-store` для API. Внешних CDN нет: все ассеты лежат в
   `static/`.
-* Ключи: профиль выбирается по имени из существующего зашифрованного keystore Hummingbot
-  (`conf/connectors/*.yml`). UI видит только признак «задано / нет» по каждому полю. Разблокировка вызывает
-  нативный `Security.login(ETHKeyFileSecretManger(password))`. Пароль передаётся только в теле POST-запроса
-  или вводится скрытым вводом в терминале (`--unlock-tty`). Он не принимается в аргументах, не пишется в
-  журнал, не возвращается в ответах и не хранится в браузере. Эндпоинта для чтения секретов нет. Keystore из
-  веба не создаётся. Формат API-ключа проверяется существующим валидатором мастера настройки: 80 hex, `0x`
-  необязателен; 64-hex ключ кошелька не подходит.
+* Ключи принадлежат процессу Hummingbot, который уже запустил движок. Именно там выбирается connector-профиль,
+  разблокируется существующий encrypted keystore и проверяется формат API-ключа. Attach-панель не утверждает,
+  что host сейчас разблокирован: она показывает по последнему committed snapshot
+  только привязку из снимка с проверенным core-отпечатком конфигурации (`connector_name`, `account_index`, `trading_pair`,
+  `grid_id`); она не читает локальный keystore, не принимает пароль и не меняет профиль работающего движка.
+  `POST /api/keystore/select` и `POST /api/keystore/unlock` в attach-режиме отвечают `409`.
 * Браузер не получает учётные данные и никогда не обращается к бирже. Единственный путь записи — строка в
   таблице `commands` через `NeutralGridStore.open_command_client`. SQLite-authorizer этого подключения
   разрешает только `INSERT` в `commands`.

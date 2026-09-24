@@ -251,7 +251,7 @@ class FakeExchange:
         self._rules = dict(
             tick_size=tick_size, size_step=size_step, min_base=min_base, min_notional=min_notional,
             max_base=max_base, max_leverage=max_leverage, supports_limit=True, supports_post_only=True,
-            max_active_orders_venue=max_active_orders_venue,
+            max_active_orders_venue=max_active_orders_venue, ordinary_limit_blocker=None,
         )
         self._position = Decimal(initial_position)
         self.available_collateral: Optional[Decimal] = available_collateral

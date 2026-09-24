@@ -104,6 +104,9 @@ class TradingRules:
     supports_post_only: bool
     fetched_at: float           # unix seconds (timestamp only, never quantity)
     max_active_orders_venue: Optional[int] = None
+    # Why an ordinary LIMIT may not be sent even when post-only is supported. This contains a fixed public reason
+    # code only; it never carries an auth token, venue response text or other secret.
+    ordinary_limit_blocker: Optional[str] = None
 
 
 @dataclass(frozen=True)

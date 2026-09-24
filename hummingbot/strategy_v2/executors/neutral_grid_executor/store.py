@@ -2553,7 +2553,9 @@ class NeutralGridStore:
                              "active orders or WS events")
         with self._scope(tx):
             self._require_writer()
-            cid = self._attribute_order(row)
+            cid, identity_problem = self._attribute_order(row)
+            if identity_problem is not None:
+                raise InvalidTransitionError(f"order evidence conflicts: {identity_problem}")
             if cid is None:
                 client = _row_client_id(row)
                 if client is not None:
@@ -2957,6 +2959,11 @@ class NeutralGridStore:
                 done = self._x("SELECT * FROM outbox WHERE cid = ? AND kind = ? ORDER BY id DESC LIMIT 1",
                                (cid, kind)).fetchone()
                 if done is not None and self._same_last_result(self._outbox(done), outcome, detail):
+                    if result.exchange_order_id:
+                        binding_problem = self._exchange_id_binding_problem(cid, result.exchange_order_id)
+                        if binding_problem is not None:
+                            raise InvalidTransitionError(binding_problem)
+                        self._bind_exchange_order_id(cid, result.exchange_order_id)
                     if leg_state is not None:  # replayed result + refinement: still evidence-checked
                         self.set_leg_state(scope, cid, leg_state, reason=f"{kind} transport {outcome.value}")
                     return self._outbox(done)
@@ -2967,10 +2974,10 @@ class NeutralGridStore:
                                              f"have been called")
             leg = self.leg(cid)
             order = self.order(cid)
-            if result.exchange_order_id and order.exchange_order_id and \
-                    order.exchange_order_id != result.exchange_order_id:
-                raise InvalidTransitionError(f"CID {cid}: exchange order id {result.exchange_order_id} differs "
-                                             f"from recorded {order.exchange_order_id}")
+            if result.exchange_order_id:
+                binding_problem = self._exchange_id_binding_problem(cid, result.exchange_order_id)
+                if binding_problem is not None:
+                    raise InvalidTransitionError(binding_problem)
             releasing = outcome in (TransportOutcome.NOT_SENT, TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL)
             now = self._clock_ms()
             effective, effective_detail = outcome, detail
@@ -3012,7 +3019,7 @@ class NeutralGridStore:
                 self._x("UPDATE orders SET cancel_state = ?, updated_at_ms = ? WHERE cid = ?",
                         (cancel_state, now, cid))
             if result.exchange_order_id and not order.exchange_order_id:
-                self._x("UPDATE orders SET exchange_order_id = ? WHERE cid = ?", (result.exchange_order_id, cid))
+                self._bind_exchange_order_id(cid, result.exchange_order_id)
             if target is not None and not leg.final:
                 self._set_leg_state_raw(leg, target, f"{kind} transport {effective.value}")
             if leg_state is not None:  # engine refinement: same evidence rules as set_leg_state
@@ -3095,16 +3102,63 @@ class NeutralGridStore:
 
     # ---------------------------------------------------------------------------------------------- history
 
-    def _attribute_order(self, row: ExchangeOrderRow) -> Optional[int]:
-        client = _row_client_id(row)
+    def _exchange_id_owners(self, exchange_id: str) -> Tuple[int, ...]:
+        return tuple(row[0] for row in self._x(
+            "SELECT cid FROM orders WHERE exchange_order_id = ? ORDER BY cid", (exchange_id,)
+        ).fetchall())
+
+    def _resolve_order_identity(self, client: Optional[int], exchange_id: Optional[str]) \
+            -> Tuple[Optional[int], Optional[str]]:
+        """Resolve the two venue identities independently; never let one silently override the other."""
+        client_cid = client if client is not None and self._x(
+            "SELECT 1 FROM cid_map WHERE cid = ?", (client,)
+        ).fetchone() else None
+        owners = self._exchange_id_owners(exchange_id) if exchange_id else ()
+        if len(owners) > 1:
+            return client_cid, f"exchange order id {exchange_id} is already owned by multiple CIDs {owners}"
+        exchange_cid = owners[0] if owners else None
+        if client_cid is not None and exchange_cid is not None and client_cid != exchange_cid:
+            return client_cid, (f"client CID {client_cid} conflicts with exchange order id {exchange_id} "
+                                f"owned by CID {exchange_cid}")
+        return (client_cid if client_cid is not None else exchange_cid), None
+
+    def _identity_conflict_cids(self, client: Optional[int], exchange_id: Optional[str]) -> Tuple[int, ...]:
+        implicated: Set[int] = set(self._exchange_id_owners(exchange_id) if exchange_id else ())
         if client is not None and self._x("SELECT 1 FROM cid_map WHERE cid = ?", (client,)).fetchone():
-            return client
-        exchange_id = row.order_id or row.order_index
-        if exchange_id:
-            found = self._x("SELECT cid FROM orders WHERE exchange_order_id = ?", (exchange_id,)).fetchall()
-            if len(found) == 1:
-                return found[0][0]
+            implicated.add(client)
+        return tuple(sorted(implicated))
+
+    def _record_identity_conflict(self, result: HistoryBatchResult, inbox_id: int, client: Optional[int],
+                                  exchange_id: Optional[str], detail: str) -> None:
+        implicated = self._identity_conflict_cids(client, exchange_id)
+        self._finish_inbox(inbox_id, "CONFLICT", implicated[0] if len(implicated) == 1 else None, detail)
+        for cid in implicated or (None,):
+            self._conflict(result, "ID_OWNERSHIP_MISMATCH", inbox_id, cid, detail)
+
+    def _attribute_order(self, row: ExchangeOrderRow) -> Tuple[Optional[int], Optional[str]]:
+        return self._resolve_order_identity(_row_client_id(row), _row_exchange_id(row))
+
+    def _exchange_id_binding_problem(self, cid: int, exchange_id: str) -> Optional[str]:
+        _require_text(exchange_id, "exchange_order_id", 128)
+        order = self.order(cid)
+        if order is None:
+            return f"unknown CID {cid} cannot own exchange order id {exchange_id}"
+        if order.exchange_order_id is not None and order.exchange_order_id != exchange_id:
+            return (f"CID {cid}: exchange order id {exchange_id} differs from recorded "
+                    f"{order.exchange_order_id}")
+        owners = self._exchange_id_owners(exchange_id)
+        foreign = tuple(owner for owner in owners if owner != cid)
+        if foreign:
+            return f"exchange order id {exchange_id} is already owned by CID{'s' if len(foreign) > 1 else ''} " \
+                   f"{foreign if len(foreign) > 1 else foreign[0]}; refusing to bind CID {cid}"
         return None
+
+    def _bind_exchange_order_id(self, cid: int, exchange_id: str) -> None:
+        problem = self._exchange_id_binding_problem(cid, exchange_id)
+        if problem is not None:
+            raise InvalidTransitionError(problem)
+        self._x("UPDATE orders SET exchange_order_id = COALESCE(exchange_order_id, ?) WHERE cid = ?",
+                (exchange_id, cid))
 
     def _order_row_problems(self, cid: int, row: ExchangeOrderRow) -> List[str]:
         leg = self.leg(cid)
@@ -3123,8 +3177,9 @@ class NeutralGridStore:
             problems.append(f"price {row.price} != {leg.price}")
         if row.initial_base_amount != leg.amount:
             problems.append(f"amount {row.initial_base_amount} != {leg.amount}")
-        if row.order_id and order.exchange_order_id and row.order_id != order.exchange_order_id:
-            problems.append(f"exchange order id {row.order_id} != {order.exchange_order_id}")
+        exchange_id = _row_exchange_id(row)
+        if order.exchange_order_id and exchange_id != order.exchange_order_id:
+            problems.append(f"exchange order id {exchange_id} != {order.exchange_order_id}")
         if order.venue_filled is not None and row.filled_base_amount < order.venue_filled:
             problems.append(f"cumulative filled regressed {order.venue_filled} -> {row.filled_base_amount}")
         if row.filled_base_amount > leg.amount:
@@ -3138,11 +3193,13 @@ class NeutralGridStore:
         return order.venue_filled == row.filled_base_amount and order.venue_status == row.status
 
     def _update_order_from_row(self, cid: int, row: ExchangeOrderRow, *, final: bool) -> None:
-        self._x("""UPDATE orders SET exchange_order_id = COALESCE(exchange_order_id, ?), order_index = ?,
+        exchange_id = _row_exchange_id(row)
+        self._bind_exchange_order_id(cid, exchange_id)
+        self._x("""UPDATE orders SET order_index = ?,
                    nonce = COALESCE(?, nonce), venue_status = ?, venue_filled = ?, venue_remaining = ?,
                    venue_final = MAX(venue_final, ?), venue_row_json = ?, last_evidence_ms = ?, updated_at_ms = ?
                    WHERE cid = ?""",
-                (row.order_id or row.order_index, row.order_index, row.nonce, row.status,
+                (row.order_index, row.nonce, row.status,
                  canonical_decimal(row.filled_base_amount),
                  canonical_decimal(row.remaining_base_amount), int(final), row.raw_json, row.timestamp_ms,
                  self._clock_ms(), cid))
@@ -3314,14 +3371,11 @@ class NeutralGridStore:
 
     def _apply_trade(self, engine: EngineRecord, row: ExchangeTradeRow, key: str, inbox_id: int,
                      result: HistoryBatchResult) -> None:
-        cid = None
         client = row.own_client_order_id
-        if client is not None and self._x("SELECT 1 FROM cid_map WHERE cid = ?", (client,)).fetchone():
-            cid = client
-        elif row.own_exchange_order_id:
-            found = self._x("SELECT cid FROM orders WHERE exchange_order_id = ?", (row.own_exchange_order_id,)).fetchall()
-            if len(found) == 1:
-                cid = found[0][0]
+        cid, identity_problem = self._resolve_order_identity(client, row.own_exchange_order_id)
+        if identity_problem is not None:
+            self._record_identity_conflict(result, inbox_id, client, row.own_exchange_order_id, identity_problem)
+            return
         if cid is None:
             self._classify_unowned(engine, row.timestamp_ms, inbox_id, client, "trades", result)
             return
@@ -3356,7 +3410,7 @@ class NeutralGridStore:
         # a non-final TP on a released cycle is the audited cover of its late obligation, not late evidence
         late = leg.final or (cycle.state == "COMPLETE" and leg.role == LegRole.ENTRY)
         if row.own_exchange_order_id and not order.exchange_order_id:
-            self._x("UPDATE orders SET exchange_order_id = ? WHERE cid = ?", (row.own_exchange_order_id, cid))
+            self._bind_exchange_order_id(cid, row.own_exchange_order_id)
         self._x("""INSERT INTO fills(dedupe_key, domain, account_index, market_id, trade_id_str, own_side,
                    own_exchange_order_id, cid, grid_id, cell_id, generation, role, size, price, is_maker, timestamp_ms,
                    inbox_id, late, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -3400,7 +3454,12 @@ class NeutralGridStore:
 
     def _apply_order_row(self, engine: EngineRecord, row: ExchangeOrderRow, inbox_id: int,
                          result: HistoryBatchResult, touched_orders: Set[int]) -> None:
-        cid = self._attribute_order(row)
+        cid, identity_problem = self._attribute_order(row)
+        if identity_problem is not None:
+            self._record_identity_conflict(
+                result, inbox_id, _row_client_id(row), _row_exchange_id(row), identity_problem
+            )
+            return
         if cid is None:
             self._classify_unowned(engine, row.timestamp_ms, inbox_id, _row_client_id(row), "inactive_orders",
                                    result)
@@ -3633,6 +3692,14 @@ class NeutralGridStore:
         """Recompute leg/cycle quantities from the append-only fills table; returns inconsistencies."""
         problems: List[str] = []
         credited: Dict[Tuple[str, int, int, str], Decimal] = {}
+        with self._rlock:
+            duplicate_exchange_ids = self._x(
+                "SELECT exchange_order_id, group_concat(cid, ','), count(*) FROM orders "
+                "WHERE exchange_order_id IS NOT NULL GROUP BY exchange_order_id HAVING count(*) > 1 "
+                "ORDER BY exchange_order_id"
+            ).fetchall()
+        for row in duplicate_exchange_ids:
+            problems.append(f"exchange order id {row[0]} is owned by multiple CIDs [{row[1]}] ({row[2]} rows)")
         for leg in self.legs():
             fills = self.fills(leg.cid)
             total = sum((f.size for f in fills), Decimal(0))

@@ -217,15 +217,14 @@
 
   <!-- Access -->
   <section class="panel" id="panel-access" role="tabpanel" aria-labelledby="tab-access" hidden>
-    <h2>Профиль ключей</h2>
-    <p class="hint" id="keystore-note">Используется существующий зашифрованный keystore Hummingbot. Значения ключей
-      никогда не показываются и не передаются в браузер — только признак «задано».</p>
+    <h2>Ключи и привязка</h2>
+    <p class="hint" id="keystore-note">Статус доступа загружается…</p>
     <div class="grid-2">
-      <article class="card">
+      <article class="card" id="credentials-status-card">
         <h3>Статус</h3>
         <dl class="kv" id="keystore-status"></dl>
       </article>
-      <article class="card">
+      <article class="card" id="profile-card">
         <h3>Профили</h3>
         <form id="profile-form" class="stack" autocomplete="off">
           <label for="profile-select">Профиль</label>
@@ -235,14 +234,14 @@
         <dl class="kv" id="profile-fields"></dl>
       </article>
     </div>
-    <article class="card">
+    <article class="card" id="unlock-card">
       <h3>Разблокировать</h3>
       <form id="unlock-form" class="stack" autocomplete="off">
         <label for="unlock-password">Пароль keystore</label>
         <input id="unlock-password" type="password" autocomplete="off" spellcheck="false">
         <button type="submit" class="btn btn-primary">Разблокировать</button>
         <p class="hint">Пароль уходит только на локальный backend в теле запроса, не сохраняется в браузере и не
-          попадает в журналы. Его можно также ввести в терминале при запуске (--unlock-tty).</p>
+          попадает в журналы.</p>
         <p class="form-error" id="unlock-error" role="alert"></p>
       </form>
     </article>

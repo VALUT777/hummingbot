@@ -185,6 +185,7 @@ class FieldMappingTest(unittest.TestCase):
 class FakeConnector:
     domain = CONSTANTS.ROBINHOOD_DOMAIN
     account_index = ACCOUNT
+    api_key_index = 7
 
     def __init__(self):
         self.market = SimpleNamespace(market_id=MARKET)
@@ -196,6 +197,7 @@ class FakeConnector:
             return_value=LighterTransportResult(LighterTransportOutcome.ACCEPTED, "cancel_tx_accepted_not_terminal",
                                                 exchange_order_id=str(ASK_ORDER)))
         self.fetch_active_orders = AsyncMock()
+        self.fetch_maker_only_api_key_indexes = AsyncMock(return_value=frozenset())
         self.cursors: List[Optional[str]] = []
 
     def market_info_for_trading_pair(self, trading_pair):
@@ -260,6 +262,7 @@ class LighterPortTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(100, self.port.request_weight("inactive_orders"))
         self.assertEqual(300, self.port.request_weight("active_orders"))
         self.assertEqual(300, self.port.request_weight("account"))
+        self.assertEqual(600, self.port.request_weight("order_book_details"))
         self.assertEqual(300, self.port.request_weight("anything-else"))
 
     async def test_submit_passes_cid_unchanged_and_never_reduce_only(self):
@@ -348,6 +351,66 @@ class LighterPortTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(expected, rules.supports_post_only)
                 self.assertEqual(Decimal("0.0001"), rules.tick_size)
         self.assertEqual(len(cases), self.connector._update_trading_rules.await_count)  # always refreshed
+
+    async def test_trading_rules_block_ordinary_limit_when_selected_key_is_maker_only(self):
+        self.connector.market = SimpleNamespace(
+            market_id=MARKET, min_price_increment=Decimal("0.0001"), min_base_increment=Decimal("0.01"),
+            min_base_amount=Decimal("5"), min_quote_amount=Decimal("10"), max_leverage=Decimal("5"),
+            raw_info={"status": "active", "market_config": {"hidden": False, "force_reduce_only": False}},
+        )
+        self.connector._update_trading_rules = AsyncMock()
+        self.connector.fetch_maker_only_api_key_indexes.return_value = frozenset({3, 7})
+
+        rules = await self.port.trading_rules()
+
+        self.assertFalse(rules.supports_limit)
+        self.assertTrue(rules.supports_post_only)
+        self.assertEqual("API_KEY_MAKER_ONLY", rules.ordinary_limit_blocker)
+
+    async def test_trading_rules_allow_ordinary_limit_when_selected_key_is_not_maker_only(self):
+        self.connector.market = SimpleNamespace(
+            market_id=MARKET, min_price_increment=Decimal("0.0001"), min_base_increment=Decimal("0.01"),
+            min_base_amount=Decimal("5"), min_quote_amount=Decimal("10"), max_leverage=Decimal("5"),
+            raw_info={"status": "active", "market_config": {"hidden": False, "force_reduce_only": False}},
+        )
+        self.connector._update_trading_rules = AsyncMock()
+        self.connector.fetch_maker_only_api_key_indexes.return_value = frozenset({3, 8})
+
+        rules = await self.port.trading_rules()
+
+        self.assertTrue(rules.supports_limit)
+        self.assertTrue(rules.supports_post_only)
+        self.assertIsNone(rules.ordinary_limit_blocker)
+
+    async def test_trading_rules_fail_closed_when_maker_only_capability_is_unknown(self):
+        self.connector.market = SimpleNamespace(
+            market_id=MARKET, min_price_increment=Decimal("0.0001"), min_base_increment=Decimal("0.01"),
+            min_base_amount=Decimal("5"), min_quote_amount=Decimal("10"), max_leverage=Decimal("5"),
+            raw_info={"status": "active", "market_config": {"hidden": False, "force_reduce_only": False}},
+        )
+        self.connector._update_trading_rules = AsyncMock()
+        for result in (None, [7], frozenset({255}), frozenset({999}),
+                       RuntimeError("request failed auth=SECRET")):
+            with self.subTest(result=repr(result)):
+                if isinstance(result, Exception):
+                    self.connector.fetch_maker_only_api_key_indexes.side_effect = result
+                else:
+                    self.connector.fetch_maker_only_api_key_indexes.side_effect = None
+                    self.connector.fetch_maker_only_api_key_indexes.return_value = result
+
+                rules = await self.port.trading_rules()
+
+                self.assertFalse(rules.supports_limit)
+                self.assertTrue(rules.supports_post_only)
+                self.assertEqual("MAKER_ONLY_CAPABILITY_UNKNOWN", rules.ordinary_limit_blocker)
+                self.assertNotIn("SECRET", repr(rules))
+
+        self.connector.api_key_index = 255
+        self.connector.fetch_maker_only_api_key_indexes.side_effect = None
+        self.connector.fetch_maker_only_api_key_indexes.return_value = frozenset()
+        rules = await self.port.trading_rules()
+        self.assertFalse(rules.supports_limit)
+        self.assertEqual("MAKER_ONLY_CAPABILITY_UNKNOWN", rules.ordinary_limit_blocker)
 
     @staticmethod
     def leaky_content_type_error():

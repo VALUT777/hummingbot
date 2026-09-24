@@ -188,7 +188,7 @@ async def test_keystore_unlock_masked_and_secrets_never_leak(make_web, tmp_path,
     api_key = secrets.token_hex(40)  # 80 hex: API private key format (not a real key)
     _write_keystore(tmp_path, monkeypatch, password, api_key)
     keystore = KeystoreService(demo=False)
-    web = await make_web(sample_snapshot(), keystore=keystore, mode="attach")
+    web = await make_web(sample_snapshot(), keystore=keystore, mode="live")
     await web.login()
 
     listing = await (await web.get("/api/keystore")).json()
@@ -229,7 +229,7 @@ async def test_keystore_is_never_created_from_web(make_web, tmp_path, monkeypatc
     (tmp_path / "connectors").mkdir()
     (tmp_path / "connectors" / "lighter_perpetual_robinhood.yml").write_text("connector: lighter_perpetual_robinhood\n")
     monkeypatch.setattr(config_helpers, "CONNECTORS_CONF_DIR_PATH", tmp_path / "connectors")
-    web = await make_web(sample_snapshot(), keystore=KeystoreService(demo=False), mode="attach")
+    web = await make_web(sample_snapshot(), keystore=KeystoreService(demo=False), mode="live")
     await web.login()
     await web.post("/api/keystore/select", {"profile": "lighter_perpetual_robinhood"})
     resp = await web.post("/api/keystore/unlock", {"password": "first-password"})
@@ -251,6 +251,9 @@ def test_static_assets_are_local_and_js_never_stores_or_numbers_ids():
     assert not re.search(r"\b(Number|parseInt|parseFloat)\s*\(", js)
     assert ".innerHTML" not in js and "insertAdjacentHTML" not in js
     assert 'lang="ru"' in html
+    assert "от имени выбранного профиля ключей" not in js
+    assert "уже запущенному движку" in js
+    assert "--unlock-tty" not in html
 
 
 @pytest.mark.asyncio

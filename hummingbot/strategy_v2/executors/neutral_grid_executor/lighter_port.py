@@ -66,7 +66,8 @@ ENDPOINT_WEIGHTS: Dict[str, int] = {
     ENDPOINT_INACTIVE_ORDERS: CONSTANTS.WEIGHT_INACTIVE_ORDERS,  # 100
     ENDPOINT_ACTIVE_ORDERS: CONSTANTS.WEIGHT_DEFAULT,            # 300
     ENDPOINT_ACCOUNT: CONSTANTS.WEIGHT_DEFAULT,                  # 300
-    ENDPOINT_TRADING_RULES: CONSTANTS.WEIGHT_DEFAULT,            # 300
+    # Public market rules + private maker-only key capability, each an "other" 300-weight read.
+    ENDPOINT_TRADING_RULES: 2 * CONSTANTS.WEIGHT_DEFAULT,        # 600
     ENDPOINT_SEND_TX: CONSTANTS.WEIGHT_SEND_TX,                  # 6
 }
 
@@ -330,16 +331,36 @@ class LighterExchangePort:
 
     # reads -----------------------------------------------------------------------------------
     async def trading_rules(self) -> TradingRules:
-        """Fresh rules; limit/post-only availability comes from the refreshed market state.
+        """Fresh public rules plus the selected key's private maker-only capability.
 
         A market is tradable only if ``status == "active"`` and ``market_config`` carries boolean
         ``hidden is False`` and ``force_reduce_only is False`` (the same rule as the legacy grid
         snapshot). Anything else - including missing fields - reports both flags False so the engine
-        blocks new exposure (NG-GRID-003, NG-RISK-004). A market absent after refresh raises.
+        blocks new exposure (NG-GRID-003, NG-RISK-004). An unknown private capability blocks ordinary LIMIT and all
+        new entries immediately while preserving known post-only support; no key setting is ever changed here. A
+        market absent after refresh raises.
         """
         await _sanitized("trading_rules", self._connector._update_trading_rules)
         market = await _sanitized("trading_rules", self._market_info)
         tradable = market_is_tradable(getattr(market, "raw_info", None))
+        ordinary_limit_blocker = None
+        try:
+            maker_only = await _sanitized(
+                "maker_only_capability", self._connector.fetch_maker_only_api_key_indexes)
+            api_key_index = self._connector.api_key_index
+            if type(api_key_index) is not int or not 0 <= api_key_index <= CONSTANTS.MAX_API_KEY_INDEX \
+                    or type(maker_only) is not frozenset or any(
+                        type(index) is not int or not 0 <= index <= CONSTANTS.MAX_API_KEY_INDEX
+                        for index in maker_only):
+                raise HistorySchemaError("maker-only capability is malformed")
+            if api_key_index in maker_only:
+                ordinary_limit_blocker = "API_KEY_MAKER_ONLY"
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - fixed blocker only; private exception text is never retained
+            ordinary_limit_blocker = "MAKER_ONLY_CAPABILITY_UNKNOWN"
+        if not tradable:
+            ordinary_limit_blocker = None
         max_leverage = market.max_leverage
         return TradingRules(
             tick_size=market.min_price_increment,
@@ -348,9 +369,10 @@ class LighterExchangePort:
             min_notional=market.min_quote_amount,
             max_base=None,
             max_leverage=max_leverage if max_leverage > 0 else None,
-            supports_limit=tradable,
+            supports_limit=tradable and ordinary_limit_blocker is None,
             supports_post_only=tradable,
             fetched_at=self._clock(),
+            ordinary_limit_blocker=ordinary_limit_blocker,
         )
 
     async def best_bid_ask(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:

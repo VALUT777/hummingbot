@@ -9,14 +9,13 @@ Modes:
 
 Security defaults: binds 127.0.0.1 only; a non-loopback bind needs --allow-non-loopback-bind and is
 still only protected by session + CSRF + Origin (use an SSH tunnel or an authenticating TLS proxy for
-remote access). The keystore password is never accepted on the command line: use --unlock-tty (hidden
-prompt) or the unlock form in the UI. Closing the browser never stops the engine.
+remote access). In attach mode the Hummingbot host owns and unlocks connector credentials; this web
+process neither accepts a keystore password nor changes the attached profile. Closing the browser never stops the engine.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-import getpass
 import logging
 import signal
 import sys
@@ -60,10 +59,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="разрешить не-loopback адрес (опасно: нет TLS; используйте SSH-туннель)")
     parser.add_argument("--allowed-host", action="append", default=[],
                         help="дополнительное имя хоста для проверки Host/Origin (только вместе с флагом выше)")
-    parser.add_argument("--profile", default="lighter_perpetual_robinhood",
-                        help="имя профиля в зашифрованном keystore Hummingbot")
-    parser.add_argument("--unlock-tty", action="store_true",
-                        help="спросить пароль keystore скрытым вводом в терминале (никогда не через аргументы)")
     parser.add_argument("--stale-after", type=float, default=15.0,
                         help="через сколько секунд снимок считается устаревшим (по умолчанию 15)")
     parser.add_argument("--data-dir", type=Path, help="каталог временного журнала демо (по умолчанию mkdtemp)")
@@ -78,7 +73,7 @@ def refuse_secret_arguments(argv: Sequence[str]) -> None:
         lowered = arg.split("=", 1)[0].lower().lstrip("-")
         if any(word in lowered for word in _FORBIDDEN_ARG_WORDS):
             raise LaunchRefused("Пароли и ключи не принимаются в аргументах командной строки. "
-                                "Используйте --unlock-tty или форму разблокировки в интерфейсе.")
+                                "Выберите и разблокируйте ключи в процессе Hummingbot.")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -92,13 +87,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if not (0 < args.port < 65536):
         raise LaunchRefused("Некорректный порт")
     return args
-
-
-def unlock_from_tty(keystore, profile: str, *, stdin=sys.stdin, prompt=getpass.getpass) -> None:
-    if not stdin.isatty():
-        raise LaunchRefused("--unlock-tty требует интерактивный терминал (скрытый ввод).")
-    keystore.select(profile)
-    keystore.unlock(prompt("Пароль keystore Hummingbot (ввод скрыт): "))
 
 
 def login_url(host: str, port: int, token: str) -> str:
@@ -120,8 +108,6 @@ async def serve(args: argparse.Namespace, *, ready: Optional[asyncio.Event] = No
     else:
         bundle = await runtime.build_attach(args)
     ctx = bundle.context
-    if args.unlock_tty:
-        unlock_from_tty(ctx.keystore, args.profile)
     app = create_app(ctx)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

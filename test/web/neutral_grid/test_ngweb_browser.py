@@ -116,6 +116,62 @@ async def test_browser_truthful_state_security_and_keyboard(make_web, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_browser_attach_shows_bound_identity_and_hides_detached_keystore_controls(make_web, tmp_path):
+    web = await make_web(_snapshot_with_engine_fields("BOOTSTRAPPING"), mode="attach")
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.eval("document.getElementById('tab-access').click()")
+        await page.wait_for("document.getElementById('profile-card').hidden && "
+                            "document.getElementById('unlock-card').hidden")
+        assert not await page.eval("document.getElementById('credentials-status-card').hidden")
+        assert await page.eval("document.getElementById('profile-form').offsetParent === null")
+        assert await page.eval("document.getElementById('keystore-status').offsetParent !== null")
+        credentials = await page.eval("document.getElementById('keystore-status').textContent")
+        assert "lighter_perpetual_robinhood" in credentials
+        assert "Аккаунт" in credentials and "7" in credentials
+        assert "аккаунт 7" in await page.eval("document.getElementById('identity').textContent")
+
+        await page.eval("document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-prices').children.length > 0 && "
+                            "!document.getElementById('start-open').disabled")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        start_note = await page.eval("document.getElementById('start-mode-note').textContent")
+        assert "уже запущенному движку" in start_note
+        assert "аккаунт 7" in start_note and "LIT-USDG" in start_note
+        assert "выбранного профиля" not in start_note
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_attach_refreshes_identity_from_new_committed_snapshot(make_web, tmp_path):
+    web = await make_web(_snapshot_with_engine_fields("BOOTSTRAPPING"), mode="attach")
+    current = {"grid_id": None, "config_error": "engine_config отсутствует"}
+    web.ctx.identity_provider = lambda: dict(current)
+    browser, page = await _open(tmp_path, web)
+    try:
+        initial_identity = await page.eval("document.getElementById('identity').textContent")
+        assert initial_identity == "Привязка неизвестна"
+        current.clear()
+        current.update({"grid_id": "ng-engine-grid", "connector_name": "lighter_perpetual_robinhood",
+                        "trading_pair": "LIT-USDG", "account_index": "7"})
+        web.gateway.snapshot.update(committed_at=time.time(), engine_revision=2)
+        # Open Preview immediately, before the periodic /api/state refresh.  The confirmation must use the
+        # identity bound into this exact validated preview rather than the older session identity.
+        await page.eval("document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-prices').children.length > 0 && "
+                            "!document.getElementById('start-open').disabled")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        note = await page.eval("document.getElementById('start-mode-note').textContent")
+        assert "аккаунт 7" in note and "LIT-USDG" in note
+        await page.wait_for("document.getElementById('identity').textContent.includes('lighter_perpetual_robinhood')")
+    finally:
+        await browser.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scheme", ["light", "dark"])
 async def test_browser_contrast_and_mobile_layout(make_web, tmp_path, scheme):
     web = await make_web(_snapshot_with_engine_fields("PAUSED"))
