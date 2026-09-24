@@ -23,7 +23,17 @@ Completeness rules (NG-HIST-002, AC-10/11/12/41/53):
 * the durable high-water mark is only *returned* (``trades_high_water``/``orders_high_water``,
   only when ``complete``); the engine commits it in the same SQLite transaction as the inbox rows,
   dedupe keys and ledger transitions. The scanner itself never writes durable state, so an
-  in-flight pagination cursor is never persisted separately from the rows it produced.
+  in-flight pagination cursor is never persisted separately from the rows it produced;
+* rows are offered (``new_trades``/``new_orders``) only when a walk has *finished* (both streams
+  reached their natural end or verified boundary); in-progress and failed calls offer none. Every
+  key involved in a conflict - a duplicate with a different payload, a payload differing from the
+  committed one, a non-terminal inactive row, a changed high-water row, and a terminal order whose
+  executions exceed its cumulative fill (together with those executions) - is withheld from
+  ``new_*`` and exposed for audit in :attr:`HistoryScanner.last_conflicted_rows`. Every row that
+  is offered is therefore uncontradicted venue evidence that may be committed idempotently, even
+  when the result as a whole is incomplete (conflict or retention gap);
+* inactive orders are keyed by the exact exchange order id within the account/market scope; client
+  ids are part of the payload, so a client-id disagreement for one exchange order is a conflict.
 
 Work is bounded per :meth:`HistoryScanner.scan` call (weight budget + optional page cap) and is
 resumable: an unfinished walk keeps its in-memory position and reports ``in_progress`` so the
@@ -84,7 +94,7 @@ CANCELED_STATUS_PREFIX = "canceled"
 
 _MAX_CURSOR_LEN = 4096
 
-OrderKey = Tuple[str, int, int, str, str]
+OrderKey = Tuple[str, int, int, str]
 TradeKey = Tuple[str, int, int, str, str, str]
 
 
@@ -128,11 +138,11 @@ def trade_payload_fingerprint(row: ExchangeTradeRow) -> str:
 
 
 def order_dedupe_key(domain: str, row: ExchangeOrderRow) -> OrderKey:
-    exchange_id = row.order_index if row.order_index is not None else (row.order_id or "")
-    client_id = row.client_order_id_str
-    if client_id is None:
-        client_id = "" if row.client_order_id is None else str(row.client_order_id)
-    return (domain, row.account_index, row.market_id, exchange_id, client_id)
+    """Canonical order key: exact exchange order id in the account/market scope (client ids are payload)."""
+    exchange_id = row.order_index or row.order_id
+    if not exchange_id:
+        raise HistorySchemaError("order row has no exchange order id")
+    return (domain, row.account_index, row.market_id, exchange_id)
 
 
 def order_payload_fingerprint(row: ExchangeOrderRow) -> str:
@@ -245,7 +255,11 @@ class InMemoryHistoryCursorView:
         return list(self._rows[STREAM_ORDERS].values())
 
     def commit(self, result: HistoryScanResult) -> None:
-        """Apply new rows (idempotent by key) and, only for complete results, the high-water marks."""
+        """Apply offered rows (idempotent by key) and, only for complete results, the high-water marks.
+
+        Offered rows never include a contradicted key (see module docstring), so committing them from
+        an incomplete result is safe; the engine must still pause on ``conflicts``.
+        """
         for row in result.new_trades:
             key = row.dedupe_key(self.domain)
             fingerprint = trade_payload_fingerprint(row)
@@ -293,6 +307,7 @@ class _StreamProgress:
     rows: Dict[Tuple, object] = field(default_factory=dict)       # insertion order = newest -> oldest
     fingerprints: Dict[Tuple, str] = field(default_factory=dict)
     conflicts: List[str] = field(default_factory=list)
+    conflicted_keys: Dict[Tuple, List[object]] = field(default_factory=dict)   # key -> every version seen
     pages_read: int = 0
     duplicate_rows: int = 0
     saw_previous_high_water_row: bool = False
@@ -360,6 +375,8 @@ class HistoryScanner:
         self._retry_after_failure = False
         self.completed_scans: Deque[ScanRecord] = deque(maxlen=scan_log_size)
         self.last_result: Optional[HistoryScanResult] = None
+        # Every version of every row withheld from the last finished walk (audit / manual review).
+        self.last_conflicted_rows: Dict[str, List[object]] = {STREAM_TRADES: [], STREAM_ORDERS: []}
         self.coalesced_calls = 0
 
     # ------------------------------------------------------------------ cadence / coalescing
@@ -463,12 +480,15 @@ class HistoryScanner:
 
     def _result(self, complete: bool, reason: Optional[str], pages: Dict[str, int], weight: int,
                 conflicts: Optional[List[str]] = None,
-                high_water: Optional[Dict[str, Optional[str]]] = None) -> HistoryScanResult:
+                high_water: Optional[Dict[str, Optional[str]]] = None,
+                emit_rows: bool = False) -> HistoryScanResult:
         new_trades: List[ExchangeTradeRow] = []
         new_orders: List[ExchangeOrderRow] = []
         all_conflicts = list(conflicts or [])
         for progress in (self._progress or {}).values():
             for key, row in progress.rows.items():
+                if not emit_rows or key in progress.conflicted_keys:
+                    continue
                 if self._view.committed_payload(progress.stream, key) is not None:
                     continue
                 (new_trades if progress.stream == STREAM_TRADES else new_orders).append(row)
@@ -621,6 +641,7 @@ class HistoryScanner:
                 progress.last_numeric_id = numeric_id
         elif not is_terminal_order_status(row.status):
             self._add_conflict(progress, f"{REASON_CONFLICT}:inactive_order_not_terminal:{_key_label(key)}")
+            self._withhold(progress, key, row)
         if progress.newest is None:
             progress.newest = HighWaterMark(timestamp_ms=timestamp_ms, key=key)
         progress.oldest_ts_ms = timestamp_ms
@@ -629,17 +650,21 @@ class HistoryScanner:
             progress.saw_previous_high_water_row = True
             if previous.timestamp_ms != timestamp_ms:
                 self._add_conflict(progress, f"{REASON_CONFLICT}:high_water_row_changed:{progress.stream}")
+                self._withhold(progress, key, row)
         seen = progress.fingerprints.get(key)
         if seen is not None:
             progress.duplicate_rows += 1
             if seen != fingerprint:
                 self._add_conflict(progress, f"{REASON_CONFLICT}:duplicate_key_payload_mismatch:{_key_label(key)}")
+                self._withhold(progress, key, progress.rows[key])
+                self._withhold(progress, key, row)
             return None
         progress.fingerprints[key] = fingerprint
         progress.rows[key] = row
         committed = self._view.committed_payload(progress.stream, key)
         if committed is not None and committed != fingerprint:
             self._add_conflict(progress, f"{REASON_CONFLICT}:committed_payload_mismatch:{_key_label(key)}")
+            self._withhold(progress, key, row)
         return None
 
     @staticmethod
@@ -647,13 +672,25 @@ class HistoryScanner:
         if conflict not in progress.conflicts:
             progress.conflicts.append(conflict)
 
+    @staticmethod
+    def _withhold(progress: _StreamProgress, key: Tuple, row: object) -> None:
+        versions = progress.conflicted_keys.setdefault(key, [])
+        if not any(version is row for version in versions):
+            versions.append(row)
+
     def _finalize(self, pages: Dict[str, int], weight_used: int) -> HistoryScanResult:
         now = self._clock()
         conflicts: List[str] = []
         retention_gap = False
         trades_progress = self._progress[STREAM_TRADES]
         orders_progress = self._progress[STREAM_ORDERS]
-        conflicts.extend(cumulative_conflicts(orders_progress.rows.values(), trades_progress.rows.values()))
+        for conflict, order_key, trade_keys in _cumulative_conflict_details(
+            self.domain, orders_progress.rows.values(), trades_progress.rows.values()
+        ):
+            conflicts.append(conflict)
+            self._withhold(orders_progress, order_key, orders_progress.rows[order_key])
+            for trade_key in trade_keys:
+                self._withhold(trades_progress, trade_key, trades_progress.rows[trade_key])
         for progress in self._progress.values():
             previous = progress.previous_high_water
             if previous is not None and not progress.saw_previous_high_water_row:
@@ -684,7 +721,12 @@ class HistoryScanner:
         else:
             reason = None
         complete = reason is None
-        result = self._result(complete, reason, pages, weight_used, conflicts=conflicts, high_water=high_water)
+        result = self._result(complete, reason, pages, weight_used, conflicts=conflicts, high_water=high_water,
+                              emit_rows=True)
+        self.last_conflicted_rows = {
+            name: [version for versions in progress.conflicted_keys.values() for version in versions]
+            for name, progress in self._progress.items()
+        }
         started_at = self._scan_started_at if self._scan_started_at is not None else now
         self._progress = None
         self._consecutive_failures = 0
@@ -709,28 +751,36 @@ def cumulative_conflicts(orders: Iterable[ExchangeOrderRow], trades: Iterable[Ex
     Only rows present in the same evidence set are compared, so a lower trade sum is never a
     conflict (older fills may lie outside the window); a higher one always is.
     """
-    by_exchange_id: Dict[str, Decimal] = {}
-    by_client_id: Dict[int, Decimal] = {}
+    return [conflict for conflict, _, _ in _cumulative_conflict_details("", orders, trades)]
+
+
+def _cumulative_conflict_details(
+    domain: str, orders: Iterable[ExchangeOrderRow], trades: Iterable[ExchangeTradeRow]
+) -> List[Tuple[str, OrderKey, List[Tuple]]]:
+    """(conflict, order key, keys of the executions attributed to it) for every cumulative conflict."""
+    by_exchange_id: Dict[str, List[ExchangeTradeRow]] = {}
+    by_client_id: Dict[int, List[ExchangeTradeRow]] = {}
     for trade in trades:
         if trade.own_exchange_order_id:
-            by_exchange_id[trade.own_exchange_order_id] = (
-                by_exchange_id.get(trade.own_exchange_order_id, Decimal("0")) + trade.size
-            )
+            by_exchange_id.setdefault(trade.own_exchange_order_id, []).append(trade)
         elif trade.own_client_order_id is not None:
-            by_client_id[trade.own_client_order_id] = (
-                by_client_id.get(trade.own_client_order_id, Decimal("0")) + trade.size
-            )
-    conflicts = []
+            by_client_id.setdefault(trade.own_client_order_id, []).append(trade)
+    details = []
     for order in orders:
         if not is_terminal_order_status(order.status):
             continue
-        executed = sum((by_exchange_id.get(i, Decimal("0")) for i in order_exchange_ids(order)), Decimal("0"))
+        attributed = [trade for i in order_exchange_ids(order) for trade in by_exchange_id.get(i, [])]
         if order.client_order_id is not None:
-            executed += by_client_id.get(order.client_order_id, Decimal("0"))
+            attributed += by_client_id.get(order.client_order_id, [])
+        executed = sum((trade.size for trade in attributed), Decimal("0"))
         if executed > order.filled_base_amount:
             label = order.order_index or order.order_id or str(order.client_order_id)
-            conflicts.append(f"{REASON_CONFLICT}:trades_exceed_order_cumulative:{label}")
-    return conflicts
+            details.append((
+                f"{REASON_CONFLICT}:trades_exceed_order_cumulative:{label}",
+                order_dedupe_key(domain, order),
+                [trade.dedupe_key(domain) for trade in attributed],
+            ))
+    return details
 
 
 def attribute_trades_to_order(order: ExchangeOrderRow,

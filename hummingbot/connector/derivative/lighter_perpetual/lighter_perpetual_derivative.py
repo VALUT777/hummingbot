@@ -45,8 +45,10 @@ from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativ
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import get_new_numeric_client_order_id
 from hummingbot.core.api_throttler.data_types import RateLimit
+from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
@@ -108,8 +110,11 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         self._balance_refresh_task: Optional[asyncio.Task] = None
         # Neutral grid: payload-free "poll authoritative history soon" signals (never proof).
         self._history_wakeup_listeners: List[Callable[[], None]] = []
-        # Orders sent through `submit_with_client_id`: tracked (events/WS updates) but reconciled by
-        # the neutral-grid engine from paginated authoritative history instead of per-order polls.
+        # Every client id sent through `submit_with_client_id`, restored from tracking state or
+        # registered by the engine, for the whole process lifetime (never removed). Such orders are
+        # tracked (events/WS updates) but reconciled by the neutral-grid engine from paginated
+        # authoritative history: no legacy per-order polls, lost-order handling, generic cancel or
+        # re-send of the same client id.
         self._history_reconciled_client_order_ids: Set[str] = set()
         self._real_time_balance_update = False
         self._signer_client = self._create_signer_client() if trading_required and self._account_index is not None else None
@@ -315,6 +320,58 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         await self._update_orders_with_error_handler(
             orders=orders, error_handler=self._handle_update_error_for_active_order
         )
+
+    async def _update_lost_orders(self):
+        orders = [
+            order for client_order_id, order in self._order_tracker.lost_orders.copy().items()
+            if client_order_id not in self._history_reconciled_client_order_ids
+        ]
+        await self._update_orders_with_error_handler(
+            orders=orders, error_handler=self._handle_update_error_for_lost_order
+        )
+
+    async def _cancel_lost_orders(self):
+        # History-reconciled orders are cancelled only by the engine (durable intent first).
+        for client_order_id, lost_order in list(self._order_tracker.lost_orders.items()):
+            if client_order_id in self._history_reconciled_client_order_ids:
+                continue
+            await self._execute_order_cancel(order=lost_order)
+
+    @property
+    def limit_orders(self) -> List[LimitOrder]:
+        return [
+            order.to_limit_order() for order in self.in_flight_orders.values()
+            if order.client_order_id not in self._history_reconciled_client_order_ids
+        ]
+
+    @property
+    def tracking_states(self) -> Dict[str, Any]:
+        states = super().tracking_states
+        for client_order_id, state in states.items():
+            if client_order_id in self._history_reconciled_client_order_ids and isinstance(state, dict):
+                state[CONSTANTS.HISTORY_RECONCILED_STATE_MARKER] = True
+        return states
+
+    def restore_tracking_states(self, saved_states: Dict[str, Any]):
+        for client_order_id, state in saved_states.items():
+            if isinstance(state, dict) and state.get(CONSTANTS.HISTORY_RECONCILED_STATE_MARKER) is True:
+                self._history_reconciled_client_order_ids.add(str(client_order_id))
+        super().restore_tracking_states(saved_states)
+
+    async def cancel_all(self, timeout_seconds: float) -> List[CancellationResult]:
+        # Hummingbot stop/exit must not cancel neutral-grid orders behind the engine's back: they are
+        # skipped by `_execute_cancel` and omitted from the result (the engine owns their cancel).
+        results = await super().cancel_all(timeout_seconds)
+        return [result for result in results if result.order_id not in self._history_reconciled_client_order_ids]
+
+    async def _execute_cancel(self, trading_pair: str, order_id: str) -> str:
+        if order_id in self._history_reconciled_client_order_ids:
+            self.logger().warning(
+                f"Order {order_id} is owned by the neutral grid engine; it is cancelled only through "
+                f"cancel_with_client_id after a durable cancel intent."
+            )
+            return None
+        return await super()._execute_cancel(trading_pair, order_id)
 
     async def _update_lost_orders_status(self):
         await self._update_lost_orders()
@@ -1572,7 +1629,10 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         if self._signer_client is None:
             return LighterTransportResult(not_sent, "pre_send_validation: signer client unavailable")
         order_id = str(client_order_id)
-        if self._order_tracker.fetch_order(client_order_id=order_id) is not None:
+        if (
+            order_id in self._history_reconciled_client_order_ids
+            or self._order_tracker.fetch_order(client_order_id=order_id) is not None
+        ):
             # A previous submission with this CID governs; re-sending it is not proven idempotent.
             return LighterTransportResult(LighterTransportOutcome.UNKNOWN, "duplicate_client_order_id_in_flight")
 
@@ -1631,15 +1691,28 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             tx_hash=tx_hash if isinstance(tx_hash, str) else None,
         )
 
+    def register_history_reconciled_order(self, client_order_id: int) -> None:
+        """Mark a durable engine client id as history-reconciled (call on startup, before polling).
+
+        The engine should register every client id whose outbox intent may have reached transport.
+        The id is then never polled per order, never cancelled by generic/lost-order paths and never
+        re-sent by ``submit_with_client_id`` in this process. Orders restored from Hummingbot
+        tracking state are re-registered automatically via a marker in the saved state.
+        """
+        problem = self._client_order_id_problem(client_order_id)
+        if problem is not None:
+            raise ValueError(problem)
+        self._history_reconciled_client_order_ids.add(str(client_order_id))
+
     def release_history_reconciled_order(self, client_order_id: int) -> None:
         """Stop tracking a CID-submitted order once the engine has proven it terminal from history.
 
-        Emits no events and sends nothing; the order stays in the tracker cache, so the same client
-        id is still refused by ``submit_with_client_id``.
+        Emits no events and sends nothing. The client id stays history-reconciled for the process
+        lifetime: it is still refused by ``submit_with_client_id`` after the tracker cache expires and
+        still excluded from legacy polling. Across restarts the engine's durable CID ledger is the
+        guard (see ``register_history_reconciled_order``).
         """
-        order_id = str(client_order_id)
-        self._order_tracker.stop_tracking_order(order_id)
-        self._history_reconciled_client_order_ids.discard(order_id)
+        self._order_tracker.stop_tracking_order(str(client_order_id))
 
     async def cancel_with_client_id(
         self,

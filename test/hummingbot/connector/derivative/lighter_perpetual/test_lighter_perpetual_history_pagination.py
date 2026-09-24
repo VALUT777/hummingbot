@@ -114,11 +114,14 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
 
         self.signer.create_order = AsyncMock(side_effect=create_order)
         self.signer.cancel_order = AsyncMock(side_effect=cancel_order)
+        self.connector = self.new_connector()
+
+    def new_connector(self) -> LighterPerpetualDerivative:
         with patch(
             "hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_derivative.SignerClient",
             return_value=self.signer,
         ):
-            self.connector = LighterPerpetualDerivative(
+            connector = LighterPerpetualDerivative(
                 lighter_perpetual_account_index=ACCOUNT,
                 lighter_perpetual_api_key_index=1,
                 lighter_perpetual_api_private_key=PRIVATE_KEY,
@@ -127,11 +130,18 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
                 domain=CONSTANTS.ROBINHOOD_DOMAIN,
             )
         market = market_info()
-        self.connector._markets_by_trading_pair = {PAIR: market}
-        self.connector._markets_by_id = {MARKET: market}
-        self.connector._markets_by_exchange_symbol = {"LIT": market}
-        # prove the pre-persisted CID path never allocates a fresh client id
-        self.connector._new_client_order_id = MagicMock(side_effect=AssertionError("new CID allocated"))
+        connector._markets_by_trading_pair = {PAIR: market}
+        connector._markets_by_id = {MARKET: market}
+        connector._markets_by_exchange_symbol = {"LIT": market}
+        # Tripwire for "never a new CID": a plain mock (not raising, so the connector's broad
+        # except cannot turn a regression into the expected UNKNOWN); tests assert it is never called.
+        connector._new_client_order_id = MagicMock(return_value="424242")
+        return connector
+
+    async def submit_cid(self, cid: int, connector: Optional[LighterPerpetualDerivative] = None):
+        return await (connector or self.connector).submit_with_client_id(
+            client_order_id=cid, trading_pair=PAIR, trade_type=TradeType.BUY, price=Decimal("5.0000"),
+            amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER)
 
     def pool_weights(self) -> List[int]:
         return [log.weight for log in self.connector._throttler._task_logs
@@ -407,15 +417,16 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_ac56_timeout_not_found_and_errors_are_unknown_and_never_retry_with_new_cid(self):
         outcomes = {
-            "timeout": asyncio.TimeoutError(),
-            "connection": ConnectionResetError("peer reset"),
-            "secretish_exception": RuntimeError(f"{PRIVATE_KEY} {AUTH_TOKEN}"),
-            "http_400_or_signing_error": (None, None, "invalid nonce"),
-            "not_found": (None, None, "order not found"),
-            "non_200": (None, {"code": 21120, "message": "rejected"}, None),
-            "missing_code": (None, {}, None),
+            "timeout": (asyncio.TimeoutError(), "transport_exception: TimeoutError"),
+            "connection": (ConnectionResetError("peer reset"), "transport_exception: ConnectionResetError"),
+            "secretish_exception": (RuntimeError(f"{PRIVATE_KEY} {AUTH_TOKEN}"), "transport_exception: RuntimeError"),
+            "http_400_or_signing_error": ((None, None, "invalid nonce"),
+                                          "transport_error: signer returned an error"),
+            "not_found": ((None, None, "order not found"), "transport_error: signer returned an error"),
+            "non_200": ((None, {"code": 21120, "message": "rejected"}, None), "transport_error: code=21120"),
+            "missing_code": ((None, {}, None), "transport_error: code=None"),
         }
-        for cid, (name, behaviour) in enumerate(outcomes.items(), start=100):
+        for cid, (name, (behaviour, expected_detail)) in enumerate(outcomes.items(), start=100):
             with self.subTest(name):
                 self.signer.create_order.reset_mock()
                 if isinstance(behaviour, BaseException):
@@ -427,7 +438,9 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
                     client_order_id=cid, trading_pair=PAIR, trade_type=TradeType.BUY, price=Decimal("5.0000"),
                     amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER)
                 self.assertEqual(LighterTransportOutcome.UNKNOWN, result.outcome)
+                self.assertEqual(expected_detail, result.detail)
                 self.assertNotEqual(LighterTransportOutcome.DEFINITIVE_REJECT_ZERO_FILL, result.outcome)
+                self.connector._new_client_order_id.assert_not_called()
                 self.assertNotIn(PRIVATE_KEY, result.detail)
                 self.assertNotIn(AUTH_TOKEN, result.detail)
                 self.signer.create_order.assert_awaited_once()
@@ -443,6 +456,7 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(LighterTransportOutcome.UNKNOWN, again.outcome)
                 self.assertEqual("duplicate_client_order_id_in_flight", again.detail)
                 self.signer.create_order.assert_awaited_once()
+                self.connector._new_client_order_id.assert_not_called()
 
     async def test_cid_orders_are_tracked_but_not_polled_per_order(self):
         await self.connector.submit_with_client_id(
@@ -476,6 +490,87 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
             client_order_id=321, trading_pair=PAIR, trade_type=TradeType.BUY, price=Decimal("5.0000"),
             amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER)
         self.assertEqual(LighterTransportOutcome.UNKNOWN, again.outcome)  # a CID is never reused
+
+    async def test_restored_cid_orders_stay_excluded_from_polling_lost_orders_and_resend(self):
+        """Finding 3: the CID exclusion must survive Hummingbot's tracking-state save/restore."""
+        self.assertEqual(LighterTransportOutcome.ACCEPTED, (await self.submit_cid(4242)).outcome)
+        await asyncio.sleep(0)
+        self.connector.start_tracking_order(
+            order_id="999", exchange_order_id=None, trading_pair=PAIR, trade_type=TradeType.BUY,
+            price=Decimal("5"), amount=Decimal("10"), order_type=OrderType.LIMIT)
+        saved = json.loads(json.dumps(self.connector.tracking_states))  # MarketsRecorder stores JSON
+        self.assertIs(True, saved["4242"][CONSTANTS.HISTORY_RECONCILED_STATE_MARKER])
+        self.assertNotIn(CONSTANTS.HISTORY_RECONCILED_STATE_MARKER, saved["999"])  # legacy order untouched
+        del saved["999"]
+
+        restarted = self.new_connector()
+        restarted.restore_tracking_states(saved)
+        self.assertIn("4242", restarted.in_flight_orders)  # still tracked for events/WS updates
+        polled: List[str] = []
+
+        async def request_status(tracked_order):
+            polled.append(tracked_order.client_order_id)
+            raise IOError("must not poll")
+
+        restarted._request_order_status = AsyncMock(side_effect=request_status)
+        restarted._api_get = AsyncMock(return_value={"trades": [], "orders": [
+            {"client_order_id": "4242", "order_id": str(BIG + 4242), "status": "open", "filled_base_amount": "0"}]})
+        await restarted._update_orders()
+        await restarted._update_trade_history()
+        self.assertEqual([], polled)
+        restarted._api_get.assert_not_awaited()
+
+        # a restored CID can never be re-sent in the new process either
+        self.signer.create_order.reset_mock()
+        again = await self.submit_cid(4242, connector=restarted)
+        self.assertEqual(LighterTransportOutcome.UNKNOWN, again.outcome)
+        self.signer.create_order.assert_not_awaited()
+
+        # lost-order escalation never polls or cancels a CID order
+        restarted._order_tracker._lost_orders["4242"] = restarted._order_tracker.fetch_order(client_order_id="4242")
+        await restarted._update_lost_orders()
+        await restarted._cancel_lost_orders()
+        self.assertEqual([], polled)
+        self.signer.cancel_order.assert_not_awaited()
+
+    async def test_engine_can_register_durable_cids_before_polling_starts(self):
+        fresh = self.new_connector()
+        fresh.register_history_reconciled_order(777)
+        self.signer.create_order.reset_mock()
+        self.assertEqual(LighterTransportOutcome.UNKNOWN, (await self.submit_cid(777, connector=fresh)).outcome)
+        self.signer.create_order.assert_not_awaited()
+
+    async def test_cancel_all_and_generic_cancel_never_touch_cid_orders(self):
+        """Finding 4: Hummingbot stop/exit must not cancel engine orders without a durable intent."""
+        self.assertEqual(LighterTransportOutcome.ACCEPTED, (await self.submit_cid(7)).outcome)
+        await asyncio.sleep(0)
+        self.connector._api_get = AsyncMock(return_value={"orders": [
+            {"client_order_id": "7", "order_id": str(BIG + 7), "status": "open", "filled_base_amount": "0"}]})
+        results = await self.connector.cancel_all(5)
+        self.assertEqual([], [r.order_id for r in results])
+        self.assertIsNone(await self.connector._execute_cancel(PAIR, "7"))
+        self.connector.cancel(PAIR, "7")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.signer.cancel_order.assert_not_awaited()
+        self.assertEqual([], [order.client_order_id for order in self.connector.limit_orders])
+        self.assertEqual(OrderState.OPEN, self.connector.in_flight_orders["7"].current_state)
+
+    async def test_released_cid_is_refused_for_process_lifetime_and_stays_unpolled(self):
+        """Finding 5: refusal must not depend on the 30 s tracker cache; release must not re-enable polls."""
+        self.assertEqual(LighterTransportOutcome.ACCEPTED, (await self.submit_cid(321)).outcome)
+        await asyncio.sleep(0)
+        self.connector.release_history_reconciled_order(321)
+        api_get = AsyncMock(return_value={"trades": []})
+        self.connector._api_get = api_get
+        await self.connector._update_trade_history()  # order sits in the tracker cache (fillable)
+        api_get.assert_not_awaited()
+        self.connector._order_tracker._cached_orders.clear()  # simulate the 30 s TTL expiry
+        again = await self.submit_cid(321)
+        self.assertEqual(LighterTransportOutcome.UNKNOWN, again.outcome)
+        self.assertEqual("duplicate_client_order_id_in_flight", again.detail)
+        self.signer.create_order.assert_awaited_once()
+        self.connector._new_client_order_id.assert_not_called()
 
     # ------------------------------------------------------------------------ cancel
     async def test_cancel_by_exchange_index_is_not_terminal(self):

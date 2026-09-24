@@ -313,6 +313,37 @@ class LighterPortTest(unittest.IsolatedAsyncioTestCase):
         self.connector.cancel_with_client_id.side_effect = TimeoutError()
         self.assertEqual(TransportOutcome.UNKNOWN, (await self.port.cancel(7, None)).outcome)
 
+    async def test_trading_rules_reflect_market_state_and_fail_closed(self):
+        """Review finding 7: limit/post-only availability comes from fresh market state."""
+        def market(raw_info):
+            return SimpleNamespace(
+                market_id=MARKET, min_price_increment=Decimal("0.0001"), min_base_increment=Decimal("0.01"),
+                min_base_amount=Decimal("5"), min_quote_amount=Decimal("10"), max_leverage=Decimal("5"),
+                raw_info=raw_info)
+
+        tradable = {"status": "active", "market_config": {"hidden": False, "force_reduce_only": False}}
+        cases = {
+            "tradable": (tradable, True),
+            "force_reduce_only": ({"status": "active", "market_config": {"hidden": False, "force_reduce_only": True}},
+                                  False),
+            "hidden": ({"status": "active", "market_config": {"hidden": True, "force_reduce_only": False}}, False),
+            "inactive": ({"status": "inactive", "market_config": {"hidden": False, "force_reduce_only": False}},
+                         False),
+            "missing_market_config": ({"status": "active"}, False),
+            "missing_force_reduce_only": ({"status": "active", "market_config": {"hidden": False}}, False),
+            "non_bool_flag": ({"status": "active", "market_config": {"hidden": False, "force_reduce_only": "false"}},
+                              False),
+        }
+        self.connector._update_trading_rules = AsyncMock()
+        for name, (raw_info, expected) in cases.items():
+            with self.subTest(name):
+                self.connector.market = market(raw_info)
+                rules = await self.port.trading_rules()
+                self.assertIs(expected, rules.supports_limit)
+                self.assertIs(expected, rules.supports_post_only)
+                self.assertEqual(Decimal("0.0001"), rules.tick_size)
+        self.assertEqual(len(cases), self.connector._update_trading_rules.await_count)  # always refreshed
+
     async def test_position_scope_is_checked(self):
         self.connector.fetch_account_position = AsyncMock(return_value={
             "account_index": ACCOUNT, "market_id": MARKET, "net_position": Decimal("-12.5"),
