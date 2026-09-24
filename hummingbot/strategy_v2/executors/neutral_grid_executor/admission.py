@@ -60,6 +60,7 @@ class CellAdmission:
     reserved_slots: int = 0          # current durable reservation of this cell (0 if not armed)
     eligible: bool = True            # idle cell allowed to start a new cycle now
     blocker: Optional[str] = None    # why an idle cell is not eligible (UI)
+    slot_need: Optional[int] = None  # open cycle: max simultaneous orders still possible (see slot_need_from_ledger)
 
 
 @dataclass(frozen=True)
@@ -122,12 +123,22 @@ def plan(cells: Sequence[CellAdmission], cap: int, mid: Optional[Decimal], rules
     shortfall: Dict[int, int] = {}
     blocked: Dict[int, str] = {}
 
-    # 1. Exit side first: every open cycle keeps (at least) what it holds.
+    # 1. Exit side first: every open cycle keeps what it still may need (never less than its actual orders).
     open_cells = sorted((c for c in cells if c.open_cycle), key=lambda c: c.cell.cell_id)
+    targets: Dict[int, int] = {}
     for c in open_cells:
         cid = c.cell.cell_id
         actual[cid] = c.actual_orders
-        reservations[cid] = max(c.reserved_slots, c.actual_orders)
+        held = max(c.reserved_slots, c.actual_orders)
+        if c.slot_need is not None:
+            target = c.slot_need
+        elif not rule_errors:
+            target = required_slots(order_amount_base, rules, c.cell.tp_price)
+        else:
+            target = held
+        targets[cid] = max(target, c.actual_orders)
+        # Shrink first (a finished entry / closed TP returns its slot), growth is granted in step 2.
+        reservations[cid] = min(held, targets[cid])
     for c in cells:
         if not c.open_cycle:
             actual[c.cell.cell_id] = c.actual_orders
@@ -138,18 +149,16 @@ def plan(cells: Sequence[CellAdmission], cap: int, mid: Optional[Decimal], rules
         return SlotLedger(cap=eff_cap, actual=total_actual, reserved_unused=unused,
                           free=eff_cap - total_actual - unused)
 
-    # 2. Runtime floors may have dropped: grow open reservations to the current requirement (before entries).
-    if not rule_errors:
-        for c in open_cells:
-            cid = c.cell.cell_id
-            need = required_slots(order_amount_base, rules, c.cell.tp_price)
-            missing = need - reservations[cid]
-            if missing <= 0:
-                continue
-            grant = max(min(missing, ledger().free), 0)
-            reservations[cid] += grant
-            if grant < missing:
-                shortfall[cid] = missing - grant
+    # 2. Grow open reservations to what they may still need (e.g. runtime floors dropped) before any entry.
+    for c in open_cells:
+        cid = c.cell.cell_id
+        missing = targets[cid] - reservations[cid]
+        if missing <= 0:
+            continue
+        grant = max(min(missing, ledger().free), 0)
+        reservations[cid] += grant
+        if grant < missing:
+            shortfall[cid] = missing - grant
     slots = ledger()
     if slots.oversubscribed:
         blocker = blocker or f"SLOTS_OVERSUBSCRIBED:free={slots.free}"
@@ -233,3 +242,24 @@ def select_entries_to_cancel(needed: int, entries: Sequence[SlotEntry], mid: Opt
 
     candidates.sort(key=key)
     return tuple(e.key for e in candidates[:needed])
+
+
+def slot_need_from_ledger(ledger, rules: TradingRules) -> int:
+    """Maximum number of simultaneously held slots a ``cells.CellLedger`` may still need.
+
+    ``non-final legs`` (each holds one slot, UNKNOWN included) ``+`` future TP children: while an entry may still
+    fill, ``ceil((unassigned + entry remainder) / min_valid_TP_qty)``; once every entry is final, only what is
+    dispatchable now under ``rules`` (DUST does not hold a slot until rules make it dispatchable).
+    """
+    min_valid = min_valid_tp_qty(rules, ledger.spec.tp_price)
+    plan = ledger.tp_obligation_to_dispatch(rules)
+    need = 0
+    for cycle in ledger.open_cycles():
+        need += sum(1 for leg in cycle.legs if not leg.is_final)
+        if cycle.entry_final:
+            need += sum(1 for item in plan.items if item.generation == cycle.generation)
+        else:
+            entry_remaining = sum((e.remaining for e in cycle.entries if not e.is_final), ZERO)
+            future = max(cycle.unassigned_total(), ZERO) + entry_remaining
+            need += math.ceil(Fraction(future) / Fraction(min_valid))
+    return need
