@@ -360,7 +360,29 @@ Mutation proofs (scratch copy of the fixed tree, one guard removed per run; 16/1
 Contract for WS-E (M1): render `summary.history_conflicts` (all version summaries are strings; `committed` marks
 the ledger's version) and send `ack_history_conflict` with the viewed `summary.conflict_set_id` and, for keys whose
 versions are all `committed: false`, `accepted: {<key>: <fingerprint>}`. The web normalisation currently drops both
-fields, so a web ack is refused with `CONFLICT_SET_ID_REQUIRED` until WS-E passes them through (R7).
+fields, so a web ack is refused with `CONFLICT_SET_ID_REQUIRED` until WS-E passes them through (R7, since done).
+
+M1 web parity (orchestrator follow-up; `codex/ng-web` @ `6fdf45d76` merged as the fast-forward to `d82f5992e`; red
+`adcc254eb`, green `fa4d0289f`). The web accepts only opaque tokens `[A-Za-z0-9_:.-]{1,160}` for keys, fingerprints and
+the set id, and the engine had published the raw typed-JSON dedupe label and the raw canonical-JSON payload
+fingerprint. Canonical form, identical on both sides (the engine publishes it, the web echoes it verbatim):
+
+* `key`: `trade:<trade_id>:<own_side>:<own_exchange_order_id>` / `order:<exchange_order_id>` (domain, account,
+  market are fixed per engine); a part outside `[A-Za-z0-9_.-]` or a key over 160 chars becomes
+  `<trade|order>:sha:<32 hex of the typed key>`; single-version entries are namespaced
+  `store_conflict:<id>`, `manual_reconcile:reason`, `freeze:LEDGER_INVARIANT`, `active_evidence:<cell>` (unique keys).
+* `fingerprint`: first 32 lowercase hex of sha256(UTF-8 of the scanner's canonical payload fingerprint,
+  `history.trade_payload_fingerprint` / `order_payload_fingerprint`); single-version entries: 32-hex digest of
+  their summary. The engine maps an `accepted` fingerprint back to the raw one (only among that key's versions).
+* `conflict_set_id`: first 32 hex of sha256 over the canonical JSON of `[[stream, key, [fingerprints…]], …]`.
+* `stream` values are the scanner's (`trades`, `inactive_orders`) plus the single-entry kinds above.
+
+The web ack `{action, note, acknowledge, conflict_set_id, accepted, confirmation}` is accepted as is (extra fields
+ignored) — `E test_ng_engine_review4.py::test_m1_web_parity_keys_fingerprints_and_the_normalized_ack_apply` runs
+the real `web.neutral_grid.commands.CommandService` normalisation and conflict-set gate on a real engine snapshot
+(one never-committed duplicate with the web's pick + one committed contradiction) and applies the normalized
+payload; `::test_m1_web_parity_changed_set_and_empty_set_are_refused_by_the_engine` pins CONFLICT_SET_CHANGED and
+NOTHING_TO_AUDIT for web-normalized payloads. Mutation "accepted fingerprint not mapped back" kills the first.
 
 Semantics changed by this round (older tests updated): `resolve_unknown_submit` waits `unknown_resolution_delay_s`
 (`test_ng_engine_crash.py::test_ac16_crash_after_dispatch_commit_is_unknown_not_proven_absent` retries until then); `ack_history_conflict`
@@ -386,9 +408,8 @@ carries the reviewed `conflict_set_id` (`review1::test_r16_ledger_invariant_free
   START already resumes; the launcher needs the `RESUME <grid_id> AFTER STOP <stop_ms>` phrase).
 * **R6 (WS-B, optional).** An audited store API to replace a committed payload/quantity (`LedgerCorrection` from
   the scanner) in one transaction; until then the engine audits accept only the committed version.
-* **R7 (WS-E, needed for web acks).** Pass `conflict_set_id` (required) and `accepted` (optional
-  `{key: fingerprint}`) of `ack_history_conflict` through the web normalisation and render
-  `summary.history_conflicts` (round 4, M1). Without them the engine refuses the ack (`CONFLICT_SET_ID_REQUIRED`).
+* **R7 (WS-E) — done** in `codex/ng-web` @ `6fdf45d76` (merged): the web passes `conflict_set_id`/`accepted` and
+  renders `summary.history_conflicts`; parity pinned by the two `test_m1_web_parity_*` tests.
 * **R4 (WS-C, optional).** `LighterExchangePort` does not forward `register/release_history_reconciled_order`; the
   executor calls the connector directly (the fake exchange implements the same names).
 
@@ -439,17 +460,18 @@ carries the reviewed `conflict_set_id` (`review1::test_r16_ledger_invariant_free
   engine then fails closed, but Hummingbot's generic cancel paths could touch orders of a previous run until the
   connector restores its own tracking marker (logged as an error).
 
-## Commands run (code at `d0eef1804`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
+## Commands run (code at `fa4d0289f`; `PY=$HOME/.cache/codex/hummingbot-robinhood-v217-9af100d/env/bin/python`)
 
 | Gate | Command | Result |
 |---|---|---|
-| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 289 passed |
+| WS-D tests | `$PY -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine test/controllers/generic/test_neutral_grid.py -q` | 291 passed |
 | Heavy property sweep | `NG_PROPERTY_SEEDS=60 NG_PROPERTY_STEPS=120 $PY -m pytest .../engine/test_ng_engine_properties.py -q` | 61 passed |
 | Lighter connector | `$PY -m pytest test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_derivative.py -q` | 85 passed, 8 subtests passed |
 | Committed neutral/risk | `$PY -m pytest test/scripts/test_lighter_robinhood_neutral_grid.py test/scripts/test_lighter_robinhood_grid_risk.py -q` | 73 passed |
 | Controller/executor regressions | `$PY -m pytest test/hummingbot/strategy_v2/executors/grid_executor test/controllers/generic test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py test/hummingbot/strategy_v2/executors/test_executor_base.py -q` | 150 passed |
 | Merged WS-A/B/C suites | `$PY -m pytest test/.../neutral_grid_executor/core test/.../neutral_grid_executor/store test/.../neutral_grid_executor/history test/hummingbot/connector/derivative/lighter_perpetual/test_lighter_perpetual_history_pagination.py -q` | 369 passed, 277 subtests passed |
-| Web suite (WS-E, merged) | `$PY -m pytest test/web/neutral_grid -q` (incl. browser tests) | 138 passed |
+| Web suite (WS-E, merged `d82f5992e`) | `$PY -m pytest test/web/neutral_grid -q` (incl. browser tests) | 149 passed |
+| Round 4 web parity | `$PY -m pytest .../engine/test_ng_engine_review4.py -k parity` at `adcc254eb` / at `fa4d0289f` | 1 failed (keys not web-safe), 1 passed / 2 passed |
 | Round 4 red/green | `$PY -m pytest .../engine/test_ng_engine_review4.py` + the new `CTL` tests at the `5f266ca83` code (tests of `eea457d5a`) / at `d0eef1804` | 23 failed (+2 intended passes) / all passed; mutations 16/16 killed (`mutate4.py`) |
 | Round 3 red/green | `$PY -m pytest .../engine/test_ng_engine_review3.py test/controllers/generic/test_neutral_grid.py -q` at the `2fbb338e7` code / at `f654952ae` | 19 failed, 32 passed / 51 passed (+3 web-contract tests: red at `f48ed9490`, green at `99cb39468`) |
 | Review package 2 red/green | `$PY -m pytest .../engine/test_ng_engine_review2.py test/controllers/generic/test_neutral_grid.py -q` at the `969003ef4` code / at `f96d33c58` | 15 failed, 29 passed / 44 passed |
