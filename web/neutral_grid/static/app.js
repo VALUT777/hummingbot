@@ -576,7 +576,7 @@
       if (r.data.engine_identity) msg += " Движок: " + txt(r.data.engine_identity.grid_id) + ".";
       if (r.data.preview) { S.preview = r.data.preview; renderPreview(); }
       await refreshState();
-      return { conflict: true };
+      return { conflict: true, message: msg, code: r.data.error };
     }
     if (r.data && r.data.errors) msg += " " + r.data.errors.join(" ");
     errorNode.textContent = msg;
@@ -623,10 +623,10 @@
       if (res.ok) { $("cmd-dialog").close(); toast("Команда записана в очередь движка."); }
       else if (res.retry) btn.textContent = "Повторить (тот же ключ)";
       else if (res.conflict) {
-        // stale: operator must re-read and confirm again with a brand-new key
-        var msg = $("cmd-error").textContent;
+        // never auto-applied: the operator re-reads the fresh state and confirms again with a brand-new key
         openCommand(S.dialogKind);
-        $("cmd-error").textContent = "Конфликт: данные изменились, команда НЕ применена. Проверьте и подтвердите заново. " + msg;
+        $("cmd-error").textContent = "Команда НЕ поставлена в очередь (409). " + res.message +
+          " Проверьте актуальные данные выше и подтвердите заново.";
       }
     });
   }
@@ -770,8 +770,9 @@
         $("start-ack-baseline").checked = false;
         $("start-ack-risk").checked = false;
         updateStartButton();
-        $("start-error").textContent = "Конфликт: превью или состояние изменились — старт НЕ поставлен. " +
-          "Превью обновлено; проверьте и подтвердите заново.";
+        $("start-error").textContent = "Старт НЕ поставлен в очередь (409). " + res.message +
+          (res.code === "stale_preview" || res.code === "stale_revision"
+            ? " Превью обновлено; проверьте его и подтвердите заново." : "");
         if (S.preview) openStartSummaryOnly();
       }
     });

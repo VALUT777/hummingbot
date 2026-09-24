@@ -155,7 +155,9 @@ input[type="checkbox"] { min-height: auto; width: 1.15rem; height: 1.15rem; acce
 .form-error { color: var(--bad); font-weight: 600; min-height: 1.2em; margin: 0; }
 .inline-form .row { display: flex; gap: .5rem; flex-wrap: wrap; }
 .inline-form input { flex: 1 1 18rem; font-family: var(--mono); }
-.filters { display: flex; flex-wrap: wrap; gap: .5rem .9rem; align-items: center; }
+.filters { display: flex; flex-wrap: wrap; gap: .5rem .9rem; align-items: center; min-width: 0; max-width: 100%; }
+.filters select { min-width: 0; max-width: 100%; flex: 1 1 12rem; }
+.card-head > * { min-width: 0; max-width: 100%; }
 .pending { font-size: .9rem; }
 .pending .status { font-weight: 700; }
 .sticky-actions { position: sticky; bottom: 0; background: var(--bg); padding: .6rem 0; border-top: 1px solid var(--border); }
