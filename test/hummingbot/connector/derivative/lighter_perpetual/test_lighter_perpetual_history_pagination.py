@@ -235,6 +235,27 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL,
                           {"account_index": ACCOUNT, "market_id": MARKET, "limit": 100}), calls[1])
 
+    async def test_private_stream_activity_only_wakes_history_polling(self):
+        woke: List[str] = []
+
+        def broken_listener():
+            raise RuntimeError("listener bug")
+
+        async def events():
+            yield {"channel": f"{CONSTANTS.ACCOUNT_ALL_TRADES_CHANNEL}:{ACCOUNT}", "trades": {}}
+            yield {"channel": f"{CONSTANTS.ACCOUNT_ALL_ORDERS_CHANNEL}:{ACCOUNT}", "orders": {}}
+            yield {"channel": f"{CONSTANTS.ACCOUNT_ALL_POSITIONS_CHANNEL}:{ACCOUNT}", "positions": {}}
+            yield {"channel": "unrelated:1"}
+
+        self.connector._iter_user_event_queue = events
+        self.connector.add_history_wakeup_listener(broken_listener)
+        port = LighterExchangePort(self.connector, PAIR)
+        port.subscribe_history_wakeups(lambda: woke.append("wake"))
+        await self.connector._user_stream_event_listener()
+        self.assertEqual(["wake"] * 3, woke)
+        self.assertEqual({}, dict(self.connector._order_tracker.all_orders))  # a hint, not state
+        self.connector.remove_history_wakeup_listener(broken_listener)
+
     # ------------------------------------------------------------------------ scanner over connector
     async def test_ac10_ac11_scanner_over_connector_reads_every_page_and_dedupes_boundary(self):
         orders = [raw_order(i, BASE_TS - i * 1000) for i in range(250)]
@@ -422,6 +443,39 @@ class LighterHistoryPaginationTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(LighterTransportOutcome.UNKNOWN, again.outcome)
                 self.assertEqual("duplicate_client_order_id_in_flight", again.detail)
                 self.signer.create_order.assert_awaited_once()
+
+    async def test_cid_orders_are_tracked_but_not_polled_per_order(self):
+        await self.connector.submit_with_client_id(
+            client_order_id=321, trading_pair=PAIR, trade_type=TradeType.BUY, price=Decimal("5.0000"),
+            amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER)
+        await asyncio.sleep(0)
+        api_get = AsyncMock(return_value={"trades": []})
+        self.connector._api_get = api_get
+        await self.connector._update_trade_history()
+        api_get.assert_not_awaited()  # no recentTrades weight for history-reconciled orders
+
+        self.connector.start_tracking_order(
+            order_id="999", exchange_order_id=None, trading_pair=PAIR, trade_type=TradeType.BUY,
+            price=Decimal("5"), amount=Decimal("10"), order_type=OrderType.LIMIT)
+        await self.connector._update_trade_history()
+        api_get.assert_awaited_once()  # a legacy fillable order keeps the legacy poll
+        polled: List[str] = []
+
+        async def request_status(tracked_order):
+            polled.append(tracked_order.client_order_id)
+            raise IOError("stop here")
+
+        self.connector._request_order_status = AsyncMock(side_effect=request_status)
+        await self.connector._update_orders()
+        self.assertEqual(["999"], polled)  # legacy order still polled; the CID order is not
+        self.assertIn("321", self.connector.in_flight_orders)
+
+        self.connector.release_history_reconciled_order(321)
+        self.assertNotIn("321", self.connector.in_flight_orders)
+        again = await self.connector.submit_with_client_id(
+            client_order_id=321, trading_pair=PAIR, trade_type=TradeType.BUY, price=Decimal("5.0000"),
+            amount=Decimal("10"), order_type=OrderType.LIMIT_MAKER)
+        self.assertEqual(LighterTransportOutcome.UNKNOWN, again.outcome)  # a CID is never reused
 
     # ------------------------------------------------------------------------ cancel
     async def test_cancel_by_exchange_index_is_not_terminal(self):
