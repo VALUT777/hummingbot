@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from bidict import bidict
@@ -219,3 +220,136 @@ def own_trade_details(trade: Dict[str, Any], account_index: int) -> Optional[Tup
             not bool(trade.get("is_maker_ask", False)),
         )
     return None
+
+
+# ---------------------------------------------------------------------------------------------
+# Paginated authoritative history and pre-persisted client-id submission (neutral grid,
+# spec NG-HIST-001..004 / NG-DB-005). Additive helpers; existing callers are unaffected.
+# ---------------------------------------------------------------------------------------------
+
+
+class LighterHistoryResponseError(IOError):
+    """A history/active-orders response does not have the documented SDK 1.1.4 shape."""
+
+
+@dataclass(frozen=True)
+class LighterHistoryPage:
+    """One raw page of ``/api/v1/trades`` or ``/api/v1/accountInactiveOrders``.
+
+    ``rows`` are the raw JSON objects exactly as decoded (ids stay ``int``/``str``, never float);
+    ``next_cursor`` is the response value passed through verbatim (possibly ``None``/``""`` or a
+    malformed non-string, which the history scanner classifies); ``cursor_sent`` echoes the
+    request cursor.
+    """
+    rows: List[Dict[str, Any]]
+    next_cursor: Any
+    cursor_sent: Optional[str]
+    limit: Optional[int]
+
+
+def history_page_from_response(
+    response: Any, rows_field: str, cursor_sent: Optional[str], limit: Optional[int]
+) -> LighterHistoryPage:
+    if not isinstance(response, dict):
+        raise LighterHistoryResponseError(f"Lighter {rows_field} response is not an object.")
+    if "code" in response:
+        try:
+            code = exact_int(response["code"], "code")
+        except (TypeError, ValueError):
+            raise LighterHistoryResponseError(f"Lighter {rows_field} response has an invalid code.")
+        if code != 200:
+            raise LighterHistoryResponseError(f"Lighter {rows_field} response failed with code {code}.")
+    rows = response.get(rows_field)
+    if not isinstance(rows, list):
+        raise LighterHistoryResponseError(f"Lighter {rows_field} response is missing the {rows_field} list.")
+    if limit is not None and len(rows) > limit:
+        raise LighterHistoryResponseError(f"Lighter {rows_field} page has {len(rows)} rows for limit {limit}.")
+    if any(not isinstance(row, dict) for row in rows):
+        raise LighterHistoryResponseError(f"Lighter {rows_field} page contains a malformed row.")
+    return LighterHistoryPage(
+        rows=list(rows), next_cursor=response.get("next_cursor"), cursor_sent=cursor_sent, limit=limit
+    )
+
+
+def validate_history_page_request(cursor: Optional[str], limit: int) -> None:
+    if type(limit) is not int or not 1 <= limit <= CONSTANTS.HISTORY_PAGE_LIMIT_MAX:
+        raise ValueError(f"History page limit must be an int in [1, {CONSTANTS.HISTORY_PAGE_LIMIT_MAX}].")
+    if cursor is not None and not isinstance(cursor, str):
+        raise ValueError("History cursor must be an opaque string or None.")
+
+
+def exact_scaled_int(value: Any, decimals: int) -> Optional[int]:
+    """Scale a Decimal to the venue integer representation, or None if that would round.
+
+    Unlike :func:`decimal_to_exchange_int` this never quantizes silently (NG-GRID-003).
+    """
+    if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+        return None
+    scaled = value.scaleb(decimals)
+    integral = scaled.to_integral_value()
+    if scaled != integral:
+        return None
+    return int(integral)
+
+
+def strict_decimal(value: Any) -> Optional[Decimal]:
+    """Decimal only from exact str/int sources (never float/bool); None if absent or not finite."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    try:
+        parsed = Decimal(value)
+    except Exception:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def strict_market_position(
+    account: Dict[str, Any], market_id: int
+) -> Tuple[Decimal, Optional[Decimal], Optional[str]]:
+    """Signed net position, confirmed leverage and raw margin mode for one market (fail closed)."""
+    raw_positions = account.get("positions")
+    if not isinstance(raw_positions, list):
+        raise IOError("Lighter account snapshot is missing positions data.")
+    net_position = Decimal("0")
+    leverage = None
+    margin_mode = None
+    for raw_position in raw_positions:
+        if not isinstance(raw_position, dict):
+            raise IOError("Lighter account snapshot contains a malformed position.")
+        try:
+            position_market_id = exact_int(raw_position["market_id"], "market_id")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise IOError("Lighter account snapshot contains an invalid position market id.") from exc
+        if position_market_id != market_id:
+            continue
+        size = strict_decimal(raw_position.get("position"))
+        try:
+            sign = exact_int(raw_position.get("sign"), "sign")
+        except (TypeError, ValueError):
+            sign = None
+        if size is None or size < 0 or sign not in (-1, 0, 1) or (sign == 0 and size != 0):
+            raise IOError("Lighter account snapshot contains an invalid position size or sign.")
+        net_position += size * sign
+        confirmed = leverage_from_account_margin_percentage(raw_position.get("initial_margin_fraction"))
+        if confirmed is not None:
+            leverage = confirmed
+        raw_mode = raw_position.get("margin_mode")
+        if type(raw_mode) in (int, str):
+            margin_mode = str(raw_mode)
+    return net_position, leverage, margin_mode
+
+
+class LighterTransportOutcome(str, Enum):
+    """Mirror of the neutral-grid ``TransportOutcome`` values, kept connector-local for layering."""
+    NOT_SENT = "NOT_SENT"
+    ACCEPTED = "ACCEPTED"
+    DEFINITIVE_REJECT_ZERO_FILL = "DEFINITIVE_REJECT_ZERO_FILL"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class LighterTransportResult:
+    outcome: LighterTransportOutcome
+    detail: str = ""
+    exchange_order_id: Optional[str] = None
+    tx_hash: Optional[str] = None

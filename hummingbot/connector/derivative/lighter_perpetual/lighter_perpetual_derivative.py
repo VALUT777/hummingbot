@@ -14,10 +14,15 @@ from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_api_ord
     LighterPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_api_utils import (
+    LighterHistoryPage,
+    LighterTransportOutcome,
+    LighterTransportResult,
     account_index_from_account,
     decimal_to_exchange_int,
     exact_int,
+    exact_scaled_int,
     extract_account_snapshot,
+    history_page_from_response,
     leverage_from_account_margin_percentage,
     markets_by_exchange_symbol,
     markets_by_id,
@@ -26,7 +31,10 @@ from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_api_uti
     order_state_from_order_data,
     own_trade_details,
     perpetual_markets_from_exchange_info,
+    strict_decimal,
+    strict_market_position,
     trading_pair_symbol_map,
+    validate_history_page_request,
 )
 from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_auth import LighterAuth
 from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_user_stream_data_source import (
@@ -1297,3 +1305,361 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     def _is_tx_response_success(self, tx_response: Any) -> bool:
         code = self._extract_tx_code(tx_response)
         return code == 200
+
+    # ── Neutral grid: paginated authoritative history (NG-HIST-001/002) ─────────────────────────
+    # Additive API. The legacy one-page readers (`_find_order`, `get_grid_account_snapshot`,
+    # `_update_trade_history`) are intentionally left unchanged.
+
+    def _require_history_account_index(self) -> int:
+        if self._account_index is None:
+            raise IOError("Lighter account index is not resolved; history cannot be scoped.")
+        return self._account_index
+
+    async def fetch_inactive_orders_page(
+        self,
+        trading_pair: str,
+        cursor: Optional[str] = None,
+        limit: int = CONSTANTS.HISTORY_PAGE_LIMIT_MAX,
+    ) -> LighterHistoryPage:
+        """One page of ``GET /api/v1/accountInactiveOrders``.
+
+        Parameter names are those of lighter-sdk 1.1.4 ``OrderApi.account_inactive_orders``:
+        header ``authorization`` (added by ``LighterAuth``), required ``account_index`` and
+        ``limit`` (1..100), optional ``market_id`` and ``cursor``. The cursor is sent verbatim and
+        the response ``next_cursor`` is returned verbatim. Throttled as weight 100.
+        """
+        validate_history_page_request(cursor, limit)
+        await self._ensure_account_ready()
+        market = self.market_info_for_trading_pair(trading_pair)
+        params: Dict[str, Any] = {
+            "account_index": self._require_history_account_index(),
+            "market_id": market.market_id,
+            "limit": limit,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = await self._api_get(
+            path_url=CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL,
+            params=params,
+            is_auth_required=True,
+            limit_id=CONSTANTS.ACCOUNT_INACTIVE_ORDERS_PATH_URL,
+        )
+        return history_page_from_response(response, "orders", cursor_sent=cursor, limit=limit)
+
+    async def fetch_trades_page(
+        self,
+        trading_pair: str,
+        cursor: Optional[str] = None,
+        limit: int = CONSTANTS.HISTORY_PAGE_LIMIT_MAX,
+        order_index: Optional[int] = None,
+    ) -> LighterHistoryPage:
+        """One page of ``GET /api/v1/trades``, newest first.
+
+        Parameter names are those of lighter-sdk 1.1.4 ``OrderApi.trades``: required ``sort_by``
+        (``trade_id``) and ``limit`` (1..100); ``authorization`` header, ``account_index``,
+        ``market_id``, ``sort_dir`` (``desc``), optional exact ``order_index`` filter and the opaque
+        ``cursor`` sent verbatim. The response ``next_cursor`` is returned verbatim. Throttled as
+        weight 600.
+        """
+        validate_history_page_request(cursor, limit)
+        if order_index is not None and (type(order_index) is not int or order_index < 0):
+            raise ValueError("order_index filter must be a non-negative int.")
+        await self._ensure_account_ready()
+        market = self.market_info_for_trading_pair(trading_pair)
+        params: Dict[str, Any] = {
+            "account_index": self._require_history_account_index(),
+            "market_id": market.market_id,
+            "sort_by": CONSTANTS.TRADES_SORT_BY_TRADE_ID,
+            "sort_dir": CONSTANTS.TRADES_SORT_DIR_DESC,
+            "limit": limit,
+        }
+        if cursor is not None:
+            params["cursor"] = cursor
+        if order_index is not None:
+            params["order_index"] = order_index
+        response = await self._api_get(
+            path_url=CONSTANTS.TRADES_PATH_URL,
+            params=params,
+            is_auth_required=True,
+            limit_id=CONSTANTS.TRADES_PATH_URL,
+        )
+        return history_page_from_response(response, "trades", cursor_sent=cursor, limit=limit)
+
+    async def fetch_active_orders(self, trading_pair: str) -> LighterHistoryPage:
+        """All active orders of the account on one market (``GET /api/v1/accountActiveOrders``).
+
+        SDK 1.1.4 ``account_active_orders`` has no cursor parameter; a non-empty ``next_cursor`` in
+        the response therefore means a truncated list, which callers must treat as unknown.
+        """
+        await self._ensure_account_ready()
+        market = self.market_info_for_trading_pair(trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL,
+            params={"account_index": self._require_history_account_index(), "market_id": market.market_id},
+            is_auth_required=True,
+            limit_id=CONSTANTS.ACCOUNT_ACTIVE_ORDERS_PATH_URL,
+        )
+        return history_page_from_response(response, "orders", cursor_sent=None, limit=None)
+
+    async def fetch_account_position(self, trading_pair: str) -> Dict[str, Any]:
+        """Authoritative signed net position for one market from a single account read (weight 300).
+
+        Quantities are parsed from exact string/int sources only; malformed data raises.
+        ``available_collateral`` is advisory and ``None`` when it cannot be established exactly.
+        """
+        await self._ensure_account_ready()
+        market = self.market_info_for_trading_pair(trading_pair)
+        account_params = self._account_lookup_params()
+        account_params["active_only"] = "false"
+        response = await self._api_get(path_url=CONSTANTS.BALANCE_PATH_URL, params=account_params)
+        if not isinstance(response, dict):
+            raise IOError("Lighter account response is not an object.")
+        try:
+            account = extract_account_snapshot(
+                response, account_index=self._account_index, l1_address=self._l1_address
+            )
+        except ValueError as exc:
+            raise IOError("Lighter account snapshot contains an invalid account index.") from exc
+        net_position, leverage, margin_mode = strict_market_position(account, market.market_id)
+        available_collateral = None
+        assets = account.get("assets")
+        aggregate_available = strict_decimal(account.get("available_balance"))
+        if isinstance(assets, list):
+            rows = [
+                asset for asset in assets
+                if isinstance(asset, dict)
+                and str(asset.get("symbol", "")).upper() == self._domain_settings.collateral_token
+            ]
+            if self._domain == CONSTANTS.ROBINHOOD_DOMAIN:
+                try:
+                    valid_asset = exact_int(rows[0].get("asset_id"), "asset_id") == CONSTANTS.ROBINHOOD_COLLATERAL_ASSET_ID
+                except (IndexError, ValueError):
+                    valid_asset = False
+                if not valid_asset:
+                    rows = []
+            if len(rows) == 1 and aggregate_available is not None and aggregate_available >= 0:
+                total = strict_decimal(rows[0].get("margin_balance"))
+                locked = strict_decimal(rows[0].get("locked_balance"))
+                if total is not None and locked is not None and total >= 0 and locked >= 0:
+                    available_collateral = min(aggregate_available, max(total - locked, Decimal("0")))
+        return {
+            "account_index": self._account_index,
+            "market_id": market.market_id,
+            "net_position": net_position,
+            "leverage": leverage,
+            "margin_mode": margin_mode,
+            "available_collateral": available_collateral,
+            "fetched_at": time.time(),
+        }
+
+    # ── Neutral grid: pre-persisted client-id submission (NG-HIST-004, NG-DB-005) ───────────────
+    # Outcome classification:
+    # * NOT_SENT  - returned only from pre-send validation, i.e. before the signer is invoked, so
+    #               the transport provably was not called for this request;
+    # * ACCEPTED  - signer returned no error and a RespSendTx with code 200 (tx accepted for
+    #               processing; NOT proof of order acceptance, fills or terminal state);
+    # * UNKNOWN   - everything else: exceptions, timeouts, error strings, non-200 codes.
+    # * DEFINITIVE_REJECT_ZERO_FILL is never emitted: lighter-sdk 1.1.4 documents no definitive
+    #   venue rejection codes. RespSendTx only carries code/message/tx_hash (models/resp_send_tx.py),
+    #   and `process_api_key_and_nonce` (signer_client.py:211-243) collapses local signing errors
+    #   and HTTP 400 BadRequestException bodies into the same `(None, None, error_str)` tuple, so a
+    #   returned error does not even prove whether the tx reached the venue. Zero-fill terminal
+    #   proof must come from authoritative history (exact inactive order row + full scan).
+    # Nonce: the SDK allocates the tx nonce inside the async signer call under its own per-key lock
+    # (`nonce_manager.async_next_nonce`, signer_client.py:211-243), so no pre-send nonce exists. The
+    # order row `nonce` is a secondary corroborating field only; the primary identity is the
+    # pre-persisted client order id within the exact account/market.
+
+    @staticmethod
+    def _client_order_id_problem(client_order_id: Any) -> Optional[str]:
+        if type(client_order_id) is not int:
+            return "client_order_id must be an int"
+        if not 1 <= client_order_id < (1 << CONSTANTS.MAX_CLIENT_ORDER_ID_BIT_COUNT):
+            return f"client_order_id outside [1, 2**{CONSTANTS.MAX_CLIENT_ORDER_ID_BIT_COUNT})"
+        return None
+
+    def _order_update_timestamp(self) -> float:
+        timestamp = self.current_timestamp
+        if timestamp is None or timestamp != timestamp:  # NaN before the clock starts
+            timestamp = self._time()
+        return timestamp
+
+    async def submit_with_client_id(
+        self,
+        client_order_id: int,
+        trading_pair: str,
+        trade_type: TradeType,
+        price: Decimal,
+        amount: Decimal,
+        order_type: OrderType,
+        order_expiry_ms: Optional[int] = None,
+    ) -> LighterTransportResult:
+        """Submit a LIMIT (GoodTillTime) or LIMIT_MAKER (post-only) order with a pre-persisted CID.
+
+        The numeric client order id is used unchanged as ``client_order_index`` (never replaced by
+        ``_new_client_order_id``); ``reduce_only`` is always explicitly ``False`` (virtual neutral
+        cells, NG-ORD-002). The order is registered with the Hummingbot order tracker before the
+        signer call and the signer runs under the connector's existing tx lock.
+        """
+        not_sent = LighterTransportOutcome.NOT_SENT
+        problem = self._client_order_id_problem(client_order_id)
+        if problem is not None:
+            return LighterTransportResult(not_sent, f"pre_send_validation: {problem}")
+        if trade_type not in (TradeType.BUY, TradeType.SELL):
+            return LighterTransportResult(not_sent, "pre_send_validation: trade_type must be BUY or SELL")
+        if order_type not in (OrderType.LIMIT, OrderType.LIMIT_MAKER):
+            return LighterTransportResult(not_sent, "pre_send_validation: only LIMIT and LIMIT_MAKER are allowed")
+        if order_expiry_ms is not None and (type(order_expiry_ms) is not int or order_expiry_ms <= 0):
+            return LighterTransportResult(not_sent, "pre_send_validation: order_expiry_ms must be a positive int")
+        try:
+            await self._ensure_account_ready()
+            market = self.market_info_for_trading_pair(trading_pair)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LighterTransportResult(not_sent, f"pre_send_validation: market unavailable ({type(exc).__name__})")
+        base_amount = exact_scaled_int(amount, market.size_decimals)
+        price_int = exact_scaled_int(price, market.price_decimals)
+        if base_amount is None or price_int is None:
+            return LighterTransportResult(
+                not_sent, "pre_send_validation: price/amount must be positive and exact at venue precision"
+            )
+        if self._signer_client is None:
+            return LighterTransportResult(not_sent, "pre_send_validation: signer client unavailable")
+        order_id = str(client_order_id)
+        if self._order_tracker.fetch_order(client_order_id=order_id) is not None:
+            # A previous submission with this CID governs; re-sending it is not proven idempotent.
+            return LighterTransportResult(LighterTransportOutcome.UNKNOWN, "duplicate_client_order_id_in_flight")
+
+        self.start_tracking_order(
+            order_id=order_id,
+            exchange_order_id=None,
+            trading_pair=trading_pair,
+            trade_type=trade_type,
+            price=price,
+            amount=amount,
+            order_type=order_type,
+            position_action=PositionAction.NIL,
+        )
+        tif = (
+            self._signer_client.ORDER_TIME_IN_FORCE_POST_ONLY
+            if order_type is OrderType.LIMIT_MAKER
+            else self._signer_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME
+        )
+        order_kwargs: Dict[str, Any] = dict(
+            market_index=market.market_id,
+            client_order_index=client_order_id,
+            base_amount=base_amount,
+            price=price_int,
+            is_ask=trade_type is TradeType.SELL,
+            order_type=self._signer_client.ORDER_TYPE_LIMIT,
+            time_in_force=tif,
+            reduce_only=False,
+        )
+        if order_expiry_ms is not None:
+            order_kwargs["order_expiry"] = order_expiry_ms
+        try:
+            async with self._throttler.execute_task(limit_id=CONSTANTS.SEND_TX_LIMIT):
+                async with self._tx_lock:
+                    _, tx_response, error = await self._signer_client.create_order(**order_kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LighterTransportResult(LighterTransportOutcome.UNKNOWN, f"transport_exception: {type(exc).__name__}")
+        if error is not None or not self._is_tx_response_success(tx_response):
+            code = self._extract_tx_code(tx_response)
+            return LighterTransportResult(
+                LighterTransportOutcome.UNKNOWN,
+                f"transport_error: code={code}" if error is None else "transport_error: signer returned an error",
+            )
+        self._order_tracker.process_order_update(OrderUpdate(
+            client_order_id=order_id,
+            trading_pair=trading_pair,
+            update_timestamp=self._order_update_timestamp(),
+            new_state=OrderState.OPEN,
+        ))
+        tx_hash = tx_response.get("tx_hash") if isinstance(tx_response, dict) else getattr(tx_response, "tx_hash", None)
+        return LighterTransportResult(
+            LighterTransportOutcome.ACCEPTED,
+            "send_tx_accepted",
+            tx_hash=tx_hash if isinstance(tx_hash, str) else None,
+        )
+
+    async def cancel_with_client_id(
+        self,
+        trading_pair: str,
+        client_order_id: int,
+        exchange_order_index: Optional[str] = None,
+    ) -> LighterTransportResult:
+        """Cancel an own order by exact exchange order index (or look it up by exact CID).
+
+        ACCEPTED only means the cancel tx was accepted for processing; it is never terminal proof.
+        NOT_SENT means no cancel tx was sent (validation/lookup failed) and says nothing about the
+        order itself.
+        """
+        not_sent = LighterTransportOutcome.NOT_SENT
+        problem = self._client_order_id_problem(client_order_id)
+        if problem is not None:
+            return LighterTransportResult(not_sent, f"pre_send_validation: {problem}")
+        try:
+            await self._ensure_account_ready()
+            market = self.market_info_for_trading_pair(trading_pair)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LighterTransportResult(not_sent, f"pre_send_validation: market unavailable ({type(exc).__name__})")
+        if exchange_order_index is None:
+            try:
+                active = await self.fetch_active_orders(trading_pair)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return LighterTransportResult(not_sent, f"order_lookup_failed: {type(exc).__name__}")
+            matches = []
+            for row in active.rows:
+                client_index = row.get("client_order_index", row.get("client_order_id"))
+                try:
+                    if exact_int(client_index, "client_order_index") == client_order_id:
+                        matches.append(row)
+                except (TypeError, ValueError):
+                    continue
+            if len(matches) != 1:
+                return LighterTransportResult(not_sent, f"order_lookup: {len(matches)} active matches for client id")
+            exchange_order_index = matches[0].get("order_index", matches[0].get("order_id"))
+        try:
+            order_index = exact_int(exchange_order_index, "order_index")
+        except (TypeError, ValueError):
+            return LighterTransportResult(not_sent, "pre_send_validation: exchange order index is not an exact int")
+        if order_index < 0:
+            return LighterTransportResult(not_sent, "pre_send_validation: exchange order index is negative")
+        if self._signer_client is None:
+            return LighterTransportResult(not_sent, "pre_send_validation: signer client unavailable")
+        try:
+            async with self._throttler.execute_task(limit_id=CONSTANTS.SEND_TX_LIMIT):
+                async with self._tx_lock:
+                    _, tx_response, error = await self._signer_client.cancel_order(
+                        market_index=market.market_id,
+                        order_index=order_index,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return LighterTransportResult(LighterTransportOutcome.UNKNOWN, f"transport_exception: {type(exc).__name__}")
+        if error is not None or not self._is_tx_response_success(tx_response):
+            code = self._extract_tx_code(tx_response)
+            return LighterTransportResult(
+                LighterTransportOutcome.UNKNOWN,
+                f"transport_error: code={code}" if error is None else "transport_error: signer returned an error",
+                exchange_order_id=str(order_index),
+            )
+        tracked = self._order_tracker.fetch_order(client_order_id=str(client_order_id))
+        if tracked is not None and not tracked.is_done:
+            self._order_tracker.process_order_update(OrderUpdate(
+                client_order_id=tracked.client_order_id,
+                trading_pair=tracked.trading_pair,
+                update_timestamp=self._order_update_timestamp(),
+                new_state=OrderState.PENDING_CANCEL,
+            ))
+        return LighterTransportResult(
+            LighterTransportOutcome.ACCEPTED, "cancel_tx_accepted_not_terminal", exchange_order_id=str(order_index)
+        )
