@@ -157,6 +157,25 @@ string/pair shapes). `test_review3_*` and `test_review6_caught_guard_error_*` we
 (their red evidence at `78d780164` stays valid for that model); `test_ng_store_history.py::test_aggregated_tp_fill_allocation_is_exact_and_idempotent`
 now asserts the automatic split.
 
+## UI drill-down queries (web review: AC-22 / NG-UI-002, no silent truncation)
+
+Branch fast-forwarded to `codex/neutral-grid-implementation` @ `bb49f434e` first. Schema v3 = `m0003_drilldown_indexes`
+(`fills_by_trade_id`, `orders_by_order_index`; `orders.exchange_order_id` and the `id` primary keys were already
+indexed). All four queries are read-only and work on the writer, `open_command_client` and `open_readonly` handles.
+
+| API | Semantics | Tests |
+|---|---|---|
+| `find_orders_by_id(id_str) -> List[OrderMatch(leg, order, matched_on)]` | exact TEXT match on `exchange_order_id` or `order_index`, and on the client order id when `id_str` is a canonical decimal integer in `[1, 2**48)`; ids must be `str` (numbers and padded text raise `TypeError`) | `test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_drilldown.py::test_find_orders_and_fills_by_exact_big_id_strings` |
+| `find_fills_by_trade_id(trade_id_str) -> List[FillRecord]` | exact TEXT match; a self-trade returns both own legs | `test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_drilldown.py::test_find_orders_and_fills_by_exact_big_id_strings`<br>`test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_drilldown.py::test_self_trade_returns_both_own_legs` |
+| `commands_page(before_id=None, limit=100) -> List[CommandRecord]` | `id < before_id ORDER BY id DESC LIMIT limit` (keyset; next page = last id), `1 <= limit <= 1000` | `test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_drilldown.py::test_keyset_pages_reach_every_row_beyond_5000` |
+| `audit_page(before_id=None, limit=100) -> List[AuditEvent]` | same keyset contract for `audit_events` | `test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_drilldown.py::test_keyset_pages_reach_every_row_beyond_5000` |
+| indexes | every lookup uses an index, the pages walk the primary key without a temp sort | `test/hummingbot/strategy_v2/executors/neutral_grid_executor/store/test_ng_store_drilldown.py::test_drilldown_queries_use_indexes` |
+
+The tests cover ids above 2**53 / 2**63 round-tripping as exact strings (float-rounded and off-by-one strings do not
+match), paging through 6000 commands and 6000+ audit events down to id 1 on all three handle types, and a recursive
+no-float assertion over every returned record. Backward compatible: nothing existing changed; `OrderMatch` and
+`AuditEvent` are exported.
+
 ## Handoff to WS-D (engine)
 
 1. Open once per process (lock + host marker live in `default_host_dir()`, see Review fixes): `NeutralGridStore.open(None or path, EngineIdentity(connector_name, connector_domain,
@@ -210,6 +229,8 @@ now asserts the automatic split.
 - `NeutralGridStore.open_readonly(db_path)`: `latest_snapshot()` -> `StoredSnapshot` (`snapshot_json` can be served
   verbatim; decimals/ids are strings, ints above 2**53 are strings); staleness from `committed_at_ms`.
   `get_command`, `list_commands`, `audit_events` are readable.
+- Drill-down without truncation: `find_orders_by_id`, `find_fills_by_trade_id`, `commands_page`, `audit_page` (see
+  "UI drill-down queries"); they replace scanning the newest 5000 rows.
 
 ## Open risks
 
