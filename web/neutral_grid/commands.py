@@ -38,6 +38,10 @@ AUDIT_ACTIONS = (
     AUDIT_ACTION_BASELINE, "ack_late_evidence", "ack_history_conflict", "ack_retention_gap", "ack_risk_blocked",
     "resolve_unknown_submit",
 )
+# Audited operator actions beyond the base set (engine ``commands.EXTENDED_AUDIT_ACTIONS``): offered only when the
+# committed snapshot shows they apply, and only with an explicit typed confirmation phrase.
+EXTENDED_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid")
+FREEZE_CID = "CID_ALLOCATION"
 COMMAND_KINDS = {k.value: k.value for k in CommandKind}
 MAX_CID = (1 << 48) - 1
 
@@ -164,6 +168,7 @@ class CommandService:
             normalized = self._normalize_only(COMMAND_KINDS[kind], incoming)
         except ValueError:
             return False
+        stored = {k: v for k, v in stored.items() if k != "material_id"}  # server-added at enqueue
         return jsonsafe.canonical(stored) == jsonsafe.canonical(normalized)
 
     async def _stale(self, cur_cfg: int, cur_eng: int, snapshot: Optional[Dict[str, Any]],
@@ -182,6 +187,45 @@ class CommandService:
         body = {"error": code, "message": message}
         body.update(extra)
         return CommandOutcome(status, body)
+
+    def confirmation_phrase(self, action: str, cid: Optional[str] = None) -> str:
+        if action == "retire_colliding_cid":
+            return f"СПИСАТЬ CID {cid}"
+        return f"МИГРАЦИЯ СЕТКИ {self.engine_identity.get('grid_id')}"
+
+    def _extended_audit_blocker(self, normalized: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[CommandOutcome]:
+        """D2-17: extended audits only when the committed snapshot shows they apply (fail closed otherwise)."""
+        summary = snapshot.get("summary") or {}
+        action = normalized.get("action")
+        if action == "retire_colliding_cid":
+            if FREEZE_CID not in (summary.get("freezes") or {}):
+                return self._error(409, "audit_not_applicable",
+                                   "Списание CID доступно только при заморозке CID_ALLOCATION (коллизия CID).")
+            colliding = summary.get("colliding_cid")
+            if colliding not in (None, "") and str(colliding) != normalized["cid"]:
+                raise ValueError(f"Списать можно только CID из коллизии, о которой сообщил движок: {colliding}.")
+        if action == "migrate_grid":
+            blockers = summary.get("grid_mutation_blockers")
+            if not isinstance(blockers, list) or blockers:
+                return self._error(409, "audit_not_applicable",
+                                   "Миграция сетки доступна только для полностью спокойной сетки "
+                                   "(grid_mutation_blockers пуст и опубликован движком).", blockers=blockers)
+        return None
+
+    async def _start_material_blocker(self, snapshot: Dict[str, Any], cur_cfg: int,
+                                      cur_eng: int) -> Optional[CommandOutcome]:
+        """E-09: the baseline is confirmed only for the grid/rules the applied Start acknowledged."""
+        applied = self._gateway.list_commands(limit=1, kind=CommandKind.START.value, status="APPLIED")
+        acknowledged = ((applied[0].get("payload") or {}).get("material_id")) if applied else None
+        if not acknowledged:
+            return None  # a Start not issued through this UI: the engine binds it to its config fingerprint
+        preview = await self._preview(config_revision=cur_cfg, engine_revision=cur_eng)
+        if preview.get("material_id") != acknowledged:
+            return self._error(409, "start_material_changed",
+                               "Конфигурация или правила рынка изменились после подтверждённого «Старта»; "
+                               "baseline не подтверждается. Остановите движок и выполните новый «Старт».",
+                               preview=preview)
+        return None
 
     def _check_config_baseline(self, typed: Decimal) -> None:
         """B is part of the config (NG-ARCH-003); the operator re-types it as the explicit confirmation."""
@@ -215,7 +259,7 @@ class CommandService:
             return {"expected_initial_position": format(baseline, "f"), "confirm": True}
         if kind == CommandKind.BASELINE_AUDIT.value:
             action = payload.get("action", AUDIT_ACTION_BASELINE)
-            if action not in AUDIT_ACTIONS:
+            if action not in AUDIT_ACTIONS + EXTENDED_AUDIT_ACTIONS:
                 raise ValueError("Недопустимое действие аудита.")
             note = _note(payload)
             if not note:
@@ -226,11 +270,16 @@ class CommandService:
             normalized = {"action": action, "note": note, "acknowledge": True}
             if action == AUDIT_ACTION_BASELINE:
                 normalized["observed_position"] = format(parse_signed_decimal(payload.get("observed_position")), "f")
-            if action == "resolve_unknown_submit":
+            if action in ("resolve_unknown_submit", "retire_colliding_cid"):
                 cid = payload.get("cid")
                 if not isinstance(cid, str) or not cid.isdigit() or int(cid) > MAX_CID:
                     raise ValueError("cid: строка с 48-битным client order ID.")
                 normalized["cid"] = cid
+            if action in EXTENDED_AUDIT_ACTIONS:
+                expected = self.confirmation_phrase(action, normalized.get("cid"))
+                if payload.get("confirmation") != expected:
+                    raise ValueError(f"Для этого действия введите точную фразу подтверждения: «{expected}».")
+                normalized["confirmation"] = expected
             return normalized
         reason = _note(payload, "reason")
         return {"reason": reason} if reason else {}
@@ -248,6 +297,10 @@ class CommandService:
                 return normalized, self._error(
                     409, "start_required", "Сначала отправьте «Старт» с подтверждением риска по превью; "
                     "baseline подтверждается только после применённого старта.")
+            if kind == CommandKind.CONFIRM_BASELINE.value:
+                return normalized, await self._start_material_blocker(snapshot, cur_cfg, cur_eng)
+            if kind == CommandKind.BASELINE_AUDIT.value:
+                return normalized, self._extended_audit_blocker(normalized, snapshot)
             return normalized, None
         pending = self._gateway.list_commands(limit=1, kind=CommandKind.START.value, status="QUEUED")
         if pending:
@@ -268,4 +321,5 @@ class CommandService:
         if preview.get("errors"):
             return normalized, self._error(422, "preview_invalid", "Конфигурация не прошла проверку.",
                                            errors=preview["errors"], preview=preview)
+        normalized["material_id"] = preview.get("material_id")  # what the risk acknowledgement was about (E-09)
         return normalized, None
