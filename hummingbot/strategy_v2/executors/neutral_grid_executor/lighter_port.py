@@ -279,6 +279,13 @@ class LighterExchangePort:
     def request_weight(self, endpoint: str) -> int:
         return ENDPOINT_WEIGHTS.get(endpoint, CONSTANTS.WEIGHT_DEFAULT)
 
+    def subscribe_history_wakeups(self, callback: Callable[[], None]) -> None:
+        """Wire private-stream activity to e.g. ``HistoryScanner.wake`` (a poll hint, never proof)."""
+        self._connector.add_history_wakeup_listener(callback)
+
+    def unsubscribe_history_wakeups(self, callback: Callable[[], None]) -> None:
+        self._connector.remove_history_wakeup_listener(callback)
+
     # reads -----------------------------------------------------------------------------------
     async def trading_rules(self) -> TradingRules:
         await self._connector._update_trading_rules()
