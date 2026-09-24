@@ -8,11 +8,12 @@ layout has no horizontal page scroll.
 from __future__ import annotations
 
 import time
+from decimal import Decimal
 
 import pytest
 from conftest import ACCESS_TOKEN
 from ngweb_cdp import CONTRAST_JS, Browser, find_chrome
-from ngweb_fakes import sample_snapshot
+from ngweb_fakes import sample_rules, sample_snapshot
 
 CHROME = find_chrome()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chrome/Chromium binary for headless browser tests")
@@ -249,3 +250,72 @@ async def test_browser_flow_on_offline_demo_engine(tmp_path):
         await browser.close()
         await client.close()
         await bundle.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_409_is_reissued_by_one_operator_click_never_automatically(make_web, tmp_path):
+    """Orchestrator (c): a stale revision gives 409 + fresh state; inputs survive, one click re-issues with the
+    fresh revisions, and nothing is resubmitted on its own."""
+    web = await make_web(_snapshot_with_engine_fields("NORMAL"))
+    web.gateway.live_clock = True
+    browser, page = await _open(tmp_path, web)
+    try:
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'NORMAL'")
+        await page.eval("document.querySelector('[data-cmd=stop]').click()")
+        await page.wait_for("document.getElementById('cmd-dialog').open")
+        await page.eval("document.getElementById('f-reason').value = 'плановая остановка'")
+        web.gateway.snapshot["engine_revision"] = 2  # the engine commits a real transition meanwhile
+        await page.eval("document.getElementById('cmd-submit').click()")
+        await page.wait_for("document.getElementById('cmd-error').textContent.includes('409')")
+        assert await page.eval("document.getElementById('cmd-dialog').open") is True
+        assert await page.eval("document.getElementById('f-reason').value") == "плановая остановка"
+        assert "engine r2" in await page.eval("document.getElementById('cmd-context').textContent")
+        await page.eval("new Promise(r => setTimeout(r, 3000))")
+        assert web.gateway.commands == []  # never re-sent automatically
+        await page.eval("document.getElementById('cmd-submit').click()")  # the single operator click
+        await page.wait_for("!document.getElementById('cmd-dialog').open")
+        [row] = web.gateway.commands
+        assert row["kind"] == "stop" and row["expected_engine_revision"] == 2
+        assert row["payload"] == {"reason": "плановая остановка"}
+
+        # Start: a revision-only conflict keeps B and both acknowledgements -> one click with the fresh preview
+        web.gateway.snapshot.update(engine_state="STOPPED", engine_revision=3)
+        web.gateway.commands.clear()
+        await page.eval("document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-cards').textContent.includes('56 / 55')")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        await page.eval("document.getElementById('start-baseline').value = '0';"
+                        "document.getElementById('start-ack-baseline').checked = true;"
+                        "document.getElementById('start-ack-risk').checked = true;"
+                        "document.getElementById('start-baseline').dispatchEvent(new Event('input'))")
+        web.gateway.snapshot["engine_revision"] = 4
+        await page.eval("document.getElementById('start-submit').click()")
+        await page.wait_for("document.getElementById('start-error').textContent.includes('409')")
+        assert await page.eval("document.getElementById('start-ack-risk').checked") is True
+        assert await page.eval("document.getElementById('start-baseline').value") == "0"
+        assert web.gateway.commands == []
+        await page.eval("document.getElementById('start-submit').click()")
+        await page.wait_for("!document.getElementById('start-dialog').open")
+        [start] = web.gateway.commands
+        assert start["kind"] == "start" and start["expected_engine_revision"] == 4
+        # material change (runtime rules) behind the conflict: the risk acknowledgement must be redone
+        web.gateway.snapshot.update(engine_state="STOPPED", engine_revision=5)
+        web.gateway.commands.clear()
+        await page.eval("document.getElementById('tab-overview').click(); document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-cards').textContent.includes('56 / 55')")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        await page.eval("document.getElementById('start-baseline').value = '0';"
+                        "document.getElementById('start-ack-baseline').checked = true;"
+                        "document.getElementById('start-ack-risk').checked = true;"
+                        "document.getElementById('start-baseline').dispatchEvent(new Event('input'))")
+        web.market["rules"] = sample_rules(min_base=Decimal("4"))
+        web.gateway.snapshot["engine_revision"] = 6
+        await page.eval("document.getElementById('start-submit').click()")
+        await page.wait_for("document.getElementById('start-error').textContent.includes('409')")
+        assert await page.eval("document.getElementById('start-ack-risk').checked") is False
+        assert await page.eval("document.getElementById('start-submit').disabled") is True
+        assert web.gateway.commands == []
+    finally:
+        await browser.close()

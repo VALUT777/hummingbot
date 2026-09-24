@@ -124,6 +124,14 @@ class PreviewService:
                                        "config_revision": config_revision, "engine_revision": engine_revision})
         return hashlib.sha256(material.encode()).hexdigest()[:24]
 
+    def material_id(self, rules: Optional[TradingRules], cfg: Optional[GridConfig]) -> str:
+        """Fingerprint of what the operator acknowledges (config + rules), without revisions."""
+        rules_view = _rules_dict(rules)
+        if rules_view is not None:
+            rules_view.pop("fetched_at", None)
+        material = jsonsafe.canonical({"config": _config_dict(cfg) if cfg is not None else None, "rules": rules_view})
+        return hashlib.sha256(material.encode()).hexdigest()[:24]
+
     async def build(self, *, config_revision: int, engine_revision: int,
                     baseline_confirmed_in_ledger: bool = False) -> Dict[str, Any]:
         cfg, cfg_error = self.current_config()
@@ -132,6 +140,7 @@ class PreviewService:
         if cfg is None:
             return {"mode": self.mode, "config_revision": config_revision, "engine_revision": engine_revision,
                     "preview_id": self.preview_id(rules, config_revision, engine_revision, cfg=None),
+                    "material_id": self.material_id(rules, None),
                     "config": None, "runtime_rules": _rules_dict(rules), "market_source": ctx.source,
                     "rules_fetched_at": ctx.fetched_at, "live_confirmation_required": not baseline_confirmed_in_ledger,
                     "errors": [f"Конфигурация движка недоступна: {cfg_error}"] + list(ctx.errors),
@@ -185,6 +194,7 @@ class PreviewService:
             "config_revision": config_revision,
             "engine_revision": engine_revision,
             "preview_id": self.preview_id(rules, config_revision, engine_revision, cfg=cfg),
+            "material_id": self.material_id(rules, cfg),
             "config": _config_dict(cfg),
             "runtime_rules": _rules_dict(rules),
             "market_source": ctx.source,

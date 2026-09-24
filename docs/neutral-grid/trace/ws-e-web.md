@@ -164,6 +164,14 @@ Contract names coded ahead of WS-D/WS-B publication (tests use snapshots carryin
 - store indexed reads listed in #5: done, WS-B merged.
 
 Until the engine publishes `engine_config` and the rules flags, attach-mode preview shows an explicit error and
-Start is refused (fail-closed). Note for WS-D: the engine refreshes rules every `rules_refresh_s=60` s, while
-the attach gate requires `fetched_at` within `history_freshness_s` (10 s). Unless rules are refreshed at least
-that often, or a separate published max age is agreed, attach Start will usually be disabled.
+Start is refused (fail-closed). The rules-freshness conflict is resolved by decision (b): the gate now uses the engine-published
+`runtime_rules.max_age_s`.
+
+
+## Orchestrator decisions (b), (c), (d)
+
+| Decision | Implementation | Tests |
+|---|---|---|
+| (b) Rules freshness uses the engine-published `summary.runtime_rules.max_age_s`, not `history_freshness_s` | `snapshot_market` fails closed when `max_age_s` is absent or non-positive, or when `now - fetched_at > max_age_s`. History freshness stays separate: snapshot staleness and lag. | `test_ngweb_attach.py::test_attach_market_rules_flags_and_freshness[*]` (older than max age; missing max age), `::test_rules_freshness_uses_engine_max_age_not_history_freshness` (60 s old rules are fresh under 180 s even though history freshness is 10 s; failed before) |
+| (c) Strict 409 for all four commands; operator-driven one-click re-issue, never automatic | After a 409 the command dialog stays open with the fresh state, uses the revisions from the 409 body, and keeps every operator input (reason/B/confirm/action/observed/note/ack/cid) plus a new key. Nothing is re-sent until the operator clicks. Start keeps B and the acknowledgements only when the preview `material_id` (config + rules, no revisions) is unchanged; otherwise the risk acknowledgement must be redone. | B: `test_ngweb_browser.py::test_browser_409_is_reissued_by_one_operator_click_never_automatically` (Stop: reason kept, nothing sent for 3 s, one click → expected_engine_revision=2; Start revision-only → one click; Start with changed rules → acknowledgements reset, submit disabled; failed before) |
+| (d) WS-B indexed reads | Merged `codex/ng-store@3d0a4d162` (`381192b04`); gateway switched in `08bf75dda` (see review fix #5). | `test_ngweb_drilldown_store.py::test_more_than_5000_rows_old_trade_and_oldest_journal_rows_reachable` (6000 newer fills, commands and audit rows; the oldest trade found by its 2^64+1 id; commands and audit paged through the web API down to id 1 with `truncated=false`), `::test_old_big_ids_found_through_indexed_store_reads`, `::test_journal_pages_reach_the_true_end` |

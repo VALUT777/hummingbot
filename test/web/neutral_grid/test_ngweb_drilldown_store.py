@@ -113,3 +113,57 @@ async def test_journal_pages_reach_the_true_end(make_web, real_store):
         if not cursor:
             break
     assert len(seen) == 5 and seen == sorted(seen, key=int, reverse=True)
+
+
+ROWS = 6000  # beyond the former 5000-row scan window
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(240)
+async def test_more_than_5000_rows_old_trade_and_oldest_journal_rows_reachable(make_web, tmp_path):
+    """Orchestrator (d): > 5000 newer fills/commands/audit rows; the oldest ones are still found and paged to."""
+    from ngweb_fakes import sample_snapshot
+
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind
+
+    env = Env(tmp_path)
+    writer = env.open()
+    env.bootstrap(writer)
+    _filled_order(writer, 4, BIG_ORDER_ID, BIG_TRADE_ID)          # the oldest trade
+    newer = record_entry_intent(writer, cell_id=5)
+    transport = FakeTransport()
+    transport.results.append(TransportResult(TransportOutcome.ACCEPTED, "tx", exchange_order_id="77"))
+    submit_via_protocol(writer, transport, newer)
+    leg = writer.leg(newer.cid)
+    engine = writer.engine()
+    with writer.transaction() as tx:
+        writer.apply_history_batch(tx, [trade_row(str(10 ** 22 + n), leg.cid, leg.side, "0.001", price=str(leg.price),
+                                                  exchange_order_id="77") for n in range(ROWS)])
+        for n in range(ROWS):
+            writer.enqueue_command(f"bulk-key-{n:08d}", CommandKind.PAUSE, engine.config_revision,
+                                   engine.engine_revision, tx=tx)
+            writer.record_audit(tx, "ui_bulk", "operator", {"n": n})
+    assert len(writer.fills()) > ROWS
+    gateway = StoreGateway(NeutralGridStore.open_command_client(env.db))
+    gateway.latest_snapshot = lambda: sample_snapshot("NORMAL")
+    try:
+        web = await make_web(gateway=gateway)
+        await web.login()
+        old = _strict(await (await web.get(f"/api/lookup?id={BIG_TRADE_ID}")).text())
+        assert [t["trade_id_str"] for t in old["trades"]] == [BIG_TRADE_ID] and old["truncated"] is False
+        by_order = _strict(await (await web.get(f"/api/lookup?id={BIG_ORDER_ID}")).text())
+        assert len(by_order["orders"]) == 1 and by_order["truncated"] is False
+        for path, key in (("/api/commands", "commands"), ("/api/audit", "events")):
+            seen, cursor = [], None
+            while True:
+                page = _strict(await (await web.get(f"{path}?limit=200" + (f"&before={cursor}" if cursor else ""))
+                                      ).text())
+                assert page["truncated"] is False
+                seen.extend(row["id"] for row in page[key])
+                cursor = page["next_cursor"]
+                if not cursor:
+                    break
+            assert len(seen) >= ROWS and len(set(seen)) == len(seen) and seen[-1] == "1", (path, len(seen))
+    finally:
+        gateway.close()
+        writer.close()
