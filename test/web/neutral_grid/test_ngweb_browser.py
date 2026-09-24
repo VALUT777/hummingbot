@@ -131,3 +131,110 @@ async def test_browser_contrast_and_mobile_layout(make_web, tmp_path, scheme):
         await page.screenshot(tmp_path / f"cells-mobile-{scheme}.png")
     finally:
         await browser.close()
+
+
+async def _submit_dialog_until_queued(page, dialog_id, submit_id, error_id, attempts=6):
+    """Submit an open command dialog; a 409 (engine moved on) re-opens it with fresh revisions -> resubmit."""
+    for _ in range(attempts):
+        await page.eval(f"document.getElementById('{submit_id}').click()")
+        await page.wait_for(f"!document.getElementById('{dialog_id}').open || "
+                            f"document.getElementById('{error_id}').textContent.length > 0", timeout=20)
+        if not await page.eval(f"document.getElementById('{dialog_id}').open"):
+            return
+        assert "409" in await page.eval(f"document.getElementById('{error_id}').textContent")
+    raise AssertionError("command kept conflicting")
+
+
+async def _demo_click(page, prefix):
+    await page.eval("[...document.querySelectorAll('#demo-actions button')]"
+                    f".find(b => b.textContent.startsWith('{prefix}')).click()")
+    await page.wait_for("document.getElementById('demo-result').textContent.startsWith('Симулятор')")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(240)
+async def test_browser_flow_on_offline_demo_engine(tmp_path):
+    """AC-50: the real engine + FakeExchange through the UI only (dialogs, demo buttons, tabs)."""
+    import types
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from web.neutral_grid import runtime
+    from web.neutral_grid.server import create_app
+
+    args = types.SimpleNamespace(data_dir=tmp_path / "demo", host="127.0.0.1", stale_after=15.0, allowed_host=[])
+    bundle = await runtime.build_demo(args)
+    client = TestClient(TestServer(create_app(bundle.context), host="127.0.0.1"))
+    await client.start_server()
+    browser = await Browser.launch(CHROME, tmp_path / "profile")
+    try:
+        page = await browser.new_page()
+        await page.navigate(f"http://127.0.0.1:{client.port}/#auth={bundle.context.access.token}")
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'BOOTSTRAPPING'")
+        assert "Старт" in await page.eval("document.getElementById('engine-note').textContent")
+        # Start through the confirmation dialog, keyboard only
+        await page.eval("document.getElementById('tab-preview').click()")
+        await page.wait_for("document.getElementById('preview-cards').textContent.includes('56 / 55')")
+        await page.eval("document.getElementById('start-open').click()")
+        await page.wait_for("document.getElementById('start-dialog').open")
+        await page.eval("document.getElementById('start-baseline').focus()")
+        await page.type("0")
+        for _ in range(2):
+            await page.key("Tab")
+            await page.key(" ")
+        assert await page.eval("document.getElementById('start-submit').disabled") is False
+        await _submit_dialog_until_queued(page, "start-dialog", "start-submit", "start-error")
+        await page.wait_for("document.getElementById('pending-command').textContent.includes('применена')", 30)
+        # confirm the baseline once the engine says the bootstrap cut is ready
+        await page.wait_for("document.getElementById('engine-note').textContent.includes('подтвердите baseline')", 60)
+        await page.eval("document.querySelector('[data-cmd=confirm_baseline]').click()")
+        await page.eval("document.getElementById('f-baseline').value = '0';"
+                        "document.getElementById('f-confirm').checked = true")
+        await _submit_dialog_until_queued(page, "cmd-dialog", "cmd-submit", "cmd-error")
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'NORMAL'", 60)
+        # partial entry 3 + 3 -> entry still live AND TP 6 live, visible in the cells table
+        await _demo_click(page, "Частично исполнить ближайший вход")
+        await page.eval("new Promise(r => setTimeout(r, 1500))")
+        await _demo_click(page, "Частично исполнить ближайший вход")
+        await page.eval("document.getElementById('tab-cells').click()")
+        await page.eval("const s = document.getElementById('cells-state'); s.value = 'TP_LIVE';"
+                        "s.dispatchEvent(new Event('change'))")
+        await page.wait_for("(() => { const t = document.getElementById('cells-body').textContent;"
+                            " if (!t.includes('ENTRY_LIVE + TP_LIVE')) { const s = document.getElementById('cells-state');"
+                            " s.dispatchEvent(new Event('change')); return false; } return t.includes('6 / 0 / 6'); })()",
+                            60, interval=1.0)
+        # dust: visible as a DUST cell with the exact remainder
+        await page.eval("document.getElementById('tab-overview').click()")
+        await _demo_click(page, "Пыль")
+        await page.wait_for("document.getElementById('cell-legend').textContent.includes('пыль')", 90)
+        # pause / resume
+        await page.eval("document.querySelector('[data-cmd=pause]').click()")
+        await _submit_dialog_until_queued(page, "cmd-dialog", "cmd-submit", "cmd-error")
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'PAUSED'", 30)
+        await page.eval("document.querySelector('[data-cmd=resume]').click()")
+        await _submit_dialog_until_queued(page, "cmd-dialog", "cmd-submit", "cmd-error")
+        await page.wait_for("document.getElementById('pending-command').textContent.includes('Продолжить')"
+                            " && !document.getElementById('pending-command').textContent.includes('в очереди')", 30)
+        # history lag becomes visible in the history card
+        await _demo_click(page, "Задержка истории")
+        await _demo_click(page, "Частично исполнить ближайший вход")
+        await page.wait_for("(() => { const dd = [...document.querySelectorAll('#history-kv dd')][2];"
+                            " return dd && /^[1-9][0-9]* с/.test(dd.textContent); })()", 30)
+        await _demo_click(page, "Убрать задержку")
+        # stop with cancels that never prove terminal -> STOP_UNCERTAIN, never STOPPED
+        await _demo_click(page, "Отмены")
+        await page.eval("document.querySelector('[data-cmd=stop]').click()")
+        await _submit_dialog_until_queued(page, "cmd-dialog", "cmd-submit", "cmd-error")
+        await page.wait_for("document.getElementById('state-badge').dataset.state === 'STOP_UNCERTAIN'", 60)
+        assert await page.eval("document.getElementById('state-text').textContent") == "Остановка не подтверждена"
+        # mobile table with real data: no horizontal page scroll
+        await page.viewport(375, 812, mobile=True)
+        await page.eval("document.getElementById('tab-cells').click()")
+        await page.wait_for("document.querySelectorAll('#cells-body tr').length > 0")
+        assert await page.eval("document.documentElement.scrollWidth") <= 375
+        assert await page.eval("localStorage.length + sessionStorage.length") == 0
+        await page.screenshot(tmp_path / "demo-mobile.png")
+    finally:
+        await browser.close()
+        await client.close()
+        await bundle.close()

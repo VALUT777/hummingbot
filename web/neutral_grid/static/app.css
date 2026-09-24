@@ -158,7 +158,7 @@ input[type="checkbox"] { min-height: auto; width: 1.15rem; height: 1.15rem; acce
 .filters { display: flex; flex-wrap: wrap; gap: .5rem .9rem; align-items: center; min-width: 0; max-width: 100%; }
 .filters select { min-width: 0; max-width: 100%; flex: 1 1 12rem; }
 .card-head > * { min-width: 0; max-width: 100%; }
-.pending { font-size: .9rem; }
+.pending { font-size: .9rem; overflow-wrap: anywhere; }
 .pending .status { font-weight: 700; }
 .sticky-actions { position: sticky; bottom: 0; background: var(--bg); padding: .6rem 0; border-top: 1px solid var(--border); }
 

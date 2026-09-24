@@ -129,6 +129,16 @@
     clearTimeout(toast._t);
     toast._t = setTimeout(function () { t.hidden = true; }, 4500);
   }
+  // Drop out-of-order responses: only the latest request of a kind may render.
+  var SEQ = {};
+  function nextSeq(kind) { SEQ[kind] = (SEQ[kind] || 0) + 1; return SEQ[kind]; }
+  function isLatest(kind, seq) { return SEQ[kind] === seq; }
+  function shortCursor(v) {
+    if (v === null || v === undefined || v === "") return null;
+    var t = String(v);
+    return t.length > 28 ? t.slice(0, 12) + "…" + t.slice(-12) : t;
+  }
+
   function statePill(state, table) {
     var info = (table || CELL_STATES)[state] || [state || "—", "off"];
     return el("span", { cls: "pill tone-" + info[1], text: info[0] });
@@ -242,7 +252,9 @@
 
   // ------------------------------------------------------------------ state
   async function refreshState() {
+    var seq = nextSeq("state");
     var r = await api("/api/state");
+    if (!isLatest("state", seq)) return;
     if (r.status === 200 && r.data) {
       S.state = r.data;
       S.stateReceivedAt = Date.now();
@@ -305,7 +317,16 @@
       : "config r— · engine r—";
     tickAge();
     var engine = st.engine || {};
-    $("engine-note").textContent = engine.note || (ENGINE_STATES[engine.display_state] || ["", ""])[0];
+    var summary = st.summary || {};
+    var boot = summary.bootstrap || {};
+    var next = null;
+    if (st.engine_started === false) next = "Следующий шаг: проверьте превью и отправьте «Старт» (вкладка «Превью и старт»).";
+    else if (st.engine_started && (summary.baseline === null || summary.baseline === undefined) && boot.ready === true)
+      next = "Следующий шаг: сверка завершена — подтвердите baseline (кнопка «Подтвердить baseline»).";
+    else if (st.engine_started && (summary.baseline === null || summary.baseline === undefined))
+      next = "Движок сверяет позицию и историю перед подтверждением baseline: " + txt(boot.detail) + ".";
+    $("engine-note").textContent = (engine.note || (ENGINE_STATES[engine.display_state] || ["", ""])[0]) +
+      (next ? " " + next : "");
     var reasons = $("engine-reasons");
     clear(reasons);
     (engine.reasons || []).forEach(function (r) { reasons.appendChild(el("li", { text: typeof r === "string" ? r : JSON.stringify(r) })); });
@@ -364,8 +385,8 @@
       ["Полнота", h.complete === undefined ? null : (h.complete ? "полная" : "НЕПОЛНАЯ"), h.complete === false ? "bad" : "ok"],
       ["Причина неполноты", h.incomplete_reason, h.incomplete_reason ? "warn" : ""],
       ["Отставание истории", typeof h.lag_s === "number" ? fmtAge(h.lag_s) : h.lag_s],
-      ["Курсор сделок", h.trades_cursor],
-      ["Курсор ордеров", h.orders_cursor],
+      ["Курсор сделок (непрозрачный)", shortCursor(h.trades_cursor)],
+      ["Курсор ордеров (непрозрачный)", shortCursor(h.orders_cursor)],
       ["Последний полный скан", typeof h.last_full_scan_at === "number" ? fmtTime(h.last_full_scan_at) : h.last_full_scan_at]
     ]);
     var mg = s.margin || {};
@@ -631,7 +652,9 @@
   // ------------------------------------------------------------------ preview / start
   async function loadPreview(baseline) {
     var path = "/api/preview" + (baseline !== undefined ? "?baseline=" + encodeURIComponent(baseline) : "");
+    var seq = nextSeq("preview");
     var r = await api(path);
+    if (!isLatest("preview", seq)) return null;
     if (r.status === 200) { S.preview = r.data; renderPreview(); return r.data; }
     if (r.data && r.data.message) toast(r.data.message);
     return null;
@@ -701,8 +724,9 @@
     });
     var cfg = p.config || {};
     kv($("preview-config"), Object.keys(cfg).map(function (k) { return [k, cfg[k]]; }));
-    var engineActive = S.state && S.state.engine && ["BOOTSTRAPPING", "RECONCILING", "NORMAL", "DEGRADED", "PAUSED", "RISK_BLOCKED", "FROZEN", "STOPPING"]
-      .indexOf(S.state.engine.last_known_state) >= 0;
+    var engineActive = !!(S.state && S.state.engine_started === true && S.state.engine &&
+      ["BOOTSTRAPPING", "RECONCILING", "NORMAL", "DEGRADED", "PAUSED", "RISK_BLOCKED", "FROZEN", "STOPPING"]
+        .indexOf(S.state.engine.last_known_state) >= 0);
     $("start-open").disabled = !p.can_start;
     $("start-hint").textContent = !p.can_start ? "Старт недоступен: исправьте ошибки проверки." :
       (engineActive ? "Движок уже работает: повторный старт вернёт существующую команду/движок, второй движок не создаётся." :
@@ -840,8 +864,9 @@
     if (reset || key !== S.cellsFilterKey) { S.cellsCursor = null; S.cellsFilterKey = key; clear($("cells-body")); }
     var q = "?limit=60" + (active ? "&active=1" : "") + (state ? "&state=" + encodeURIComponent(state) : "") +
       (S.cellsCursor ? "&after=" + encodeURIComponent(S.cellsCursor) : "");
+    var seq = nextSeq("cells");
     var r = await api("/api/cells" + q);
-    if (r.status !== 200) return;
+    if (r.status !== 200 || !isLatest("cells", seq)) return;
     var body = $("cells-body");
     r.data.cells.forEach(function (c) { body.appendChild(renderCellRow(c)); });
     S.cellsCursor = r.data.next_cursor;
@@ -891,7 +916,9 @@
       var id = $("lookup-id").value.trim();
       var out = $("lookup-result");
       clear(out);
+      var seq = nextSeq("lookup");
       var r = await api("/api/lookup?id=" + encodeURIComponent(id));
+      if (!isLatest("lookup", seq)) return;
       if (r.status !== 200) { out.appendChild(el("p", { cls: "form-error", text: (r.data && r.data.message) || "Ошибка поиска" })); return; }
       var d = r.data;
       var total = d.snapshot_matches.length + d.orders.length + d.trades.length;
@@ -908,8 +935,9 @@
   // ------------------------------------------------------------------ journal
   async function loadCommands(reset) {
     if (reset) { S.commandsCursor = null; clear($("journal-commands").tBodies[0]); }
+    var seq = nextSeq("commands");
     var r = await api("/api/commands?limit=50" + (S.commandsCursor ? "&before=" + encodeURIComponent(S.commandsCursor) : ""));
-    if (r.status !== 200) return;
+    if (r.status !== 200 || !isLatest("commands", seq)) return;
     var body = $("journal-commands").tBodies[0];
     r.data.commands.forEach(function (c) {
       body.appendChild(el("tr", {}, [
@@ -927,8 +955,9 @@
   }
   async function loadAudit(reset) {
     if (reset) { S.auditCursor = null; clear($("journal-audit").tBodies[0]); }
+    var seq = nextSeq("audit");
     var r = await api("/api/audit?limit=50" + (S.auditCursor ? "&before=" + encodeURIComponent(S.auditCursor) : ""));
-    if (r.status !== 200) return;
+    if (r.status !== 200 || !isLatest("audit", seq)) return;
     var body = $("journal-audit").tBodies[0];
     r.data.events.forEach(function (e) {
       body.appendChild(el("tr", {}, [
