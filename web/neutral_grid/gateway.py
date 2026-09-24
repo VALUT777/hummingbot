@@ -50,7 +50,8 @@ TERMINAL_ENGINE_STATES = frozenset({"STOPPED", "STOPPED_WITH_INVENTORY"})
 
 
 MAX_CID = (1 << 48) - 1
-_SCAN_LIMIT = 5000
+_MAX_PAGE = 1000          # store keyset page bound
+_QUEUED_SCAN = 1000       # only QUEUED rows are scanned for the Start guard (a handful at most)
 
 
 def _ms_to_s(value: Optional[int]) -> Optional[float]:
@@ -136,10 +137,9 @@ class StoreGateway:
 
     def list_commands(self, *, limit: int, before: Optional[str] = None, kind: Optional[str] = None,
                       status: Optional[str] = None) -> List[Dict[str, Any]]:
-        if before is not None and kind is None and status is None:
+        if kind is None and status is None:
             return self.commands_page(before=before, limit=limit)[0]
-        fetch = limit if (before is None and kind is None) else _SCAN_LIMIT
-        rows = [command_to_dict(r) for r in self._store.list_commands(limit=fetch, status=status)]
+        rows = [command_to_dict(r) for r in self._store.list_commands(limit=_QUEUED_SCAN, status=status)]
         if before is not None:
             if not before.isdigit():
                 return []
@@ -148,48 +148,24 @@ class StoreGateway:
             rows = [r for r in rows if r["kind"] == kind]
         return rows[:limit]
 
-    # ------------------------------------------------------------------ id lookup (no silent truncation)
+    # ------------------------------------------------------------------ drill-down (indexed store reads)
     def lookup(self, id_str: str) -> Dict[str, Any]:
-        """Exact-string lookup of orders and trades. ``truncated`` is True whenever a bounded fallback scan could
-        not cover every stored row, so "found 0" is never presented as proof of absence."""
-        orders, orders_truncated = self._find_orders(id_str)
-        return {"orders": orders, "trades": self.find_trades(id_str), "truncated": orders_truncated}
+        """Exact-string lookup through the store's indexed reads: complete, never a scan window.
+
+        ``truncated`` stays in the response contract and is always False with the indexed store.
+        """
+        return {"orders": self.find_orders(id_str), "trades": self.find_trades(id_str), "truncated": False}
 
     def find_orders(self, id_str: str) -> List[Dict[str, Any]]:
-        return self._find_orders(id_str)[0]
-
-    def _find_orders(self, id_str: str) -> Tuple[List[Dict[str, Any]], bool]:
-        indexed = getattr(self._store, "find_orders_by_exchange_or_client_id", None)
-        if callable(indexed):  # WS-B indexed read: complete, no window
-            return [self._order_match(item) for item in indexed(id_str)], False
-        found: List[Dict[str, Any]] = []
-        if id_str.isdigit() and int(id_str) <= MAX_CID:
-            cid = int(id_str)
-            leg, order = self._store.leg(cid), self._store.order(cid)
-            if leg is not None or order is not None:
-                found.append({"match": "client_order_id", "leg": _plain(leg), "order": _plain(order)})
-        legs = self._store.legs()
-        window = legs[-_SCAN_LIMIT:]
-        for leg in window:
-            order = self._store.order(leg.cid)
-            if order is not None and id_str in (order.exchange_order_id, order.order_index) \
-                    and not any(f["leg"] and f["leg"]["cid"] == leg.cid for f in found):
-                found.append({"match": "exchange_order_id", "leg": _plain(leg), "order": _plain(order)})
-        return found, len(legs) > len(window)
-
-    @staticmethod
-    def _order_match(item: Any) -> Dict[str, Any]:
-        if isinstance(item, (tuple, list)) and len(item) == 2:
-            leg, order = item
-        else:
-            leg, order = getattr(item, "leg", None), getattr(item, "order", item)
-        return {"match": "indexed", "leg": _plain(leg), "order": _plain(order)}
+        return [{"match": "indexed", "matched_on": list(m.matched_on), "leg": _plain(m.leg), "order": _plain(m.order)}
+                for m in self._store.find_orders_by_id(id_str)]
 
     def find_trades(self, id_str: str) -> List[Dict[str, Any]]:
-        indexed = getattr(self._store, "find_fills_by_trade_id", None)
-        fills = list(indexed(id_str)) if callable(indexed) else self._store.fills()  # every loaded row, no window
-        found = [dict(_plain(f), match="fill") for f in fills
-                 if id_str in (f.trade_id_str, f.own_exchange_order_id) or str(f.cid) == id_str]
+        fills = {f.dedupe_key: f for f in self._store.find_fills_by_trade_id(id_str)}
+        for match in self._store.find_orders_by_id(id_str):  # fills of an order found by its client/exchange id
+            for f in self._store.fills(match.leg.cid):
+                fills.setdefault(f.dedupe_key, f)
+        found = [dict(_plain(f), match="fill") for f in fills.values()]
         for rec in self._store.unmatched_evidence(include_resolved=True):
             if id_str in {str(v) for v in (rec.payload or {}).values() if isinstance(v, (str, int))}:
                 found.append({"match": "unmatched_evidence", "inbox_id": rec.id, "stream": rec.stream,
@@ -197,34 +173,30 @@ class StoreGateway:
                               "received_at": _ms_to_s(rec.received_at_ms)})
         return found
 
-    # ------------------------------------------------------------------ cursor pages
+    # ------------------------------------------------------------------ keyset pages (indexed store reads)
+    @staticmethod
+    def _before_id(before: Optional[str]) -> Optional[int]:
+        if before is None:
+            return None
+        if not before.isdigit() or int(before) < 1:
+            raise ValueError("bad cursor")
+        return int(before)
+
     def commands_page(self, *, before: Optional[str], limit: int) -> Tuple[List[Dict[str, Any]], bool]:
-        if before is not None and not before.isdigit():
+        try:
+            before_id = self._before_id(before)
+        except ValueError:
             return [], False
-        indexed = getattr(self._store, "commands_page", None)
-        if callable(indexed) and before is not None:
-            return [command_to_dict(r) for r in indexed(int(before), limit)], False
-        return self._window_page(lambda n: [command_to_dict(r) for r in self._store.list_commands(limit=n)],
-                                 before, limit)
+        rows = self._store.commands_page(before_id=before_id, limit=max(1, min(limit, _MAX_PAGE)))
+        return [command_to_dict(r) for r in rows], False
 
     def audit_page(self, *, before: Optional[str], limit: int) -> Tuple[List[Dict[str, Any]], bool]:
-        if before is not None and not before.isdigit():
+        try:
+            before_id = self._before_id(before)
+        except ValueError:
             return [], False
-        indexed = getattr(self._store, "audit_page", None)
-        if callable(indexed) and before is not None:
-            return [self._audit_dict(e) for e in indexed(int(before), limit)], False
-        return self._window_page(lambda n: [self._audit_dict(e) for e in self._store.audit_events(limit=n)],
-                                 before, limit)
-
-    @staticmethod
-    def _window_page(fetch: Any, before: Optional[str], limit: int) -> Tuple[List[Dict[str, Any]], bool]:
-        """Newest-first page. Without an indexed store read a ``before`` page comes from a bounded window: a full
-        window with a short page means older rows may exist -> ``truncated`` (never a silent end of history)."""
-        if before is None:
-            return fetch(limit), False
-        window = fetch(_SCAN_LIMIT)
-        rows = [r for r in window if int(r["id"]) < int(before)]
-        return rows[:limit], len(window) >= _SCAN_LIMIT and len(rows) < limit
+        rows = self._store.audit_page(before_id=before_id, limit=max(1, min(limit, _MAX_PAGE)))
+        return [self._audit_dict(e) for e in rows], False
 
     @staticmethod
     def _audit_dict(e: Any) -> Dict[str, Any]:
