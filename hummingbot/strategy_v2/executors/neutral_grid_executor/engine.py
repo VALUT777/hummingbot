@@ -45,7 +45,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import (
 )
 from hummingbot.strategy_v2.executors.neutral_grid_executor.commands import (
     AUDIT_ACTION_BASELINE,
-    AUDIT_ACTIONS,
+    ALL_AUDIT_ACTIONS,
     CommandOutcome,
 )
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
@@ -94,7 +94,9 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     STREAM_INACTIVE_ORDERS as B_ORDERS,
     STREAM_TRADES as B_TRADES,
     BootstrapRecord,
+    GridMigration,
     CidAllocationError,
+    CidCollisionError,
     CursorUpdate,
     EngineIdentity as StoreIdentity,
     EntryBlockedError,
@@ -200,25 +202,32 @@ def engine_store_identity(connector_name: str, trading_pair: str, port: Exchange
 def open_engine_store(db_path: Optional[str], config: Any, port: ExchangePort, *, create_if_missing: bool = True,
                       lock_dir: Optional[str] = None, fault_hooks: Any = None,
                       clock: Callable[[], float] = time.time,
-                      prior_run_markers: Optional[Callable] = None) -> NeutralGridStore:
-    """Open the single-writer store (fails closed on missing/corrupt DB with prior-run evidence, AC-54)."""
+                      prior_run_markers: Optional[Callable] = None,
+                      allow_grid_migration: bool = False) -> NeutralGridStore:
+    """Open the single-writer store (fails closed on missing/corrupt DB with prior-run evidence, AC-54).
+
+    A changed grid (dimensions/Q) is refused (``ConfigMutationError``, AC-52) unless the operator explicitly
+    confirmed a migration: then the store opens without the fingerprint check, the engine stays frozen
+    (CONFIG_MISMATCH) and only the audited ``migrate_grid`` command can replace the quiescent grid."""
     grid_config = config if isinstance(config, GridConfig) else config.to_grid_config(port.account_index)
     identity = engine_store_identity(grid_config.connector_name, grid_config.trading_pair, port)
     return NeutralGridStore.open(
         Path(db_path) if db_path else None, identity, create_if_missing=create_if_missing,
         prior_run_markers=prior_run_markers, lock_dir=lock_dir,
-        config_fingerprint=grid.config_fingerprint(grid_config), fault_hooks=fault_hooks,
-        clock_ms=lambda: _ms(clock()))
+        config_fingerprint=None if allow_grid_migration else grid.config_fingerprint(grid_config),
+        fault_hooks=fault_hooks, clock_ms=lambda: _ms(clock()))
 
 
 def open_engine(config: GridConfig, db_path: Optional[str], port: ExchangePort, *,
                 clock: Callable[[], float] = time.time, options: Optional[EngineOptions] = None,
                 lock_dir: Optional[str] = None, fault_hooks: Any = None, create_if_missing: bool = True,
-                offline_demo: bool = False, prior_run_markers: Optional[Callable] = None) -> "NeutralGridEngine":
+                offline_demo: bool = False, prior_run_markers: Optional[Callable] = None,
+                allow_grid_migration: bool = False) -> "NeutralGridEngine":
     """Open store + engine. Any store refusal yields a fail-closed engine (never a fresh bootstrap)."""
     try:
         store = open_engine_store(db_path, config, port, create_if_missing=create_if_missing, lock_dir=lock_dir,
-                                  fault_hooks=fault_hooks, clock=clock, prior_run_markers=prior_run_markers)
+                                  fault_hooks=fault_hooks, clock=clock, prior_run_markers=prior_run_markers,
+                                  allow_grid_migration=allow_grid_migration)
     except (StoreError, PersistenceError, OSError) as exc:
         return NeutralGridEngine(config, None, port, clock, options=options, offline_demo=offline_demo,
                                  fatal_reason=f"STORE_OPEN_REFUSED:{type(exc).__name__}: {exc}",
@@ -314,6 +323,8 @@ class NeutralGridEngine:
         # evidence): input of the settlement predicate.
         self.complete_scans: Deque[ScanRecord] = deque(maxlen=64)
         self._walk_started_at: Optional[float] = None
+        self._walk_start_seq = 0
+        self._last_walk_start_seq = 0                          # causal start of the latest complete walk
         self.weight_log: Deque[Tuple[float, int]] = deque()
         self.position_gap_since: Optional[float] = None
         self.unknown_active: List[ExchangeOrderRow] = []
@@ -361,6 +372,7 @@ class NeutralGridEngine:
         self._rules_weight_log: Deque[Tuple[float, int]] = deque()
         self._hold_normal_until_tick = 0                       # anti-flap after DEGRADED (W4)
         self._sticky_freezes: Dict[str, str] = {}              # freezes to persist across a reload
+        self._sticky_meta: Dict[str, Any] = {}                 # meta fields to persist across a reload
         self._invariant_cells_cache: Optional[Dict[int, str]] = None
         self.tp_blocked_cells: Dict[int, str] = {}
         self.health_path: Optional[str] = health_path or (
@@ -537,12 +549,15 @@ class NeutralGridEngine:
         self._active_evidence_cache = {}
         self._active_reconciled_at = None
         self._invariant_cells_cache = None
-        if self._sticky_freezes:
+        if self._sticky_freezes or self._sticky_meta:
             for code, detail in self._sticky_freezes.items():
                 self.meta.freezes.setdefault(code, detail)
+            for name, value in self._sticky_meta.items():
+                setattr(self.meta, name, value)
             with self.store.transaction() as tx:
                 self.store.kv_set(tx, "engine_meta", self.meta.to_json())
             self._sticky_freezes = {}
+            self._sticky_meta = {}
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -846,17 +861,30 @@ class NeutralGridEngine:
                     return CommandOutcome(CommandStatus.REJECTED, {
                         "error": "BASELINE_CONFIG_MISMATCH", "config": str(self.config.expected_initial_position),
                         "command": str(payload["expected_initial_position"])})
+            if self.meta.stop_requested_ms is not None and payload.get("source") == "launcher" \
+                    and payload.get("resume_stop_ms") != self.meta.stop_requested_ms:
+                # An automatic launcher START (every process start, new random key) never overrides a durable
+                # STOP / STOPPING / STOP_UNCERTAIN: only an explicit operator START (web: key + expected revisions
+                # of a viewed snapshot) or a launcher resume naming this very stop may (NG-OPS-003, AC-36).
+                return CommandOutcome(CommandStatus.REJECTED, {
+                    "error": "DURABLE_STOP_ACTIVE", "stop_requested_ms": self.meta.stop_requested_ms,
+                    "stop_outcome": self.meta.stop_outcome,
+                    "detail": "an explicit operator START or a launcher resume naming this stop is required"})
             if self.meta.started and self.meta.stop_requested_ms is None:
                 return CommandOutcome(CommandStatus.APPLIED, {"already_started": True, "grid_id": self.grid_id,
                                                               "engine_state": self.engine_state.value})
+            resumed = {"resumed_stop_ms": self.meta.stop_requested_ms,
+                       "stop_outcome": self.meta.stop_outcome} if self.meta.stop_requested_ms is not None else {}
             self.meta.started = True
             self.meta.start_preview_id = preview_id
             self.meta.stop_requested_ms = None
             self.meta.stop_outcome = None
             self.meta.stop_reason = None
             return CommandOutcome(CommandStatus.APPLIED, {"started": True, "grid_id": self.grid_id},
-                                  audit=("start", {"grid_id": self.grid_id, "preview_id": preview_id,
-                                                   "risk_acknowledged": True}))
+                                  audit=("start", dict({"grid_id": self.grid_id, "preview_id": preview_id,
+                                                        "risk_acknowledged": True,
+                                                        "source": payload.get("source") or "operator"},
+                                                       **resumed)))
         if kind == CommandKind.PAUSE.value:
             self.meta.operator_paused = True
             self.meta.pause_reason = str(payload.get("reason") or "operator pause")
@@ -997,6 +1025,12 @@ class NeutralGridEngine:
         if observed != venue:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "AUDIT_STALE_OBSERVATION",
                                                            "observed_position": str(venue)})
+        unsettled = self._audit_evidence_unsettled(now)
+        if unsettled:
+            # Retryable: a rebase on a position that may contain an own fill history has not delivered would put
+            # that fill into B and count it twice (NG-RISK-003, AC-30).
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "AUDIT_EVIDENCE_NOT_SETTLED",
+                                                           "reasons": unsettled, "retryable": True})
         unresolved = [leg.cid for leg in self.non_final_legs() if leg.state != OrderState.LIVE]
         if unresolved:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "AUDIT_UNRESOLVED_ORDERS",
@@ -1018,6 +1052,22 @@ class NeutralGridEngine:
         return CommandOutcome(CommandStatus.APPLIED, {
             "observed_position": str(venue), "old_effective_baseline": str(old),
             "new_effective_baseline": str(new_baseline), "acknowledged_unmatched": inbox_ids}, reload=True)
+
+    def _audit_evidence_unsettled(self, now: float) -> List[str]:
+        """Why the current venue position cannot yet be compared with the ledger for a baseline rebase."""
+        reasons = []
+        if self.position_seq < self.fills_commit_seq:
+            reasons.append("position read predates the latest committed fill")
+        if self.ws_pending:
+            reasons.append(f"{len(self.ws_pending)} WS trade signal(s) not yet in committed history")
+        if self.history_lag_s(now) > 0:
+            reasons.append(f"history lag {self.history_lag_s(now):.1f} s")
+        if self._last_walk_start_seq < self.position_seq:
+            reasons.append("no complete history walk started after the position read")
+        live = [leg.cid for leg in self.non_final_legs() if leg.state != OrderState.LIVE]
+        if live:
+            reasons.append(f"unresolved own orders {[str(c) for c in live[:5]]}")
+        return reasons
 
     def _acknowledge_scan_conflicts(self, now: float) -> None:
         """The operator audited the current scanner conflicts: they are not re-flagged, and the walk boundary is
@@ -1125,8 +1175,42 @@ class NeutralGridEngine:
             "resolved_conflicts": ids, "accepted_trades": [r.trade_id_str for r in accepted],
             "corrected_legs": corrected, "audited_cycles": cycles}, reload=True)
 
+    def _cmd_migrate_grid(self, actor: str, note: str, now: float, tx) -> CommandOutcome:
+        """AC-52 audited grid replacement: only when the configured dimensions differ from the stored grid, the old
+        grid is quiescent (``grid_mutation_blockers() == []``) and fresh market data allows a valid new grid. Old
+        grid, cells and cycles are preserved (RETIRED); baseline, fills and cursors are untouched (no reset)."""
+        s = self.store
+        if self.grid_record is None or self.grid_record.fingerprint == self.fingerprint:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "NOTHING_TO_MIGRATE"})
+        blockers = s.grid_mutation_blockers()
+        if blockers:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "GRID_NOT_QUIESCENT", "blockers": blockers[:20]})
+        if self.config.grid_id == self.grid_record.grid_id:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "NEW_GRID_ID_REQUIRED",
+                                                           "detail": "a migrated grid needs a new grid_id"})
+        if self.rules is None or grid.rules_blockers(self.rules) or self.mid is None or self._rules_stale(now):
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "MARKET_DATA_NOT_READY"})
+        errors = grid.validate_config(self.config, self.rules, self.mid, bootstrap=True)
+        if errors:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "CONFIG_INVALID", "errors": errors})
+        prices = grid.build_grid(self.config.lower_price, self.config.upper_price, self.config.cell_count, self.rules)
+        anchor = grid.compute_anchor(self.mid, self.config.lower_price, self.config.upper_price)
+        specs = grid.assign_cells(prices, anchor)
+        old = self.grid_record
+        s.migrate_grid(tx, GridMigration(
+            new_grid_id=self.config.grid_id, config_fingerprint=self.fingerprint,
+            config=grid_config_to_json(self.config), lower_price=self.config.lower_price,
+            upper_price=self.config.upper_price, order_amount_base=self.config.order_amount_base, prices=prices,
+            cells=specs, anchor=anchor, actor=actor, reason=note))
+        self.meta.freezes.pop(FREEZE_CONFIG_MISMATCH, None)
+        self.meta.obligations = {}
+        self.meta.reject_latches = {}
+        return CommandOutcome(CommandStatus.APPLIED, {
+            "old_grid_id": old.grid_id, "new_grid_id": self.config.grid_id, "anchor": str(anchor),
+            "cells": len(specs)}, reload=True)
+
     def _cmd_reconcile(self, action: str, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
-        if action not in AUDIT_ACTIONS:
+        if action not in ALL_AUDIT_ACTIONS:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "UNKNOWN_AUDIT_ACTION", "action": action})
         s = self.store
         actor = str(payload.get("actor") or "operator")
@@ -1152,6 +1236,18 @@ class NeutralGridEngine:
             self.meta.history_reset = {STREAM_TRADES: floor, STREAM_ORDERS: floor}
             return CommandOutcome(CommandStatus.APPLIED, {"history_reset_floor_ms": floor,
                                                           "resolved_retention_gaps": gaps}, reload=True)
+        if action == "retire_colliding_cid":
+            cid = payload.get("cid", self.meta.colliding_cid)
+            if cid is None or FREEZE_CID not in self.meta.freezes:
+                return CommandOutcome(CommandStatus.REJECTED, {"error": "NO_CID_COLLISION"})
+            cid = int(cid)
+            s.retire_cid(tx, cid, actor, note)                 # audited; never allocated from now on (AC-43)
+            detail = self.meta.freezes.pop(FREEZE_CID, None)
+            self.meta.colliding_cid = None
+            return CommandOutcome(CommandStatus.APPLIED, {"retired_cid": str(cid), "cleared": FREEZE_CID,
+                                                          "detail": detail}, reload=True)
+        if action == "migrate_grid":
+            return self._cmd_migrate_grid(actor, note, now, tx)
         if action == "ack_risk_blocked":
             detail = self.meta.freezes.pop(FREEZE_RISK_BLOCKED, None)
             self.meta.risk_blocked = {}
@@ -1309,6 +1405,7 @@ class NeutralGridEngine:
             return
         if self._walk_started_at is None:
             self._walk_started_at = now
+            self._walk_start_seq = self._next_seq()
         result = await self.scanner.scan()
         self._charge(now, result.weight_used)
         for stream, pages in result.pages_read.items():
@@ -1327,6 +1424,7 @@ class NeutralGridEngine:
         if result.complete:
             started = walk_started if walk_started is not None else now
             self.complete_scans.append(ScanRecord(started_at=started, completed_at=now))
+            self._last_walk_start_seq = self._walk_start_seq
             # A client-id-only WS signal cannot be matched to one trade row: a complete walk that started after it
             # covered it (a trade-id signal stays until its row is committed, so real lag stays visible, AC-13).
             self.ws_pending = {label: at for label, at in self.ws_pending.items()
@@ -1890,6 +1988,7 @@ class NeutralGridEngine:
             ledger.next_entry_identity()
         except LedgerError as exc:
             return False, f"LOCKED:{exc}"
+        # (the full-Q quantity check is admission's FULL_Q_INVALID, also before any intent)
         why = self._latched(ledger.cell_id, LegRole.ENTRY) or self._off_tick(spec.entry_price)
         if why:
             self.cell_blockers[ledger.cell_id] = why
@@ -1899,6 +1998,13 @@ class NeutralGridEngine:
         if spec.entry_side == Side.SELL and (self.bid is None or spec.entry_price <= self.bid):
             return False, "ENTRY_WOULD_CROSS"
         return True, None
+
+    def _qty_blocker(self, qty: Decimal, price: Decimal) -> Optional[str]:
+        """The pre-send quantity check, run in planning before any intent/CID (never discovered after commit)."""
+        if self.rules is None or grid.rules_blockers(self.rules):
+            return None
+        why = grid.order_qty_blocker(qty, price, self.rules)
+        return None if why is None else f"PRESEND_QTY:{why}"
 
     def _off_tick(self, price: Decimal) -> Optional[str]:
         """A fixed grid price that is not on the venue's current tick can never be placed: blocked in planning,
@@ -1950,6 +2056,9 @@ class NeutralGridEngine:
         if latch.get("fingerprint") != self._rules_fingerprint():
             del self.meta.reject_latches[key]               # rules/config changed: try again
             return None
+        if str(latch.get("reason", "")).startswith("PRESEND"):
+            # deterministic pre-send refusal: no new revision until the rules/config fingerprint changes
+            return f"{latch.get('reason')} (until the trading rules or config change)"
         wait_ms = int(latch.get("retry_at_ms", 0)) - self._now_ms()
         if wait_ms <= 0:
             return None                                     # backoff elapsed: one more attempt (failures kept)
@@ -1980,9 +2089,18 @@ class NeutralGridEngine:
             why = (self._latched(cell_id, LegRole.TP)
                    or self._off_tick(ledger.spec.tp_price))
             if why:
+                # durable, visible blocker; the obligation keeps its queue age (NG-CELL-002, AC-34)
                 self.cell_blockers[cell_id] = why
+                for item in plan.items:
+                    for g in ([g for g, _ in item.allocation] if item.allocation else [item.generation]):
+                        self.meta.obligations.setdefault(f"{cell_id}:{g}",
+                                                         self._cell_fill_commit_ms.get(cell_id, now_ms))
                 continue
             for index, item in enumerate(plan.items):
+                qty_why = self._qty_blocker(item.qty, ledger.spec.tp_price)
+                if qty_why:
+                    self.cell_blockers[cell_id] = qty_why
+                    continue
                 if not item.allocation:
                     cycle = next(c for c in ledger.cycles if c.generation == item.generation)
                     live_entry = next((e for e in cycle.entries if not e.is_final), None)
@@ -2250,6 +2368,10 @@ class NeutralGridEngine:
         except CidAllocationError as exc:
             self.reload_needed = True
             self.meta.freezes[FREEZE_CID] = f"{type(exc).__name__}: {exc}"
+            self._sticky_freezes[FREEZE_CID] = self.meta.freezes[FREEZE_CID]
+            if isinstance(exc, CidCollisionError):
+                self.meta.colliding_cid = exc.cid
+                self._sticky_meta["colliding_cid"] = exc.cid
             self._error("CID_ALLOCATION", str(exc), now)
             return None
         except (StoreError, LedgerError):

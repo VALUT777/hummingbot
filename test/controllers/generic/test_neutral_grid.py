@@ -474,7 +474,8 @@ def test_a_drain_reports_the_durable_outcome_and_waits_at_least_the_uncertain_bo
                 break
             await asyncio.sleep(0.002)
         victim = next(o.client_order_id for o in fx.open_orders(owned=True))
-        fx.script_cancel(CancelBehavior.TIMEOUT_NOT_LANDED, victim)          # this cancel stays unknown
+        for _ in range(1000):
+            fx.script_cancel(CancelBehavior.TIMEOUT_NOT_LANDED, victim)      # this order's cancel never lands
         clean = await launcher.drain_neutral_executors(timeout_s=3.0, poll_s=0.005)
         running = False
         await advancer

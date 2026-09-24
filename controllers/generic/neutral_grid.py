@@ -5,10 +5,9 @@ lifecycle of exactly ONE ``NeutralGridExecutor`` (never 55 executors, never a Gr
 All trading decisions live in the engine hosted by that executor.
 """
 from decimal import Decimal
-from pathlib import Path
 from typing import List, Optional
 
-from pydantic import Field, model_validator
+from pydantic import PrivateAttr, model_validator
 
 from hummingbot.core.data_type.common import MarketDict, PositionMode
 from hummingbot.strategy_v2.controllers import ControllerBase, ControllerConfigBase
@@ -20,11 +19,6 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 _ALLOWED_ORDER_TYPES = (OrderTypePolicy.LIMIT_MAKER, OrderTypePolicy.LIMIT)
-
-
-def default_db_path(grid_id: str) -> str:
-    from hummingbot import data_path
-    return str(Path(data_path()) / f"neutral_grid_{grid_id}.sqlite")
 
 
 class NeutralGridConfig(ControllerConfigBase):
@@ -53,10 +47,30 @@ class NeutralGridConfig(ControllerConfigBase):
     entry_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT_MAKER
     tp_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT
     tp_gtt_seconds: int = 28 * 24 * 3600
+    # None = the store's default ledger per account/market (``<data>/neutral_grid/<domain>.<account>.<pair>``), the
+    # same identity as the host lock/marker: a new grid on that market is an audited migration, never a new DB.
     db_path: Optional[str] = None
-    # Set only by the launcher after explicit interactive confirmation; never read from YAML as true.
-    operator_confirmed_start: bool = Field(default=False, json_schema_extra={"is_updatable": False})
-    operator_confirmed_baseline: bool = Field(default=False, json_schema_extra={"is_updatable": False})
+    # Operator confirmations are NOT config fields (a YAML key is rejected by extra="forbid"): only the fixed
+    # launcher sets them after its explicit phrase / profile / key checks (``mark_operator_confirmed``).
+    _operator_confirmed_start: bool = PrivateAttr(default=False)
+    _operator_confirmed_baseline: bool = PrivateAttr(default=False)
+    _operator_confirmed_migration: bool = PrivateAttr(default=False)
+    _operator_resume_stop_ms: Optional[int] = PrivateAttr(default=None)
+
+    def mark_operator_confirmed(self, *, start: Optional[bool] = None, baseline: Optional[bool] = None,
+                                migration: Optional[bool] = None, resume_stop_ms: Optional[int] = None) -> None:
+        if start is not None:
+            self._operator_confirmed_start = bool(start)
+        if baseline is not None:
+            self._operator_confirmed_baseline = bool(baseline)
+        if migration is not None:
+            self._operator_confirmed_migration = bool(migration)
+        if resume_stop_ms is not None:
+            self._operator_resume_stop_ms = int(resume_stop_ms)
+
+    @property
+    def operator_confirmed_start(self) -> bool:
+        return self._operator_confirmed_start
 
     @model_validator(mode="after")
     def validate_neutral_grid(self):
@@ -89,8 +103,9 @@ class NeutralGridConfig(ControllerConfigBase):
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
-    def resolved_db_path(self) -> str:
-        return self.db_path or default_db_path(self.grid_id)
+    def resolved_db_path(self) -> Optional[str]:
+        """Explicit path, or None for the store's per-account/market default (resolved with the connector)."""
+        return self.db_path
 
     def executor_config(self, timestamp: Optional[float] = None) -> NeutralGridExecutorConfig:
         return NeutralGridExecutorConfig(
@@ -104,8 +119,10 @@ class NeutralGridConfig(ControllerConfigBase):
             history_overlap_s=self.history_overlap_s, poll_interval_s=self.poll_interval_s,
             entry_order_type=self.entry_order_type, tp_order_type=self.tp_order_type,
             tp_gtt_seconds=self.tp_gtt_seconds, enabled=self.enabled, db_path=self.resolved_db_path(),
-            operator_confirmed_start=self.operator_confirmed_start,
-            operator_confirmed_baseline=self.operator_confirmed_baseline,
+            operator_confirmed_start=self._operator_confirmed_start,
+            operator_confirmed_baseline=self._operator_confirmed_baseline,
+            operator_confirmed_migration=self._operator_confirmed_migration,
+            operator_resume_stop_ms=self._operator_resume_stop_ms,
         )
 
 

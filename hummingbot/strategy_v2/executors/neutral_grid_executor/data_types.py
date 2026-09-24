@@ -138,6 +138,7 @@ class EngineMeta:
     reject_latches: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     risk_blocked: Dict[str, str] = field(default_factory=dict)   # router TP key -> RISK_BLOCKED reason
     start_preview_id: Optional[str] = None                        # preview the applied START acknowledged
+    colliding_cid: Optional[int] = None                           # CID a foreign order owns (retire_colliding_cid)
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -185,10 +186,12 @@ class NeutralGridExecutorConfig(ExecutorConfigBase):
     tp_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT
     tp_gtt_seconds: int = 28 * 24 * 3600
     enabled: bool = False
-    db_path: str
+    db_path: Optional[str] = None                       # None = the store's default per account/market
     # Explicit operator confirmations collected by the launcher (never implied by enabled=true).
     operator_confirmed_start: bool = False
     operator_confirmed_baseline: bool = False
+    operator_confirmed_migration: bool = False             # launcher-confirmed audited grid migration (AC-52)
+    operator_resume_stop_ms: Optional[int] = None          # launcher-confirmed resume of exactly this durable stop
 
     @model_validator(mode="after")
     def _no_market_orders(self):

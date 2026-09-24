@@ -293,6 +293,13 @@ def format_status(snapshot: Optional[Dict[str, Any]], *, stale_after_s: float = 
     h = s["history"]
     lines.append(f"  history complete={h['complete']} reason={h['incomplete_reason']} lag={h['lag_s']}s "
                  f"last_full_scan={h['last_full_scan_at']} weight60s={h['weight_used_60s']}")
+    progress = h.get("progress") or {}
+    walk = ", ".join(f"{name} pages {p.get('pages_read')} done={p.get('done')} oldest={p.get('oldest_ts_ms')}"
+                     for name, p in sorted((progress.get("streams") or {}).items()))
+    lines.append(f"  trades cursor {h.get('trades_cursor')} | orders cursor {h.get('orders_cursor')} | pages "
+                 f"{h.get('pages_read')} | walk {'resumable' if progress.get('resumable') else 'idle'}"
+                 + (f" ({walk})" if walk else "")
+                 + (f" | backoff until {progress.get('backoff_until')}" if progress.get("backoff_until") else ""))
     sl = s["slots"]
     lines.append(f"  slots actual {sl['actual']} reserved {sl['reserved']} free {sl['free']} cap {sl['cap']} | "
                  f"armed {s['armed']} queued {s['queued']} | owned active {s['owned_active']} unknown "
@@ -310,8 +317,8 @@ def format_status(snapshot: Optional[Dict[str, Any]], *, stale_after_s: float = 
         if cell["state"] in ("IDLE", "QUEUED") and not cell["blocker"] and cell["obligation"]["dust"] == "0":
             continue
         e = cell["entry"] or {}
-        tp_text = ",".join(f"{t['cid']}/{t['exchange_id']}:{t['filled']}/{t['requested']} {t['state']}"
-                           for t in cell["tp_children"])
+        tp_text = ",".join(f"{t['cid']}/{t['exchange_id']}:{t['filled']}/{t['requested']} remaining {t['remaining']} "
+                           f"{t['state']}" for t in cell["tp_children"])
         lines.append(
             f"  cell {cell['cell_id']:>3} {cell['low']}-{cell['high']} {cell['entry_side']:<4} g{cell['generation']} "
             f"{cell['state']:<22} entry {e.get('cid')}/{e.get('exchange_id')} {e.get('filled')}/{e.get('requested')} "

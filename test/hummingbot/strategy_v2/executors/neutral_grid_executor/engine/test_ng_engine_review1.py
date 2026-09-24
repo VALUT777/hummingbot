@@ -494,9 +494,14 @@ def test_r13_risk_blocked_tps_name_their_cells_and_every_reason(tmp_path):
         _started(h)
         h.fx.manual_trade(Side.SELL, D("40"), D("5.4"))          # outside trade: short 40
         h.tick(8)
-        h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.fx.net_position), "note": "audited"},
-                  key="r13-audit")
-        h.tick(4)
+        for attempt in range(10):                                # retryable until the evidence is settled
+            h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.fx.net_position), "note": "audited"},
+                      key=f"r13-audit-{attempt}")
+            h.tick(2)
+            if _cmd(h, f"r13-audit-{attempt}").status == CommandStatus.APPLIED:
+                break
+        assert h.engine.effective_baseline == D("-40")
+        h.tick(2)
         cells = sorted(c for c in h.buy_cells() if h.live_order(c, ENTRY) is not None)[-2:]
         assert len(cells) == 2
         for c in cells:
