@@ -7,8 +7,7 @@ import secrets
 from pathlib import Path
 
 import pytest
-from conftest import ACCESS_TOKEN
-from ngweb_fakes import sample_snapshot
+from ngweb_fakes import ACCESS_TOKEN, sample_snapshot
 
 from web.neutral_grid.keystore import KeystoreService
 from web.neutral_grid.security import BindRefused, check_bind, is_loopback_host
