@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from ngweb_fakes import FakeGateway, sample_config, sample_snapshot
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import grid as core_grid
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import OrderTypePolicy
 from web.neutral_grid.runtime import attach_context, engine_config_from_snapshot
 from web.neutral_grid.security import AccessGate
 from web.neutral_grid.server import create_app
@@ -213,6 +214,35 @@ async def test_attach_rules_fetched_at_is_the_rules_time_not_snapshot_time(attac
     preview = await _preview(web)
     assert abs(preview["rules_fetched_at"] - float(snap["summary"]["runtime_rules"]["fetched_at"])) < 1e-6
     assert preview["runtime_rules"]["supports_post_only"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["API_KEY_MAKER_ONLY", "MAKER_ONLY_CAPABILITY_UNKNOWN"])
+async def test_attach_preview_blocks_any_new_entry_when_ordinary_limit_capability_is_blocked(attach_web, blocker):
+    config = engine_config_json(tp_order_type=OrderTypePolicy.LIMIT_MAKER)
+    snap = attach_snapshot(engine_config=config, supports=(False, True))
+    snap["summary"]["runtime_rules"]["ordinary_limit_blocker"] = blocker
+    web = await attach_web(snap)
+
+    preview = await _preview(web)
+    assert preview["runtime_rules"]["ordinary_limit_blocker"] == blocker
+    assert preview["can_start"] is False
+    assert any(blocker in error for error in preview["errors"]), preview["errors"]
+    response = await web.command("start", f"blocked-limit-{blocker.lower()}", {
+        "expected_initial_position": "330", "baseline_acknowledged": True, "risk_acknowledged": True,
+        "preview_id": preview["preview_id"]})
+    assert response.status == 422
+    assert web.gateway.commands == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["UNRECOGNIZED", 7])
+async def test_attach_preview_rejects_malformed_ordinary_limit_blocker(attach_web, blocker):
+    snap = attach_snapshot()
+    snap["summary"]["runtime_rules"]["ordinary_limit_blocker"] = blocker
+    preview = await _preview(await attach_web(snap))
+    assert preview["can_start"] is False
+    assert any("ordinary_limit_blocker" in error for error in preview["errors"]), preview["errors"]
 
 
 @pytest.mark.asyncio

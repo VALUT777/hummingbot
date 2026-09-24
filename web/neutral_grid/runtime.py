@@ -155,6 +155,15 @@ def _rules_flag(rr: Dict[str, Any], name: str, errors: List[str]) -> bool:
     return value
 
 
+def _ordinary_limit_blocker(rr: Dict[str, Any], errors: List[str]) -> Optional[str]:
+    value = rr.get("ordinary_limit_blocker")
+    allowed = {None, "API_KEY_MAKER_ONLY", "MAKER_ONLY_CAPABILITY_UNKNOWN"}
+    if value not in allowed:
+        errors.append("Правила рынка: ordinary_limit_blocker неизвестен или повреждён — старт заблокирован.")
+        return None
+    return value
+
+
 def snapshot_market(gateway: Any, config_source: Callable[[], Tuple[Optional[GridConfig], Optional[str]]],
                     stale_after_s: float, clock: Callable[[], float] = time.time
                     ) -> Callable[[], Awaitable[MarketContext]]:
@@ -178,6 +187,7 @@ def snapshot_market(gateway: Any, config_source: Callable[[], Tuple[Optional[Gri
                 fetched_at = float(fetched_raw) if fetched_raw not in (None, "") else None
                 supports_limit = _rules_flag(rr, "supports_limit", errors)
                 supports_post_only = _rules_flag(rr, "supports_post_only", errors)
+                ordinary_limit_blocker = _ordinary_limit_blocker(rr, errors)
                 rules = TradingRules(
                     tick_size=Decimal(str(rr["tick_size"])), size_step=Decimal(str(rr["size_step"])),
                     min_base=Decimal(str(rr["min_base"])), min_notional=Decimal(str(rr["min_notional"])),
@@ -185,7 +195,8 @@ def snapshot_market(gateway: Any, config_source: Callable[[], Tuple[Optional[Gri
                     supports_limit=supports_limit, supports_post_only=supports_post_only,
                     fetched_at=fetched_at if fetched_at is not None else 0.0,
                     max_active_orders_venue=(int(rr["max_active_orders_venue"])
-                                             if rr.get("max_active_orders_venue") not in (None, "") else None))
+                                             if rr.get("max_active_orders_venue") not in (None, "") else None),
+                    ordinary_limit_blocker=ordinary_limit_blocker)
             except (KeyError, ValueError, ArithmeticError, TypeError):
                 rules = None
                 errors.append("Правила рынка в снимке движка неполные или повреждены.")

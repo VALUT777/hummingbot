@@ -151,6 +151,9 @@ class PreviewService:
         gp = core_grid.build_preview(cfg, rules, mid, baseline, bootstrap=bootstrap)
 
         errors: List[str] = [localize_error(message) for message in gp.errors] + list(ctx.errors)
+        if rules is not None and rules.ordinary_limit_blocker is not None:
+            errors.append("Новая экспозиция заблокирована: ordinary_limit_blocker="
+                          f"{rules.ordinary_limit_blocker}; обычный LIMIT недоступен для выбранного API key.")
         if self.mode != "demo" and not cfg.enabled:
             errors.append("enabled=false: live-старт невозможен без изменения конфигурации и явного подтверждения.")
         if baseline is None:
