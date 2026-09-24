@@ -43,14 +43,15 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
 TRADES_ENDPOINT = "trades"
 INACTIVE_ENDPOINT = "inactive_orders"
 ACTIVE_ENDPOINT = "active_orders"
-POSITION_ENDPOINT = "position"
-RULES_ENDPOINT = "trading_rules"
-BOOK_ENDPOINT = "order_book"
+POSITION_ENDPOINT = "account"            # same endpoint names as history.ENDPOINT_* / LighterExchangePort
+RULES_ENDPOINT = "order_book_details"
+SEND_TX_ENDPOINT = "send_tx"
 
 # Standard account weights (spec NG-HIST-003).
 DEFAULT_WEIGHTS: Dict[str, int] = {
     TRADES_ENDPOINT: 600,
     INACTIVE_ENDPOINT: 100,
+    SEND_TX_ENDPOINT: 6,
 }
 DEFAULT_OTHER_WEIGHT = 300
 DEFAULT_WEIGHT_POOL_PER_MIN = 18000
@@ -425,7 +426,7 @@ class FakeExchange:
         return (self.bid + self.ask) / 2
 
     async def best_bid_ask(self) -> Tuple[Optional[Decimal], Optional[Decimal]]:
-        self._charge(BOOK_ENDPOINT)
+        # The live adapter reads the WS-fed local order book: no REST weight.
         return self.bid, self.ask
 
     async def position(self) -> PositionSnapshot:
