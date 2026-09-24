@@ -95,6 +95,57 @@ class TestSlotFormula(unittest.TestCase):
         self.assertEqual((2, 1), (plan.reservations[BUY_CELL.cell_id], plan.slots.free))
 
 
+class TestCapReduction(unittest.TestCase):
+    def test_cap_drop_trims_stale_reservations_and_tp_goes_to_emergency_path(self):
+        # Review #2: cap 3 -> venue cap 1 with one live entry: no unused reservation may survive, a TP for a
+        # new partial fill must not be sent over the cap; it cancel-requests the cap-consuming entry and waits.
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import LegRole
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.router import (
+            RouterIntent,
+            RouterOrder,
+            SlotBudget,
+            plan_submits,
+        )
+        views = [CellAdmission(BUY_CELL, open_cycle=True, actual_orders=1, reserved_slots=3, slot_need=3)]
+        plan = admission.plan(views, cap=3, mid=D("5.4"), rules=rules(venue_cap=1), order_amount_base=Q)
+        self.assertEqual((1, 1, 0, 0), (plan.slots.cap, plan.slots.actual, plan.slots.reserved_unused,
+                                        plan.slots.free))
+        self.assertEqual(0, plan.unused(BUY_CELL.cell_id))
+        owned = [RouterOrder(key="e", side=Side.BUY, price=BUY_CELL.low_price, remaining=D("5"),
+                             state=OrderState.LIVE, role=LegRole.ENTRY, cell_id=BUY_CELL.cell_id, filled=D("5"))]
+        tp = RouterIntent("tp", Side.SELL, BUY_CELL.high_price, D("5"), LegRole.TP, BUY_CELL.cell_id, 1)
+        rplan = plan_submits([tp], owned, slots=SlotBudget.from_plan(plan), mid=D("5.4"))
+        self.assertEqual(((), ("e",)), (rplan.submits, rplan.cancels))
+        self.assertEqual("WAIT_SLOT:ENTRY_CANCEL_REQUESTED", rplan.action_for("tp").reason)
+
+    def test_oversubscription_trims_entry_side_reservations_before_exit_ones(self):
+        cells = sample_cells()
+        views = [CellAdmission(cells[21], open_cycle=True, actual_orders=1, reserved_slots=3, slot_need=3,
+                               entry_live=True),
+                 CellAdmission(cells[20], open_cycle=True, actual_orders=1, reserved_slots=3, slot_need=2)]
+        plan = admission.plan(views, cap=4, mid=D("5.4"), rules=rules(), order_amount_base=Q)
+        # actual 2, cap 4 -> only 2 unused slots may remain: the exit-only cell 20 keeps its one extra slot.
+        self.assertEqual((2, 2, 0), (plan.slots.actual, plan.slots.reserved_unused, plan.slots.free))
+        self.assertEqual((1, 1), (plan.unused(20), plan.unused(21)))
+        plan = admission.plan(views, cap=3, mid=D("5.4"), rules=rules(), order_amount_base=Q)
+        self.assertEqual((1, 0), (plan.unused(20), plan.unused(21)))
+
+    def test_sim_never_submits_over_a_reduced_cap(self):
+        sim = CoreSim([BUY_CELL], cap=3, r=rules(min_base="5", min_notional="0"))
+        sim.tick()
+        (entry,) = sim.non_final()
+        sim.fill(entry, D("5"))
+        sim.cap = 1
+        plan = sim.tick()
+        self.assertEqual(((), (str(entry.cid),)), (plan.submits, plan.cancels))
+        self.assertEqual(1, len(sim.non_final()))
+        sim.ledgers[BUY_CELL.cell_id].set_state(entry.identity, OrderState.TERMINAL_UNKNOWN)
+        sim.prove_terminal(entry)                                     # history terminal of the cancelled entry
+        plan = sim.tick()
+        self.assertEqual(1, len(plan.submits))                        # TP 5 now fits the reduced cap
+        self.assertEqual(1, len(sim.non_final()))
+
+
 class TestRuntimeMinimumChange(unittest.TestCase):
     def test_ac34_higher_floor_blocks_new_entries_without_resize(self):
         cells = sample_cells()

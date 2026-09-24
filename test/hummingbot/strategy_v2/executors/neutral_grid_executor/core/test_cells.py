@@ -2,6 +2,7 @@
 import json
 import unittest
 
+from hummingbot.strategy_v2.executors.neutral_grid_executor import grid
 from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import (
     CellLedger,
     FillOutcome,
@@ -441,6 +442,21 @@ class TestReleaseAndDust(unittest.TestCase):
         self.assertEqual((D("5"),), plan.quantities)
         self.assertEqual(D("0"), h.ledger.buckets().dust)              # dust consumed by the merged TP
         self.assertEqual({}, h.ledger.refresh_dust(h.rules))
+
+    def test_max_base_split_is_balanced_so_no_avoidable_dust(self):
+        # Review #4: Q=10 accepted, then runtime max_base=6 (min 5, step 1): 5+5 is valid, 6+DUST 4 is not.
+        h = Harness(r=rules(step="1", min_base="5", min_notional="0"))
+        e = h.entry()
+        h.fill(e, "10")
+        h.ledger.confirm_terminal(e, D("10"))
+        tighter = rules(step="1", min_base="5", min_notional="0", max_base="6")
+        plan = h.ledger.tp_obligation_to_dispatch(tighter)
+        self.assertEqual(((D("5"), D("5")), D("0")), (plan.quantities, plan.dust))
+        self.assertEqual({}, h.ledger.refresh_dust(tighter))
+        # No exact partition: 13 with chunks in [5, 6] -> dispatch 6+6, only 1 remains (the maximum possible).
+        self.assertEqual([D("6"), D("6")], grid.partition_valid(D("13"), D("5.0727"), tighter))
+        self.assertEqual([D("5"), D("5"), D("5")], grid.partition_valid(D("15"), D("5.0727"), tighter))
+        self.assertEqual([], grid.partition_valid(D("4"), D("5.0727"), tighter))
 
     def test_full_q_below_runtime_minimum_is_not_armed(self):
         h = Harness(r=rules(min_base="11"))

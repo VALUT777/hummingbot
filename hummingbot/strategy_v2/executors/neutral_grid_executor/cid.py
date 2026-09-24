@@ -70,7 +70,10 @@ class CidAllocator:
         if cid is None and self._lookup is not None:
             found = self._lookup(identity)
             if found is not None:
-                cid = validate_cid(found)
+                try:
+                    cid = validate_cid(found)
+                except CidInvalid as exc:
+                    raise self._fail(exc)          # corrupt durable row: latch fail-closed
                 self._remember(identity, cid)
         return cid
 

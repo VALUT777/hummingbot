@@ -31,6 +31,15 @@ class TestGrouping(unittest.TestCase):
         self.assertEqual(plan.qty, sum(q for _, q in plan.allocation))
         self.assertEqual([], dust.aggregate(lots, rules(step="1", min_base="7", min_notional="0")))
 
+    def test_aggregate_above_max_base_is_split_into_valid_balanced_orders(self):
+        # Review #4 (dust side): a group above max_base forms several valid orders instead of none.
+        lots = [lot(3, 0, Side.SELL, "5.0727", "4"), lot(3, 1, Side.SELL, "5.0727", "6")]
+        plans = dust.aggregate(lots, rules(step="1", min_base="5", min_notional="0", max_base="6"))
+        self.assertEqual([D("5"), D("5")], [p.qty for p in plans])
+        self.assertEqual([(((3, 0), D("4")), ((3, 1), D("1"))), (((3, 1), D("5")),)],
+                         [p.allocation for p in plans])
+        self.assertEqual(((), ()), (plans[0].residual, plans[1].residual))
+
     def test_geometry_no_two_cells_share_tp_side_and_target(self):
         cells = grid.assign_cells(grid.build_grid(D("5"), D("6"), 55, rules()), D("5.4"))
         keys = [(c.tp_side, c.tp_price) for c in cells]

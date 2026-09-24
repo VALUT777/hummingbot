@@ -35,6 +35,9 @@ CANCELLABLE_STATES = frozenset({OrderState.LIVE})
 # Entries already on their way to terminal (their remainder is released only on history terminal).
 CANCEL_IN_FLIGHT_STATES = frozenset({OrderState.CANCEL_PENDING, OrderState.CANCEL_UNKNOWN,
                                      OrderState.TERMINAL_UNKNOWN})
+# Entries whose submission outcome is unknown: not cancellable yet, but they will resolve to LIVE (then
+# cancellable) or to a definitive zero-fill reject (then freed), so they are pending headroom, not a dead end.
+UNRESOLVED_SUBMIT_STATES = frozenset({OrderState.SUBMIT_UNKNOWN})
 
 
 @dataclass(frozen=True)
@@ -239,6 +242,7 @@ def plan_tp_headroom(ep: RiskEndpoints, tp_side: Side, tp_qty: Decimal, entries:
         return HeadroomDecision(ok=True, reason="WITHIN_CAP")
     same_side = [e for e in entries if e.side == tp_side and e.role == LegRole.ENTRY and e.counts]
     in_flight = sum((e.remaining for e in same_side if e.state in CANCEL_IN_FLIGHT_STATES), ZERO)
+    unresolved = sum((e.remaining for e in same_side if e.state in UNRESOLVED_SUBMIT_STATES), ZERO)
     candidates = [e for e in same_side if e.state in CANCELLABLE_STATES or e.state in WITHDRAWABLE_STATES]
 
     def priority(e: OpenLeg):
@@ -246,7 +250,9 @@ def plan_tp_headroom(ep: RiskEndpoints, tp_side: Side, tp_qty: Decimal, entries:
         return (-distance, -(e.cell_id if e.cell_id is not None else -1), e.key or "")
 
     candidates.sort(key=priority)
-    freeable = in_flight + sum((e.remaining for e in candidates), ZERO)
+    # Every same-side entry remainder can eventually be freed (cancel, withdraw, in-flight cancel, or an unknown
+    # submit that resolves). Only confirmed position + non-entry orders beyond the cap need the operator.
+    freeable = in_flight + unresolved + sum((e.remaining for e in candidates), ZERO)
     if freeable < excess:
         return HeadroomDecision(ok=False, risk_blocked=True,
                                 reason=f"RISK_BLOCKED:{tp_side.value} TP {q} needs {excess}, entries free {freeable}")
@@ -258,8 +264,10 @@ def plan_tp_headroom(ep: RiskEndpoints, tp_side: Side, tp_qty: Decimal, entries:
             break
         freed += e.remaining
         (withdraw if e.state in WITHDRAWABLE_STATES else cancel).append(e.key or "")
-    return HeadroomDecision(ok=False, cancel=tuple(cancel), withdraw=tuple(withdraw), wait=True,
-                            reason=f"WAIT_ENTRY_TERMINAL:{tp_side.value} TP {q} needs {excess}")
+    reason = f"WAIT_ENTRY_TERMINAL:{tp_side.value} TP {q} needs {excess}"
+    if freed < excess:
+        reason += f",WAIT_UNRESOLVED_SUBMIT:{unresolved}"
+    return HeadroomDecision(ok=False, cancel=tuple(cancel), withdraw=tuple(withdraw), wait=True, reason=reason)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

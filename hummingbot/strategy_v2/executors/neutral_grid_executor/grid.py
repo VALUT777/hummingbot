@@ -134,6 +134,37 @@ def order_qty_blocker(qty: Decimal, price: Decimal, rules: TradingRules) -> Opti
     return None
 
 
+def partition_valid(qty: Decimal, price: Decimal, rules: TradingRules) -> List[Decimal]:
+    """Largest exact set of valid orders that ``qty`` can be split into at ``price`` (never rounded up).
+
+    Chunks are size-step multiples in ``[min_valid, max_base]``. If ``qty`` (floored to step) splits exactly,
+    the chunks are balanced (e.g. 10 with ``max_base`` 6 and min 5 -> 5 + 5, not 6 + 4); otherwise the largest
+    splittable amount is used and only the unavoidable remainder is left (pending or DUST for the caller).
+    """
+    step = rules.size_step
+    n = math.floor(Fraction(qty) / Fraction(step))          # whole steps available
+    m = int(Fraction(min_valid_order_qty(rules, price)) / Fraction(step))
+    if n < m:
+        return []
+    if rules.max_base is None:
+        chunks = [n]
+    else:
+        big = math.floor(Fraction(rules.max_base) / Fraction(step))
+        if big < m:
+            return []
+        k = -(-n // big)                                     # ceil(n / big): fewest chunks that fit max_base
+        if k * m <= n:
+            q, r = divmod(n, k)                              # balanced: r chunks of q+1, k-r chunks of q
+            chunks = [q + 1] * r + [q] * (k - r)
+        else:
+            chunks = [big] * (k - 1)                         # no exact split: largest splittable amount
+    out = [Decimal(c) * step for c in chunks]
+    out = [qty if c == qty else c for c in out]              # keep the caller's exact representation
+    if any(order_qty_blocker(c, price, rules) is not None for c in out):
+        return []
+    return out
+
+
 def rules_blockers(rules: Optional[TradingRules]) -> List[str]:
     """Malformed/unknown trading rules block new exposure (NG-RISK-004)."""
     if rules is None:

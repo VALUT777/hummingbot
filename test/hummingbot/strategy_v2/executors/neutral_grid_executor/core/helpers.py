@@ -138,9 +138,11 @@ class CoreSim:
         views = []
         for cid, L in sorted(self.ledgers.items()):
             open_ = bool(L.open_cycles())
+            entry_live = any(not e.is_final for c in L.open_cycles() for e in c.entries)
             views.append(CellAdmission(cell=L.spec, open_cycle=open_, actual_orders=len(L.non_final_legs()),
                                        reserved_slots=self.reservations.get(cid, 0),
-                                       slot_need=slot_need_from_ledger(L, self.rules) if open_ else None))
+                                       slot_need=slot_need_from_ledger(L, self.rules) if open_ else None,
+                                       entry_live=entry_live))
         return views
 
     # ---------------------------------------------------------------- one tick

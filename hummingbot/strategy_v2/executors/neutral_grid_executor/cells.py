@@ -41,7 +41,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
 from hummingbot.strategy_v2.executors.neutral_grid_executor.grid import (
     min_valid_order_qty,
     order_qty_blocker,
-    quantize_down,
+    partition_valid,
     require_decimal,
     rules_blockers,
 )
@@ -832,18 +832,8 @@ class CellLedger:
 # ---------------------------------------------------------------------------------------------------------------------
 
 def _split_valid(qty: Decimal, price: Decimal, rules: TradingRules) -> List[Decimal]:
-    """Split an exact obligation into valid order quantities without rounding up (remainder is returned implicitly)."""
-    min_valid = min_valid_order_qty(rules, price)
-    remaining = quantize_down(qty, rules.size_step)
-    chunk_cap = quantize_down(rules.max_base, rules.size_step) if rules.max_base is not None else None
-    out: List[Decimal] = []
-    while remaining >= min_valid:
-        chunk = remaining if chunk_cap is None else min(remaining, chunk_cap)
-        if chunk < min_valid or order_qty_blocker(chunk, price, rules) is not None:
-            break
-        out.append(chunk)
-        remaining -= chunk
-    return out
+    """Split an exact obligation into valid order quantities without rounding up (see ``grid.partition_valid``)."""
+    return partition_valid(qty, price, rules)
 
 
 def _require_cid(cid: Any) -> None:

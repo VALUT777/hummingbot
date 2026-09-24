@@ -14,7 +14,9 @@ Rules: every candidate is checked against all owned possibly-executable orders *
 same plan (approved or waiting). TP candidates go first (by ``seq``), entries after. A TP conflicting with an
 owned entry cancel-requests that entry and waits for its history terminal; a TP conflicting with another TP (or an
 unknown-role order) waits FIFO; an entry conflicting with anything waits. Obligations are never netted internally
-and a normal partial fill never cancels an entry (only an explicit conflict does).
+and a normal partial fill never cancels an entry (only an explicit conflict does). A TP that cannot be placed for a
+non-conflict reason (RISK_BLOCKED, no slot obtainable under the effective cap) does not hold the FIFO head, so a
+crossing TP that owns a slot is not starved; entries still never cross it.
 """
 from __future__ import annotations
 
@@ -91,23 +93,35 @@ class RouterAction:
 
 @dataclass
 class SlotBudget:
-    """Slots available to this plan: global free pool plus each armed cell's unused reservation."""
+    """Slots available to this plan: global free pool plus each armed cell's unused reservation.
+
+    ``headroom`` (``effective cap - actual orders``) is a hard ceiling on new orders in this plan whatever the
+    reservations say, so a stale reservation can never put an order over a reduced cap.
+    """
     free: int
     cell_unused: Dict[int, int] = field(default_factory=dict)
+    headroom: Optional[int] = None
 
     @classmethod
     def from_plan(cls, plan) -> "SlotBudget":
         """From an ``admission.AdmissionPlan``."""
-        return cls(free=plan.slots.free, cell_unused={c: plan.unused(c) for c in plan.reservations})
+        return cls(free=max(plan.slots.free, 0), cell_unused={c: plan.unused(c) for c in plan.reservations},
+                   headroom=plan.slots.cap - plan.slots.actual)
 
     def take(self, cell_id: int, allow_global: bool) -> Optional[str]:
+        if self.headroom is not None and self.headroom <= 0:
+            return None
         if self.cell_unused.get(cell_id, 0) > 0:
             self.cell_unused[cell_id] -= 1
-            return "CELL"
-        if allow_global and self.free > 0:
+            source = "CELL"
+        elif allow_global and self.free > 0:
             self.free -= 1
-            return "GLOBAL"
-        return None
+            source = "GLOBAL"
+        else:
+            return None
+        if self.headroom is not None:
+            self.headroom -= 1
+        return source
 
 
 @dataclass(frozen=True)
@@ -174,10 +188,14 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
     withdraw_requested: Set[str] = set()
     approved: List[RouterIntent] = []
     waiting_tps: List[RouterIntent] = []
+    # TPs that cannot be placed for a non-conflict reason (RISK_BLOCKED, no slot obtainable): they do not hold
+    # the TP FIFO head (else a TP that owns a slot / fits the cap could wait forever behind them), but entries
+    # never cross them. Self-trade safety is unaffected: conflicts are always checked against live orders.
     blocked_tps: List[RouterIntent] = []
     ep = endpoints
     owed_buy, owed_sell = owed
-    budget = SlotBudget(free=slots.free, cell_unused=dict(slots.cell_unused)) if slots is not None else None
+    budget = SlotBudget(free=slots.free, cell_unused=dict(slots.cell_unused),
+                        headroom=slots.headroom) if slots is not None else None
     # Slots that will come back when already-requested entry cancels become terminal (avoid cancel spam).
     slot_frees_in_flight = sum(1 for o in owned_orders
                                if o.role == LegRole.ENTRY and o.state in _CANCEL_IN_FLIGHT)
@@ -241,7 +259,7 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
             if slot_frees_in_flight > 0:
                 slot_frees_in_flight -= 1
                 actions.append(RouterAction(ActionKind.WAIT, tp.key, "WAIT_SLOT:ENTRY_CANCEL_IN_FLIGHT"))
-                waiting_tps.append(tp)
+                blocked_tps.append(tp)
                 continue
             candidates = [SlotEntry(key=o.key, cell_id=o.cell_id if o.cell_id is not None else -1, price=o.price,
                                     filled=o.filled, state=o.state)
@@ -254,7 +272,7 @@ def plan_submits(pending_intents: Sequence[RouterIntent], owned_orders: Sequence
                 actions.append(RouterAction(ActionKind.WAIT, tp.key, "WAIT_SLOT:ENTRY_CANCEL_REQUESTED", chosen))
             else:
                 actions.append(RouterAction(ActionKind.WAIT, tp.key, "WAIT_SLOT:NO_CANCELLABLE_ENTRY"))
-            waiting_tps.append(tp)
+            blocked_tps.append(tp)
             continue
         actions.append(RouterAction(ActionKind.SUBMIT, tp.key, "OK"))
         approved.append(tp)

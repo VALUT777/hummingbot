@@ -61,6 +61,7 @@ class CellAdmission:
     eligible: bool = True            # idle cell allowed to start a new cycle now
     blocker: Optional[str] = None    # why an idle cell is not eligible (UI)
     slot_need: Optional[int] = None  # open cycle: max simultaneous orders still possible (see slot_need_from_ledger)
+    entry_live: bool = False         # open cycle whose entry may still fill (its spare slots are trimmed first)
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class AdmissionPlan:
     actual: Dict[int, int]                  # cell_id -> actual orders
     slots: SlotLedger
     blocked: Dict[int, str] = field(default_factory=dict)      # idle cells not eligible, with reason
-    shortfall: Dict[int, int] = field(default_factory=dict)    # open cells lacking reservation (slots missing)
+    shortfall: Dict[int, int] = field(default_factory=dict)    # open cells lacking reservation (slots missing/trimmed)
     blocker: Optional[str] = None                              # global reason no new entry is armed
 
     def unused(self, cell_id: int) -> int:
@@ -159,9 +160,28 @@ def plan(cells: Sequence[CellAdmission], cap: int, mid: Optional[Decimal], rules
         reservations[cid] += grant
         if grant < missing:
             shortfall[cid] = missing - grant
+    # 2b. The effective cap may have dropped below what is reserved (venue/user cap reduction): unused
+    # reservations are trimmed so they never authorize an order beyond the cap. Entry-side spare slots go
+    # first, exit-only cells last; within a group the farthest fixed entry price from mid first, then higher id.
+    deficit = -ledger().free
+    if deficit > 0:
+        def trim_key(c: CellAdmission):
+            distance = abs(c.cell.entry_price - mid) if mid is not None else ZERO
+            return (not c.entry_live, -distance, -c.cell.cell_id)
+
+        for c in sorted(open_cells, key=trim_key):
+            if deficit <= 0:
+                break
+            cid = c.cell.cell_id
+            spare = reservations[cid] - actual[cid]
+            cut = min(max(spare, 0), deficit)
+            if cut > 0:
+                reservations[cid] -= cut
+                shortfall[cid] = shortfall.get(cid, 0) + cut
+                deficit -= cut
     slots = ledger()
     if slots.oversubscribed:
-        blocker = blocker or f"SLOTS_OVERSUBSCRIBED:free={slots.free}"
+        blocker = blocker or f"SLOTS_OVERSUBSCRIBED:actual={slots.actual}>cap={slots.cap}"
     elif shortfall:
         blocker = blocker or "EXIT_RESERVATION_SHORTFALL"
     if not entries_allowed:

@@ -62,6 +62,17 @@ class TestCid(unittest.TestCase):
             alloc.allocate(ident(2))
         self.assertEqual(MAX_CLIENT_ORDER_ID, alloc.allocate(ident(0)))  # known leg still resolves
 
+    def test_malformed_durable_lookup_latches_fail_closed(self):
+        # Review #8: a corrupt durable row must latch the allocator, not only raise once.
+        alloc = CidAllocator(exists=lambda cid: False,
+                             lookup=lambda i: (1 << 48) if i.cell_id == 0 else None)
+        with self.assertRaises(CidInvalid):
+            alloc.allocate(ident(0))
+        self.assertIsNotNone(alloc.failed)
+        with self.assertRaises(CidError):
+            alloc.allocate(ident(1))
+        self.assertEqual(0, alloc.high_water)
+
     def test_validate_never_truncates_hashes_or_coerces(self):
         self.assertEqual(MAX_CLIENT_ORDER_ID, validate_cid((1 << 48) - 1))
         for bad in (0, -1, 1 << 48, (1 << 48) + 5, 1.0, "12", True, None):

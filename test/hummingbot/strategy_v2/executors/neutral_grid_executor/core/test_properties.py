@@ -5,7 +5,9 @@ Invariants checked after every event, over random fill/cancel/unknown/terminal/r
 * ``P_min <= actual position <= P_max`` for every outcome reachable before the next routing decision, and the
   interval never widens without a new submit;
 * net/gross caps are never violated, even counting every owed TP exit (TP priority), so without external
-  drift a TP is never RISK_BLOCKED; slots never oversubscribed;
+  drift a TP is never RISK_BLOCKED;
+* actual orders never exceed the effective order cap, also when the cap is lowered at random: no submit while
+  at/above the cap, unused reservations never exceed ``cap - actual``;
 * confirmed quantities (per leg, E and X per cycle) never decrease;
 * a cycle is never closed (reset) with an obligation, a non-final/unknown order or DUST;
 * ledger application is idempotent (replays are DUPLICATE and change nothing; record round trip is exact);
@@ -55,6 +57,7 @@ class Checker:
         self.sim = sim
         self.strict_risk = strict_risk   # False only after injected late evidence (outside any reachable-set proof)
         self.reopened = set()            # (cell, generation) released cycles re-opened by injected late evidence
+        self.prev_count = len(sim.non_final())  # actual orders at the previous check (fills/cancels never raise it)
         self.filled = {}
         self.cycle_eq = {}
         self.cycles_count = {}
@@ -62,6 +65,9 @@ class Checker:
         self.owed_window = None
 
     def after_tick(self):
+        rplan = self.sim.last_router
+        if self.prev_count is not None and self.prev_count >= self.sim.cap and rplan is not None:
+            self.tc.assertEqual((), rplan.submits, "submit while at/above the order cap")
         ep = self.sim.endpoints()
         self.window = (ep.P_min, ep.P_max)
         owed = self.sim.endpoints_with_obligations()
@@ -101,9 +107,13 @@ class Checker:
 
     def check_ledgers(self):
         sim, tc = self.sim, self.tc
-        tc.assertLessEqual(len(sim.non_final()), sim.cap)
-        if sim.last_admission is not None:
-            tc.assertFalse(sim.last_admission.slots.oversubscribed)
+        count = len(sim.non_final())
+        tc.assertLessEqual(count, sim.cap if self.prev_count is None else max(sim.cap, self.prev_count))
+        self.prev_count = count
+        adm = sim.last_admission
+        if adm is not None:
+            tc.assertLessEqual(adm.slots.reserved_unused, max(adm.slots.cap - adm.slots.actual, 0))
+            tc.assertTrue(adm.slots.free >= 0 or adm.slots.actual > adm.slots.cap, adm.slots)
         for cid, ledger in sim.ledgers.items():
             tc.assertEqual([], ledger.check_invariants(), f"cell {cid}")
             tc.assertGreaterEqual(len(ledger.cycles), self.cycles_count.get(cid, 0))
@@ -139,8 +149,8 @@ class Checker:
 
 def random_event(rng: random.Random, sim: CoreSim, checker: Checker, tc: unittest.TestCase):
     kind = rng.choices(["fill", "fill_all", "cancel", "ack", "prove", "resolve_unknown", "expire_tp", "replay",
-                        "mid", "pause", "transport"],
-                       weights=[30, 8, 6, 8, 14, 6, 4, 6, 4, 2, 3])[0]
+                        "mid", "pause", "transport", "cap"],
+                       weights=[30, 8, 6, 8, 14, 6, 4, 6, 4, 2, 3, 2])[0]
     legs = sim.non_final()
     if kind in ("fill", "fill_all"):
         cands = [leg for leg in legs if leg.remaining > 0]
@@ -196,6 +206,8 @@ def random_event(rng: random.Random, sim: CoreSim, checker: Checker, tc: unittes
         sim.entries_allowed = not sim.entries_allowed
     elif kind == "transport":
         sim.transport = "UNKNOWN" if sim.transport == "ACCEPTED" else "ACCEPTED"
+    elif kind == "cap":                                           # venue/user order cap changes at runtime
+        sim.cap = rng.choice([1, 2, max(1, sim.cap // 2), sim.cap + 4, 14, 40])
     checker.check()
 
 
