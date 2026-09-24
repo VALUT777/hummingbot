@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import GridConfig, TradingRules
 
+ACCESS_TOKEN = "test-access-token-0123456789abcdef"  # shared by conftest and tests; never import from conftest
 BIG_BASE = (1 << 53) + 1  # every fake id is beyond the JS safe-integer range (AC-22)
 
 

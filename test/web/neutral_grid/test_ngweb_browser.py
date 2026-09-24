@@ -11,9 +11,8 @@ import time
 from decimal import Decimal
 
 import pytest
-from conftest import ACCESS_TOKEN
 from ngweb_cdp import CONTRAST_JS, Browser, find_chrome
-from ngweb_fakes import sample_rules, sample_snapshot
+from ngweb_fakes import ACCESS_TOKEN, sample_rules, sample_snapshot
 
 CHROME = find_chrome()
 pytestmark = pytest.mark.skipif(CHROME is None, reason="no Chrome/Chromium binary for headless browser tests")
