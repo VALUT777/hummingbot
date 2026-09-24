@@ -57,8 +57,8 @@ def test_example_config_is_disabled_and_matches_the_spec_profile():
     data = yaml.safe_load(EXAMPLE_CONTROLLER.read_text())
     cfg = NeutralGridConfig(**data)
     assert cfg.enabled is False
-    assert (cfg.connector_name, cfg.trading_pair, cfg.position_mode) == ("lighter_perpetual_robinhood", "LIT-USDG",
-                                                                        PositionMode.ONEWAY)
+    assert (cfg.connector_name, cfg.trading_pair, cfg.position_mode) == \
+        ("lighter_perpetual_robinhood", "LIT-USDG", PositionMode.ONEWAY)
     assert (cfg.lower_price, cfg.upper_price, cfg.cell_count, cfg.order_amount_base) == (D("5"), D("6"), 55, D("10"))
     assert (cfg.leverage, cfg.max_abs_net_position, cfg.max_gross_position, cfg.max_active_orders) == \
         (D("5"), D("1000"), D("1000"), 120)

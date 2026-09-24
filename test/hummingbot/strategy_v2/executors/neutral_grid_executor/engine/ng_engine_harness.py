@@ -56,7 +56,7 @@ class Harness:
         kwargs = dict(fx_kwargs or {})
         self.fx = FakeExchange(self.clock, **kwargs)
         self.config = config or make_config(**config_overrides)
-        self.options = options or EngineOptions(tick_interval_s=1.0)
+        self.options = options or EngineOptions(tick_interval_s=1.0, min_wake_interval_s=1.0)
         self.db_path = self.tmp_path / "data" / "ng.sqlite3"
         self.lock_dir = self.tmp_path / "locks"
         self.hooks = FaultHooks()

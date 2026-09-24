@@ -173,26 +173,27 @@ class NeutralGridExecutor(ExecutorBase):
         return None
 
     # ------------------------------------------------------------------ WS wake-ups (not proof)
-    def _wake(self, event_type: str, event: Any) -> None:
+    def _wake(self, event_type: str, status: str, event: Any) -> None:
         if self.engine is None:
             return
-        self.engine.wake({"type": event_type, "client_order_id": getattr(event, "order_id", None),
+        self.engine.wake({"type": event_type, "status": status, "client_order_id": getattr(event, "order_id", None),
                           "trade_id": getattr(event, "exchange_trade_id", None)})
 
     def process_order_filled_event(self, event_tag, market, event):
-        self._wake("trade", event)
+        self._wake("trade", "filled", event)
 
     def process_order_canceled_event(self, event_tag, market, event):
-        self._wake("order", event)
+        self._wake("order", "canceled", event)
 
     def process_order_completed_event(self, event_tag, market, event):
-        self._wake("order", event)
+        self._wake("order", "filled", event)
 
     def process_order_created_event(self, event_tag, market, event):
-        self._wake("order", event)
+        # An acceptance ack needs no authoritative history scan (and must not spend request weight).
+        return None
 
     def process_order_failed_event(self, event_tag, market, event):
-        self._wake("order", event)
+        self._wake("order", "failed", event)
 
     # ------------------------------------------------------------------ reporting
     def get_net_pnl_quote(self) -> Decimal:

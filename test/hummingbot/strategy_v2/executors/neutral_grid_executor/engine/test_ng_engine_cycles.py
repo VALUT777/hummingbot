@@ -297,3 +297,34 @@ def test_ac57_simultaneous_partial_fills_use_reserved_slots(tmp_path):
         assert len(reasons) <= len(longs) - 1
     finally:
         h.close()
+
+
+def test_ac39_same_side_target_remainders_merge_into_one_exact_tp(tmp_path):
+    # With fixed sides two different cells never share (TP side, target); the reachable aggregation is inside
+    # one cell: a TP remainder returned by GTT expiry plus later entry fills, same side + same fixed target.
+    h = Harness(tmp_path, tp_gtt_seconds=30)
+    try:
+        _started(h)
+        cell = h.buy_cells()[-1]
+        entry = _entry(h, cell)
+        h.fx.fill(entry.cid, D("7"))
+        h.tick()
+        first = h.live_order(cell, LegRole.TP)
+        assert first.requested == D("7")
+        h.fx.fill(first.cid, D("3"))                                   # 4 left on the first child ...
+        h.run_until(lambda: h.fx.order_by_cid(first.cid).status == "canceled-expired", max_ticks=40)
+        h.fx.fill(entry.cid, D("3"))                                   # ... plus 3 new entry fills
+        h.run_until(lambda: len(_tp_legs(h, cell)) == 2, max_ticks=40)
+        tps = _tp_legs(h, cell)
+        assert tps[1].requested == D("7") and tps[1].price == tps[0].price == D("5.4")   # one merged TP
+        assert tps[1].side == Side.SELL and tps[1].identity.revision == 1
+        b = h.cell(cell).buckets()
+        assert b.E == D("10") and b.X == D("3") and b.live_tp_remainder == D("7") and b.unassigned == 0
+        h.fx.fill(tps[1].cid, D("2"))
+        h.tick(3)
+        h.crash_restart()                                               # allocation is idempotent across replay
+        h.tick(6)
+        b = h.cell(cell).buckets()
+        assert b.X == D("5") and b.live_tp_remainder == D("5") and len(h.engine.store.fills(tps[1].cid)) == 1
+    finally:
+        h.close()

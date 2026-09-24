@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import model_validator
 
@@ -39,7 +39,7 @@ class EngineOptions:
     history_retention_horizon_s: Optional[float] = None
     tp_dispatch_slo_s: float = 2.0
     snapshot_every_tick: bool = True
-    min_wake_interval_s: float = 1.0
+    min_wake_interval_s: float = 2.0             # WS wakeups coalesce into at most one extra scan per 2 s
     committed_cache_rows: int = 5000             # recent inbox rows kept as scanner "committed" view on restart
 
 

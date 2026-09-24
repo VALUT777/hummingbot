@@ -172,7 +172,7 @@ def test_ac13_history_lag_wakes_poller_tp_waits_and_lag_visible(h):
 
 
 def test_ac14_tp_dispatch_within_slo_and_blocker_queue_age_visible(tmp_path):
-    h = Harness(tmp_path, options=EngineOptions(max_submits_per_tick=1))
+    h = Harness(tmp_path, options=EngineOptions(max_submits_per_tick=1, min_wake_interval_s=1.0))
     try:
         _started(h)
         h.tick(15)                                            # all entries placed at 1 submit/tick

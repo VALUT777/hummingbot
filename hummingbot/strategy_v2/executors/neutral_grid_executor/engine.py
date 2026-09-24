@@ -53,7 +53,6 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     ExchangePort,
     ExchangeTradeRow,
     GridConfig,
-    LegIdentity,
     LegRole,
     OrderState,
     OrderTypePolicy,

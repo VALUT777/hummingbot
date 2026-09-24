@@ -120,7 +120,7 @@ def test_invariants_hold_under_random_fill_cancel_restart_orderings(tmp_path, se
     rng = random.Random(seed)
     h = Harness(tmp_path, max_abs_net_position=CAP, max_gross_position=GROSS, max_active_orders=30,
                 fx_kwargs={"min_base": D("1"), "min_notional": D("1")},
-                options=EngineOptions(stop_uncertain_after_s=10_000.0))
+                options=EngineOptions(stop_uncertain_after_s=10_000.0, min_wake_interval_s=1.0))
     try:
         h.bootstrap()
         checker = Checker(h)
@@ -136,11 +136,22 @@ def test_invariants_hold_under_random_fill_cancel_restart_orderings(tmp_path, se
         h.hooks.disarm()
         # Quiesce: stop and let every own order settle; the ledger then equals the venue exactly.
         h.command(CommandKind.STOP, key=f"stop-{seed}")
-        for _ in range(120):
-            h.tick()
-            checker.check()
+        for attempt in range(4):
+            for _ in range(40):
+                h.tick()
+                checker.check()
+                if h.engine.is_stopped:
+                    break
             if h.engine.is_stopped:
                 break
+            # STOP_UNCERTAIN is honest: only a submit whose outcome is unknowable remains. The operator audits it
+            # (the test uses the venue as oracle) and only then may the stop complete.
+            for leg in h.engine.non_final_legs():
+                assert leg.state.value == "SUBMIT_UNKNOWN" and h.fx.order_by_cid(leg.cid) is None, leg
+                h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(leg.cid),
+                                                       "note": "venue export: never landed"},
+                          key=f"audit-{seed}-{attempt}-{leg.cid}")
+        assert h.engine.is_stopped, (h.engine.engine_state, h.engine.reasons)
         if h.engine.is_stopped:
             venue_own = {Side.BUY: D("0"), Side.SELL: D("0")}
             for t in h.fx.trade_legs:
