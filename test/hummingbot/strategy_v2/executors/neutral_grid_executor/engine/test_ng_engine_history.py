@@ -297,7 +297,14 @@ def test_ac42_super_delayed_fill_after_reuse_goes_to_old_cycle_and_freezes(tmp_p
         h.tick(12)
         assert h.state != EngineState.FROZEN, h.engine.reasons                # audit unfreezes the market
         assert h.cell(cell).cycles[1].E == D("3")                             # old cycle keeps its obligation
-        assert h.cell(cell).current is None or h.cell(cell).current.generation == 2
+        # After the audit an ordinary TP of the OLD cycle closes the late obligation at the fixed target.
+        old_tp = next(t for t in h.legs(cell, LegRole.TP) if t.identity.generation == 1)
+        assert (old_tp.side, old_tp.price, old_tp.requested) == (Side.SELL, D("5.4"), D("3"))
+        h.fx.fill(old_tp.cid, D("3"))
+        h.tick(15)
+        old = h.cell(cell).cycles[1]
+        assert old.E == old.X == D("3") and not h.engine.open_conflicts          # resolved, no re-latch
+        assert h.state != EngineState.FROZEN
     finally:
         h.close()
 
