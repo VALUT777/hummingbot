@@ -143,10 +143,13 @@ class Harness:
         assert self.engine.bootstrapped, self.engine.recent_commands
 
     def settle(self, max_ticks: int = 80) -> None:
-        """Run until no leg waits for settlement (terminal row seen but not yet TERMINAL)."""
+        """Run until every owned order that is terminal *at the venue* (test oracle) is proven TERMINAL."""
         def done() -> bool:
-            legs = self.engine.non_final_legs()
-            return all(leg.cid not in self.engine.terminal_rows for leg in legs) and self.engine.history_complete
+            for leg in self.engine.non_final_legs():
+                venue = self.fx.order_by_cid(leg.cid) if leg.cid is not None else None
+                if venue is not None and not venue.is_open:
+                    return False
+            return self.engine.history_complete
         self.run_until(done, max_ticks=max_ticks)
 
     # ------------------------------------------------------------------ inspection

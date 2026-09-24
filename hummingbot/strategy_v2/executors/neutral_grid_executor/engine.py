@@ -73,6 +73,8 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import (
 from hummingbot.strategy_v2.executors.neutral_grid_executor.history import (
     ENDPOINT_ACCOUNT,
     ENDPOINT_ACTIVE_ORDERS,
+    ENDPOINT_INACTIVE_ORDERS,
+    ENDPOINT_TRADES,
     ENDPOINT_TRADING_RULES,
     STREAM_ORDERS,
     STREAM_TRADES,
@@ -901,7 +903,9 @@ class NeutralGridEngine:
     async def _scan_history(self, now: float) -> None:
         if not self.scanner.should_scan(now):
             return
-        if not self._can_spend(now, self.options.scan_weight_budget):
+        one_page_each = self.port.request_weight(ENDPOINT_TRADES) + self.port.request_weight(ENDPOINT_INACTIVE_ORDERS)
+        if not self._can_spend(now, one_page_each):
+            # Exhaustion delays new exposure (history goes stale), it never skips a proof (NG-HIST-003).
             self._error("WEIGHT_BUDGET", "history scan delayed by weight budget", now)
             return
         result = await self.scanner.scan()
