@@ -24,7 +24,7 @@ orchestration/persistence/connector part belongs to another WS (see handoffs).
 | NG-ORD-003 self-trade router, TP priority, TP–TP FIFO, no netting | `router.plan_submits`, `router.crosses` | all of `test_router.py::TestSelfTrade::*`, `test_router.py::TestFifo::*` | done |
 | NG-CELL-001 whole-cell lock, release only when (1)–(5) | `cells.CellLedger.can_release/release` | `test_cells.py::TestReleaseAndDust::test_release_requires_each_ng_cell_001_condition`; `::test_ac33_dust_is_durable_visible_and_blocks_reset`; `test_cells.py::TestTerminalPartialEntryAndLateFills::test_late_fill_after_release_goes_to_old_cycle_and_requires_audit`; property test (closed cycle ⇒ E=X, all legs final, no dust) | core part ((5) position reconciliation is an input from WS-D) |
 | NG-CELL-002 partial entry, TP per confirmed share, ENTRY_LIVE+TP_LIVE, E/X buckets, invariant, unknown TP keeps reservation | `cells.apply_fill`, `tp_obligation_to_dispatch`, `add_tp_intent`, `Cycle.buckets`, `check_invariants` | `test_cells.py::TestPartialEntry::test_ac05_partial_entry_2_3_5_with_floor_5`; `::test_entry_live_and_tp_live_are_simultaneous_leg_states`; `::test_normal_partial_fill_never_cancels_entry`; `test_cells.py::TestUnknownOutcomes::test_unknown_tp_keeps_reservation_and_no_duplicate_tp`; property test (bucket partition + invariant after every event) | core part (≤2 s dispatch SLO: WS-D) |
-| NG-CELL-003 partial TP, terminal partial entry, late fill after cancel | `cells.confirm_terminal`, `apply_fill` | `test_cells.py::TestPartialTp::*`; `test_cells.py::TestTerminalPartialEntryAndLateFills::*` | done |
+| NG-CELL-003 partial TP, terminal partial entry, late fill after cancel | `cells.confirm_terminal`, `apply_fill`, `acknowledge_late_evidence` | `test_cells.py::TestPartialTp::*`; `test_cells.py::TestTerminalPartialEntryAndLateFills::*`; `test_cells.py::TestLateEvidenceResolution::*` | done |
 | NG-CELL-004 distinct durable states, concurrent legs | `OrderState` per leg, `cells.state_flags/primary_state`, `_TRANSITIONS` | `test_cells.py::TestPartialEntry::test_entry_live_and_tp_live_are_simultaneous_leg_states`; `test_cells.py::TestUnknownOutcomes::test_illegal_transitions_raise`; `::test_restart_marks_intent_unknown_and_keeps_cid` | done |
 | NG-RISK-002 P, P_min/P_max, gross, caps, TP priority, RISK_BLOCKED | `risk.endpoints*`, `check_submit`, `obligation_totals`, `with_obligations`, `plan_tp_headroom`, router | `test_risk.py::TestEndpoints::*`; `test_risk.py::TestCaps::*`; `test_risk.py::TestTpHeadroom::*`; `test_router.py::TestCapsAndHeadroom::*`; `test_router.py::TestTpPriorityHeadroom::*`; property test | done |
 | NG-RISK-004 margin advisory, unknown data blocks | `risk.margin_advisory`, `required_margin_estimate`, `exposure_blockers` | `test_risk.py::TestMarginAdvisory::*` | core part (fetching/freshness: WS-D) |
@@ -58,13 +58,14 @@ orchestration/persistence/connector part belongs to another WS (see handoffs).
 | AC-38 (core part) | no MARKET policy/fallback can be built | `test_cells.py::TestNormalCycles::test_market_order_type_cannot_be_built`; `test_grid.py::TestValidateConfig::test_market_and_unsupported_order_types_are_forbidden` | core part |
 | AC-39 | aggregate TP split exactly, idempotent, order independent | `test_dust.py::TestAggregateFills::test_ac39_partial_fills_split_exactly_and_idempotently`; `::test_ac39_per_lot_result_independent_of_fill_order`; `test_dust.py::TestGrouping::test_aggregate_quantity_never_rounded_up_and_allocation_is_exact` | done (logic) |
 | AC-40 (ledger part) | same key different payload, overfill, unknown leg, trade cumulative > order cumulative → conflict, not applied | `test_cells.py::TestIdempotencyAndConflicts::*` | core part |
-| AC-42 (ledger part) | late evidence after reuse attributed to old cycle, flags audit, blocks new cycle | `test_cells.py::TestTerminalPartialEntryAndLateFills::test_late_fill_after_release_goes_to_old_cycle_and_requires_audit` | core part (settlement/scan: WS-C/D) |
+| AC-42 (ledger part) | late evidence after reuse attributed to old cycle, flags audit, blocks new cycle; after the audit an ordinary TP closes it without re-latching and the cell keeps cycling | `test_cells.py::TestTerminalPartialEntryAndLateFills::test_late_fill_after_release_goes_to_old_cycle_and_requires_audit`; `test_cells.py::TestLateEvidenceResolution::test_resolution_tp_fills_do_not_relatch_and_later_cycles_release`; `test_cells.py::TestLateEvidenceResolution::test_audited_execution_of_a_rejected_leg_becomes_terminal`; `test_properties.py::TestCoreProperties::test_late_evidence_is_resolved_by_ordinary_tps_and_never_latches` | core part (settlement/scan: WS-C/D) |
 | AC-43 (logic) | monotonic 48-bit CID, same identity same CID (restart via durable lookup), collision/exhaustion fail closed and latch | `test_cid.py::TestCid::*` | core part (durable: WS-B) |
 | AC-44 | full cap: TP cancels one cap-consuming entry (unfilled, farthest), waits, no spam; own reservation first; TP–TP FIFO for the last slot | `test_router.py::TestTpCapacity::*`; `test_router.py::TestFifo::test_tp_tp_conflicts_are_fifo_and_later_ones_cannot_overtake` | done |
 | AC-46 (data part) | preview numbers: 56/55, 22/33, 40 armed/15 queued, slots 120/0, reachable interval | `test_grid.py::TestPreview::*` | core part (UI: WS-E) |
 | AC-51 (ledger part) | renewal only after proven terminal, exact remainder, same target, no duplicate | `test_cells.py::TestPartialTp::test_tp_terminal_with_remainder_renews_exact_remainder_same_target` | core part |
 | AC-56 (ledger part) | NOT_SENT only for unsent zero-fill intent; definitive reject only zero fill; UNKNOWN keeps reservation, no new CID/revision | `test_cells.py::TestUnknownOutcomes::test_rejections_require_zero_fill_and_proper_state`; `::test_unknown_tp_keeps_reservation_and_no_duplicate_tp`; `::test_zero_fill_rejected_entry_gets_new_revision_in_same_generation` | core part |
 | AC-57 | many minimum partials in one batch: all TPs from reserved slots, no cancels, no oversubscription, steady state no spam, queue head progresses deterministically | `test_admission.py::TestSimultaneousPartialFills::test_ac57_many_minimum_partial_fills_use_reserved_slots_no_cancel_and_queue_progresses` | done |
+| Property tests, late evidence | late executions of final entries (incl. released cycles) → audit → resolved by ordinary TPs; no permanent latch; cells cycle again | `test_properties.py::TestCoreProperties::test_late_evidence_is_resolved_by_ordinary_tps_and_never_latches` | done |
 | Property tests (spec §13.3) | `P_min ≤ actual ≤ P_max`, window never widens, caps incl. owed exits never violated, never RISK_BLOCKED without external cause, slots never oversubscribed, monotone confirmations, no reset with obligation/unknown/dust, idempotent replay + exact round trip, fixed prices, no MARKET/reduce-only, drain liveness | `test_properties.py::TestCoreProperties::test_random_orderings_preserve_invariants` (60 seeds × 70 steps by default; `NG_CORE_PROPERTY_SEEDS=400 NG_CORE_PROPERTY_STEPS=150` also run) | done |
 
 ## Design decisions
@@ -96,6 +97,11 @@ orchestration/persistence/connector part belongs to another WS (see handoffs).
 - **Router semantics.** Candidates are *pre-commit* (SUBMIT ⇒ the engine commits intent+CID+reservation, then
   sends). Only LIVE entries are cancel-requested; an unsent INTENT entry is WITHDRAWN (NOT_SENT); SUBMIT_UNKNOWN
   and cancel-in-flight orders are waited for. TPs and unknown-role orders are never cancelled by the router.
+- **Late evidence.** An execution on a leg already proven final is `LATE_EVIDENCE` (applied to that leg's own
+  cycle, audit flag set, new cycles blocked). `acknowledge_late_evidence(gen)` (operator audit) makes the executed
+  quantity the proven cumulative (a "rejected" leg that executed becomes TERMINAL); the remaining obligation is
+  closed by ordinary TP legs on that cycle, whose fills are normal. `can_release` names every blocker (DUST,
+  LATE_EVIDENCE_AUDIT, OLD_CYCLE_OBLIGATION) even when the cell has no current cycle.
 - **Dust geometry.** With fixed sides no two different cells share (TP side, target) (asserted in
   `test_dust.py::TestGrouping::test_geometry_no_two_cells_share_tp_side_and_target`). Cross-cell aggregation is
   therefore impossible in this grid; `dust.aggregate/AggregateTp` stay generic (multi-cycle lots of one cell).
@@ -152,14 +158,22 @@ orchestration/persistence/connector part belongs to another WS (see handoffs).
 3. Entry admission with owed exits is stricter than the spec's order-only `P_max` formula (a conservative
    superset); at idle the preview numbers are unchanged.
 4. Late evidence after a remainder was already re-dispatched can make `X + reserved > E`; the ledger records the
-   truth, `check_invariants()` reports it, and the engine must freeze (no automatic repair).
+   truth, `check_invariants()` reports it, and the engine must freeze (no automatic repair; the audit
+   acknowledgement corrects cumulative values but cannot undo an over-exit).
 5. `hypothesis` is not installed in the prepared env; property tests are seeded randomized loops (fast default
    in CI, heavier sweep run manually and documented below).
 
+## Independent review
+
+A read-only review (separate agent) against spec §§2–6 found one defect, fixed in `b5cd6c292`: fills of the
+resolution TP of a released cycle were classified as late evidence and re-latched the audit flag forever
+(cell permanently unreleasable). The deterministic test was verified to fail on the old code. No other defects
+were reported for grid, router, risk, admission, CID or dust.
+
 ## Commands run (latest)
 
-- `python -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/core -q` → 110 passed, 87 subtests
-- `NG_CORE_PROPERTY_SEEDS=400 NG_CORE_PROPERTY_STEPS=150 python -m pytest …/core/test_properties.py -q` → 1 passed, 400 subtests
+- `python -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor/core -q` → 113 passed, 117 subtests
+- `NG_CORE_PROPERTY_SEEDS=400 NG_CORE_PROPERTY_STEPS=150 python -m pytest …/core/test_properties.py -q` → 2 passed, 600 subtests
 - `python -m pytest test/hummingbot/strategy_v2/executors/neutral_grid_executor test/hummingbot/strategy_v2/executors/grid_executor -q` → 137 passed (no package clash)
 - `python -m flake8 hummingbot/strategy_v2/executors/neutral_grid_executor/{grid,cells,risk,admission,router,cid,dust}.py test/hummingbot/strategy_v2/executors/neutral_grid_executor/core/` → clean
 - `git diff --check` → clean
