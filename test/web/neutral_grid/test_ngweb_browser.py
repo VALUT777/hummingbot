@@ -228,8 +228,9 @@ async def test_browser_flow_on_offline_demo_engine(tmp_path):
         # history lag becomes visible in the history card
         await _demo_click(page, "Задержка истории")
         await _demo_click(page, "Частично исполнить ближайший вход")
+        # >= 10 s: only the injected 30 s lag gets there (normal poll coalescing stays well below)
         await page.wait_for("(() => { const dd = [...document.querySelectorAll('#history-kv dd')][2];"
-                            " return dd && /^[1-9][0-9]* с/.test(dd.textContent); })()", 30)
+                            " return dd && /^([1-9][0-9]+ с|[0-9]+ мин)/.test(dd.textContent); })()", 30)
         await _demo_click(page, "Убрать задержку")
         # stop with cancels that never prove terminal -> STOP_UNCERTAIN, never STOPPED
         await _demo_click(page, "Отмены")

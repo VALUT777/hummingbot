@@ -336,7 +336,7 @@ class DemoDriver:
             if action == "dust" and order.is_open:
                 fake.venue_cancel(order.client_order_id)
                 message += "; остаток отменён биржей"
-            return {"ok": True, "message": message}
+            return {"ok": True, "message": message, "cid": str(order.client_order_id), "qty": str(qty)}
         if action == "partial_tp":
             tps = self._owned_open(LegRole.TP)
             if not tps:

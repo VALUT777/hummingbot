@@ -180,16 +180,25 @@ async def test_demo_engine_full_operator_flow(tmp_path):
         state = await api.get("/api/state")
         assert Decimal(state["summary"]["dust_total"]) >= Decimal("2")
 
-        # history lag: the WS fill is signalled at once, history (the only proof) lags -> lag visible, no TP yet
+        # history lag: the WS fill is signalled at once, history (the only proof) lags 30 s. Normal poll
+        # coalescing alone stays well under 10 s, so >= 10 s here proves the injected lag is what is shown.
         assert (await api.demo("history_lag_on"))["ok"]
-        before = next(c for c in await api.cells() if c["cell_id"] == cell_id)
-        assert (await api.demo("partial_entry"))["ok"]
-        lagged = await api.wait_state(lambda s: Decimal(str(s["summary"]["history"]["lag_s"] or "0")) > 3,
-                                      "history lag visible", timeout=30)
-        assert lagged["summary"]["history"]["lag_s"] is not None
-        during = next(c for c in await api.cells() if c["cell_id"] == cell_id)
-        assert during["entry"]["filled"] == before["entry"]["filled"]  # nothing credited without history
+        lag_fill = await api.demo("partial_entry")
+        assert lag_fill["ok"]
+
+        def lag_cell(cells):
+            return next(c for c in cells if c.get("entry") and c["entry"]["cid"] == lag_fill["cid"])
+        filled_before = Decimal(lag_cell(await api.cells())["entry"]["filled"])
+        lagged = await api.wait_state(lambda s: Decimal(str(s["summary"]["history"]["lag_s"] or "0")) >= 10,
+                                      "history lag >= 10 s", timeout=30)
+        assert Decimal(lag_cell(await api.cells())["entry"]["filled"]) == filled_before  # not credited yet
+        assert lagged["summary"]["history"]["complete"] is not None
         assert (await api.demo("history_lag_off"))["ok"]
+        # once the lagged history row becomes visible, the fill is credited exactly once
+        credited = await _wait_cell(api, lambda c: c.get("entry") and c["entry"]["cid"] == lag_fill["cid"]
+                                    and Decimal(c["entry"]["filled"]) > filled_before, "lagged fill credited",
+                                    timeout=60)
+        assert Decimal(credited["entry"]["filled"]) - filled_before == Decimal(lag_fill["qty"])
 
         # stop while cancels never prove terminal -> honest STOP_UNCERTAIN, never STOPPED
         assert (await api.demo("cancel_blackhole"))["ok"]
