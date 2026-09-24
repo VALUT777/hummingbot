@@ -1459,12 +1459,18 @@ class NeutralGridStore:
 
     def _open_existing(self, migrations: Sequence[Migration], markers: Sequence[Path], evidence: Sequence[str],
                        integrity_check: str, config_fingerprint: Optional[str]) -> None:
-        self._verify_existing_schema(migrations, allow_upgrade=True, integrity_check=integrity_check,
-                                     evidence=evidence)
-        engine = self.engine()
+        # every refusal happens before any write (migrations included): identity columns and the grid
+        # fingerprint exist since schema v1 and are immutable, so they are read with narrow queries
+        pending = self._verify_existing_schema(migrations, allow_upgrade=True, integrity_check=integrity_check,
+                                               evidence=evidence)
+        row = self._x("""SELECT e.db_uuid, e.engine_id, e.connector_name, e.connector_domain, e.account_index,
+                         e.trading_pair, e.cid_epoch, g.fingerprint FROM engine e
+                         LEFT JOIN grids g ON g.grid_id = e.current_grid_id WHERE e.id = 1""").fetchone()
+        if row is None:
+            raise StoreCorruptError(f"{self.path} has no engine row", list(evidence) + ["engine row missing"])
         identity = self.identity
-        stored = (engine.engine_id, engine.connector_name, engine.connector_domain, engine.account_index,
-                  engine.trading_pair)
+        stored = (row["engine_id"], row["connector_name"], row["connector_domain"], row["account_index"],
+                  row["trading_pair"])
         wanted = (identity.engine_id, identity.connector_name, identity.connector_domain, identity.account_index,
                   identity.trading_pair)
         if stored != wanted:
@@ -1475,22 +1481,24 @@ class NeutralGridStore:
                 missing.append(marker)
                 continue
             content = _read_marker(marker)
-            if content is None or content.get("db_uuid") != engine.db_uuid:
+            if content is None or content.get("db_uuid") != row["db_uuid"]:
                 raise PriorRunEvidenceError(
-                    f"prior-run marker {marker} does not match database {engine.db_uuid}: the database file was "
+                    f"prior-run marker {marker} does not match database {row['db_uuid']}: the database file was "
                     f"replaced or another database exists for this account/market", list(evidence))
-        if config_fingerprint is not None and engine.current_grid_id is not None:
-            grid = self.grid()
-            if grid.fingerprint != config_fingerprint:
-                raise ConfigMutationError(
-                    f"grid dimensions/Q changed (stored fingerprint {grid.fingerprint}, config "
-                    f"{config_fingerprint}); a running grid is immutable -- use migrate_grid() once it is quiescent")
+        if config_fingerprint is not None and row["fingerprint"] is not None \
+                and row["fingerprint"] != config_fingerprint:
+            raise ConfigMutationError(
+                f"grid dimensions/Q changed (stored fingerprint {row['fingerprint']}, config "
+                f"{config_fingerprint}); a running grid is immutable -- use migrate_grid() once it is quiescent")
+        for migration in pending:
+            self._apply_migration(migration)
         if missing:
-            self._write_markers(missing, engine.db_uuid, engine.cid_epoch)
+            self._write_markers(missing, row["db_uuid"], row["cid_epoch"])
             self._pending_marker_repair = [str(m) for m in missing]
 
     def _verify_existing_schema(self, migrations: Sequence[Migration], *, allow_upgrade: bool, integrity_check: str,
-                                evidence: Sequence[str] = ()) -> None:
+                                evidence: Sequence[str] = ()) -> List[Migration]:
+        """Fail closed on foreign/corrupt/unknown/newer/edited schemas; returns the pending (older) migrations."""
         conn = self._conn
         try:
             app_id = conn.execute("PRAGMA application_id").fetchone()[0]
@@ -1527,12 +1535,10 @@ class NeutralGridStore:
         if current == 0 or user_version != current:
             raise SchemaVersionError(f"inconsistent schema version (user_version={user_version}, "
                                      f"migrations={current})")
-        if current < latest:
-            if not allow_upgrade:
-                raise SchemaVersionError(f"database schema {current} is older than {latest}; the engine must "
-                                         f"migrate it first")
-            for migration in migrations[current:]:
-                self._apply_migration(migration)
+        if current < latest and not allow_upgrade:
+            raise SchemaVersionError(f"database schema {current} is older than {latest}; the engine must "
+                                     f"migrate it first")
+        return list(migrations[current:])
 
     def _apply_migration(self, migration: Migration) -> None:
         now = self._clock_ms()
@@ -1821,10 +1827,13 @@ class NeutralGridStore:
                 raise ValueError("cells must be CellSpec with cell_id 0..N-1 in order")
             if cell.low_price != price_list[index] or cell.high_price != price_list[index + 1]:
                 raise ValueError(f"cell {index} prices do not match the grid prices")
-            _enum(Side, cell.entry_side, "entry_side")
         anchor_d = Decimal(canonical_decimal(anchor, "anchor"))
         if not lower_d <= anchor_d <= upper_d:
             raise ValueError("anchor must lie within [lower_price, upper_price]")
+        for cell in cells:  # NG-GRID-002: P[i] < anchor -> BUY entry, otherwise SELL entry
+            expected = Side.BUY if cell.low_price < anchor_d else Side.SELL
+            if _enum(Side, cell.entry_side, "entry_side") != expected:
+                raise ValueError(f"cell {cell.cell_id} entry side must be {expected.value} for anchor {anchor_d}")
         return [canonical_decimal(p) for p in price_list]
 
     def _insert_grid(self, grid_id: str, fingerprint: str, config_revision: int, lower: Decimal, upper: Decimal,
@@ -2362,9 +2371,11 @@ class NeutralGridStore:
                       expected_from: Optional[Iterable[OrderState]] = None) -> LegRecord:
         """Evidence-driven leg transition (LIVE / TERMINAL_UNKNOWN / TERMINAL / REJECTED_ZERO_FILL).
 
-        Final states are final. An undispatched INTENT cannot be moved by evidence. TERMINAL requires the exact
-        final venue order row with cumulative filled equal to the leg's history fills (NG-HIST-002); rejected
-        states require zero fills. Reaching a final state releases the leg's reservation.
+        Final states are final. An undispatched INTENT cannot be moved by evidence. LIVE needs evidence (transport
+        ACCEPTED, a recorded venue order row or a history fill). TERMINAL requires the exact final venue order row
+        with cumulative filled equal to the leg's history fills (NG-HIST-002); REJECTED_ZERO_FILL requires a final
+        venue row with zero fill and no history fills (use record_transport_result for a documented definitive
+        venue reject). Reaching a final state releases the leg's reservation.
         """
         to_state = _enum(OrderState, to_state, "order state")
         with self._scope(tx):
@@ -2383,17 +2394,30 @@ class NeutralGridStore:
             if leg.state == OrderState.INTENT:
                 raise InvalidTransitionError(f"leg {cid} was never dispatched; evidence cannot move it "
                                              f"(possible CID collision)")
-            if to_state in _REJECTED_STATES and (leg.filled != 0 or self._fill_count(cid)):
-                raise InvalidTransitionError(f"leg {cid} has fills; it cannot be a zero-fill rejection")
-            if to_state == OrderState.TERMINAL:
-                order = self.order(cid)
-                if order is None or not order.venue_final or order.venue_filled is None:
-                    raise InvalidTransitionError(f"leg {cid}: no exact final venue order row; TERMINAL unproven")
-                if order.venue_filled != leg.filled:
-                    raise InvalidTransitionError(f"leg {cid}: history fills {leg.filled} != terminal cumulative "
-                                                 f"{order.venue_filled}; TERMINAL unproven")
+            self._check_evidence_for(leg, to_state)
             self._set_leg_state_raw(leg, to_state, reason)
             return self.leg(cid)
+
+    def _check_evidence_for(self, leg: LegRecord, to_state: OrderState) -> None:
+        cid = leg.cid
+        order = self.order(cid)
+        if to_state in _REJECTED_STATES:
+            if leg.filled != 0 or self._fill_count(cid):
+                raise InvalidTransitionError(f"leg {cid} has fills; it cannot be a zero-fill rejection")
+            if order is None or not order.venue_final or order.venue_filled != 0:
+                raise InvalidTransitionError(f"leg {cid}: no final zero-fill venue row; rejection unproven "
+                                             f"(timeouts/not-found stay UNKNOWN)")
+        elif to_state == OrderState.TERMINAL:
+            if order is None or not order.venue_final or order.venue_filled is None:
+                raise InvalidTransitionError(f"leg {cid}: no exact final venue order row; TERMINAL unproven")
+            if order.venue_filled != leg.filled:
+                raise InvalidTransitionError(f"leg {cid}: history fills {leg.filled} != terminal cumulative "
+                                             f"{order.venue_filled}; TERMINAL unproven")
+        elif to_state == OrderState.LIVE:
+            evidenced = order is not None and (order.submission_state == "ACCEPTED" or
+                                               order.last_evidence_ms is not None)
+            if not evidenced and not self._fill_count(cid):
+                raise InvalidTransitionError(f"leg {cid}: no acceptance, venue row or fill; LIVE unproven")
 
     def _fill_count(self, cid: int) -> int:
         return self._x("SELECT count(*) FROM fills WHERE cid = ?", (cid,)).fetchone()[0]
@@ -2497,6 +2521,9 @@ class NeutralGridStore:
                 blockers = self.entry_blockers()
                 if blockers:
                     raise EntryBlockedError("new entry exposure is blocked: " + "; ".join(blockers), blockers)
+                self._check_single_physical_entry(cycle)
+            else:
+                self._check_tp_headroom(cycle, cid, amount, allocations)
             now = self._clock_ms()
             self._x("""INSERT INTO legs(cid, grid_id, cell_id, generation, role, revision, side, price, amount,
                        order_type, reduce_only, expiry_ms, state, filled, created_at_ms, updated_at_ms)
@@ -2519,6 +2546,54 @@ class NeutralGridStore:
             self.fault_hooks.hit("before_intent_commit")
             scope.after_commit("after_intent_commit")
             return IntentRecord(cid=cid, outbox_id=outbox_id, request=submit_request, leg=self.leg(cid), created=True)
+
+    def _check_single_physical_entry(self, cycle: CycleRecord) -> None:
+        """MVP: one physical entry per cycle. A new ENTRY revision is allowed only after every earlier entry of the
+        cycle is final with zero fill (e.g. pre-send rejection or documented zero-fill reject, NG-DB-005)."""
+        for leg in self.legs(grid_id=cycle.grid_id, cell_id=cycle.cell_id, generation=cycle.generation):
+            if leg.role != LegRole.ENTRY:
+                continue
+            if not leg.final:
+                raise InvalidTransitionError(f"cycle already has entry leg {leg.cid} in {leg.state.value}")
+            if leg.filled != 0:
+                raise InvalidTransitionError(f"cycle entry leg {leg.cid} executed {leg.filled}; the cycle closes that "
+                                             f"quantity and a new cycle starts with the full amount")
+
+    def _tp_reserved(self, cycle: CycleRecord) -> Decimal:
+        """Unfilled remainder of non-final TP legs obligated to ``cycle`` (own legs and allocations)."""
+        reserved = Decimal(0)
+        own = self._x("""SELECT l.cid, l.amount, l.filled FROM legs l WHERE l.grid_id = ? AND l.cell_id = ?
+                         AND l.generation = ? AND l.role = 'TP' AND l.state NOT IN (?, ?, ?)
+                         AND NOT EXISTS (SELECT 1 FROM allocations a WHERE a.cid = l.cid)""",
+                      [cycle.grid_id, cycle.cell_id, cycle.generation] +
+                      [s.value for s in sorted(FINAL_ORDER_STATES, key=lambda s: s.value)]).fetchall()
+        for row in own:
+            reserved += parse_decimal(row["amount"]) - parse_decimal(row["filled"])
+        allocated = self._x("""SELECT a.cid, a.amount FROM allocations a JOIN legs l ON l.cid = a.cid
+                               WHERE a.grid_id = ? AND a.cell_id = ? AND a.generation = ? AND l.role = 'TP'
+                               AND l.state NOT IN (?, ?, ?)""",
+                            [cycle.grid_id, cycle.cell_id, cycle.generation] +
+                            [s.value for s in sorted(FINAL_ORDER_STATES, key=lambda s: s.value)]).fetchall()
+        for row in allocated:
+            used = sum((parse_decimal(r[0]) for r in self._x(
+                "SELECT fa.amount FROM fill_allocations fa JOIN fills f ON f.dedupe_key = fa.dedupe_key "
+                "WHERE f.cid = ? AND fa.grid_id = ? AND fa.cell_id = ? AND fa.generation = ?",
+                (row["cid"], cycle.grid_id, cycle.cell_id, cycle.generation))), Decimal(0))
+            reserved += parse_decimal(row["amount"]) - used
+        return reserved
+
+    def _check_tp_headroom(self, cycle: CycleRecord, cid: int, amount: Decimal,
+                           allocations: Optional[Sequence[Tuple[str, int, int, Decimal]]]) -> None:
+        """NG-CELL-002 invariant ``confirmed_exit + reserved_TP_unfilled <= confirmed_entry`` per cycle: a TP can
+        only close history-confirmed entry quantity, never more (no duplicate TP on status lag)."""
+        parts = [(cycle.grid_id, cycle.cell_id, cycle.generation, amount)] if not allocations else allocations
+        for grid_id, cell_id, generation, part in parts:
+            target = self.cycle(grid_id, cell_id, generation)
+            reserved = self._tp_reserved(target)
+            if target.exit_filled + reserved + Decimal(canonical_decimal(part)) > target.entry_filled:
+                raise InvalidTransitionError(
+                    f"TP {cid} for {grid_id}/{cell_id}/{generation} exceeds confirmed entry: X={target.exit_filled} "
+                    f"+ reserved={reserved} + new={part} > E={target.entry_filled}")
 
     def prepare_submit(self, tx: Optional[Transaction], leg_identity: LegIdentity, *, side: Side, price: Decimal,
                        amount: Decimal, order_type: OrderTypePolicy, reduce_only: bool = False,
@@ -2597,7 +2672,7 @@ class NeutralGridStore:
             leg = self.leg(entry.cid)
             if leg.final:
                 raise InvalidTransitionError(f"leg {leg.cid} is final ({leg.state.value})")
-            if entry.kind == KIND_SUBMIT and entry.status == "PENDING" and self.degraded_reason is not None:
+            if entry.kind == KIND_SUBMIT and self.degraded_reason is not None:
                 raise PersistenceError(f"store is degraded ({self.degraded_reason}); refusing to dispatch submit")
             now = self._clock_ms()
             self._x("UPDATE outbox SET status = 'DISPATCHED', attempts = attempts + 1, dispatched_at_ms = ?, "
@@ -2664,6 +2739,8 @@ class NeutralGridStore:
                                (cid, kind)).fetchone()
                 if done is not None and done["outcome"] == outcome.value and \
                         (done["outcome_detail"] or "") == (result.detail or ""):
+                    if leg_state is not None:  # replayed result + refinement: still evidence-checked
+                        self.set_leg_state(scope, cid, leg_state, reason=f"{kind} transport {outcome.value}")
                     return self._outbox(done)
                 raise InvalidTransitionError(f"no unresolved {kind} outbox row for CID {cid}")
             entry = self._outbox(row)
@@ -2711,10 +2788,10 @@ class NeutralGridStore:
                     raise InvalidTransitionError(f"CID {cid}: exchange order id {result.exchange_order_id} differs "
                                                  f"from recorded {order.exchange_order_id}")
                 self._x("UPDATE orders SET exchange_order_id = ? WHERE cid = ?", (result.exchange_order_id, cid))
-            if leg_state is not None:
-                target = _enum(OrderState, leg_state, "leg state")
             if target is not None and not leg.final:
                 self._set_leg_state_raw(leg, target, f"{kind} transport {outcome.value}")
+            if leg_state is not None:  # engine refinement: same evidence rules as set_leg_state
+                self.set_leg_state(scope, cid, leg_state, reason=f"{kind} transport {outcome.value}")
             self._x("UPDATE outbox SET status = 'DONE', outcome = ?, outcome_detail = ?, result_at_ms = ? WHERE id = ?",
                     (outcome.value, result.detail or None, now, entry.id))
             self.fault_hooks.hit("before_result_commit")
@@ -2768,7 +2845,7 @@ class NeutralGridStore:
         problems = []
         if leg is None:
             return [f"CID {cid} is allocated but has no intent"]
-        if leg.state == OrderState.INTENT:
+        if leg.state in (OrderState.INTENT, OrderState.REJECTED_UNSENT):
             problems.append("venue evidence for an intent that was never dispatched (CID collision?)")
         client = _row_client_id(row)
         if client is not None and client != cid:
@@ -2960,9 +3037,9 @@ class NeutralGridStore:
         if leg is None:
             problems.append(("EVIDENCE_FOR_UNDISPATCHED_INTENT", f"CID {cid} allocated without intent"))
         else:
-            if leg.state == OrderState.INTENT:
+            if leg.state in (OrderState.INTENT, OrderState.REJECTED_UNSENT):
                 problems.append(("EVIDENCE_FOR_UNDISPATCHED_INTENT",
-                                 f"fill for CID {cid} that was never dispatched (collision?)"))
+                                 f"fill for CID {cid} that was never sent (collision?)"))
             if Side(row.own_side) != leg.side:
                 problems.append(("SIDE_MISMATCH", f"trade side {Side(row.own_side).value} != leg {leg.side.value}"))
             if client is not None and client != cid:
@@ -3026,8 +3103,9 @@ class NeutralGridStore:
             return
         problems = self._order_row_problems(cid, row)
         if problems:
+            kind = "EVIDENCE_FOR_UNDISPATCHED_INTENT" if "never dispatched" in problems[0] else "ORDER_MISMATCH"
             self._finish_inbox(inbox_id, "CONFLICT", cid, "; ".join(problems))
-            self._conflict(result, "ORDER_MISMATCH", inbox_id, cid, "; ".join(problems))
+            self._conflict(result, kind, inbox_id, cid, "; ".join(problems))
             return
         self._update_order_from_row(cid, row, final=True)
         self._finish_inbox(inbox_id, "APPLIED", cid, None)

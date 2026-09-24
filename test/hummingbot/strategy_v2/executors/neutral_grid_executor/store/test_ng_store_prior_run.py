@@ -16,6 +16,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     NeutralGridStore,
     PriorRunEvidenceError,
     StoreCorruptError,
+    StoreMissingError,
 )
 from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store.ng_store_support import (
     IDENTITY,
@@ -190,7 +191,7 @@ def test_manual_recovery_is_refused_when_database_exists(env):
 
 
 def test_readers_refuse_corrupt_or_missing_files(env):
-    with pytest.raises(Exception):
+    with pytest.raises(StoreMissingError):
         NeutralGridStore.open_readonly(env.db)
     _used_store(env)
     with env.db.open("r+b") as handle:
