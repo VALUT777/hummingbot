@@ -77,7 +77,7 @@ def test_retention_gap_blocks_entries_but_not_tp_until_audited_reconciliation(en
         reopened.record_manual_reconciliation(None, "operator", "checked", {})
     audit_id = reopened.record_manual_reconciliation(
         None, "operator", "exported venue history from UI; no unknown executions",
-        {"export": "trades-2026-09-24.csv", "sha256": "abc"})
+        {"export": "trades-2026-09-24.csv", "sha256": "abc"}, resolved_retention_gaps=["TRADES"])
     after = reopened.engine()
     assert not after.manual_reconcile_required and after.reconciliation_revision == engine.reconciliation_revision + 1
     # no reset / rebaseline: baseline, cells, cycle quantities and fills are untouched

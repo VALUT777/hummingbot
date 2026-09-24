@@ -9,7 +9,7 @@ import pytest
 
 import hummingbot.strategy_v2.executors.neutral_grid_executor.store as store_module
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, EngineState
-from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MIGRATIONS, Migration
+from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import LATEST_VERSION, MIGRATIONS, Migration
 from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     EngineIdentity,
     FaultHooks,
@@ -153,8 +153,9 @@ def test_identity_mismatch_is_refused(env):
 
 def _insert_future_migration(path):
     raw = sqlite3.connect(str(path))
-    raw.execute("INSERT INTO schema_migrations(version, name, checksum, applied_at_ms) VALUES (2, 'future', 'x', 0)")
-    raw.execute("PRAGMA user_version = 2")
+    raw.execute("INSERT INTO schema_migrations(version, name, checksum, applied_at_ms) VALUES (?, 'future', 'x', 0)",
+                (LATEST_VERSION + 1,))
+    raw.execute(f"PRAGMA user_version = {LATEST_VERSION + 1}")
     raw.commit()
     raw.close()
 
@@ -179,11 +180,11 @@ def test_edited_migration_checksum_fails_closed(env):
 
 def test_pending_migration_is_applied_atomically_and_audited(env):
     env.open().close()
-    v2 = Migration(2, "add_example", "CREATE TABLE example_v2 (id INTEGER PRIMARY KEY) STRICT;")
-    store = env.open(migrations=MIGRATIONS + (v2,))
-    assert store._conn.raw.execute("PRAGMA user_version").fetchone()[0] == 2
+    nxt = Migration(LATEST_VERSION + 1, "add_example", "CREATE TABLE example_next (id INTEGER PRIMARY KEY) STRICT;")
+    store = env.open(migrations=MIGRATIONS + (nxt,))
+    assert store._conn.raw.execute("PRAGMA user_version").fetchone()[0] == LATEST_VERSION + 1
     [event] = store.audit_events("migration")
-    assert event.payload["version"] == 2 and event.payload["name"] == "add_example"
+    assert event.payload["version"] == LATEST_VERSION + 1 and event.payload["name"] == "add_example"
     store.close()
     with pytest.raises(SchemaVersionError):
         env.open()  # older code refuses the upgraded database
@@ -191,12 +192,13 @@ def test_pending_migration_is_applied_atomically_and_audited(env):
 
 def test_failed_migration_leaves_previous_version(env):
     env.open().close()
-    broken = Migration(2, "broken", "CREATE TABLE ok_part (id INTEGER PRIMARY KEY) STRICT;\nCREATE TABLE engine (x);")
+    broken = Migration(LATEST_VERSION + 1, "broken",
+                       "CREATE TABLE ok_part (id INTEGER PRIMARY KEY) STRICT;\nCREATE TABLE engine (x);")
     with pytest.raises(PersistenceError):
         env.open(migrations=MIGRATIONS + (broken,))
     raw = sqlite3.connect(str(env.db))
     try:
-        assert raw.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert raw.execute("PRAGMA user_version").fetchone()[0] == LATEST_VERSION
         assert raw.execute("SELECT count(*) FROM sqlite_master WHERE name = 'ok_part'").fetchone()[0] == 0
     finally:
         raw.close()
@@ -273,3 +275,22 @@ def test_restart_reads_back_state(env):
     assert again.kv_get("slots") == {"cap": 120, "reserved": "3"}
     state = again.load_state()
     assert state.engine.effective_baseline == Decimal("-12.5") and len(state.cells) == 55
+
+
+def test_v1_database_is_upgraded_to_v2_with_attempt_and_gap_backfill(env):
+    v1_only = MIGRATIONS[:1]
+    store = env.open(migrations=v1_only)
+    store.close()
+    raw = sqlite3.connect(str(env.db))  # a v1 database with one dispatched submit and a recorded retention gap
+    raw.execute("UPDATE cursors SET required_boundary_ts_ms = 10, oldest_available_ts_ms = 20 WHERE stream = 'TRADES'")
+    raw.execute("PRAGMA foreign_keys = OFF")
+    raw.execute("INSERT INTO outbox(kind, cid, request_json, status, attempts, outcome, created_at_ms, "
+                "dispatched_at_ms) VALUES ('SUBMIT', 7, '{}', 'DONE', 1, 'UNKNOWN', 1, 2)")
+    raw.commit()
+    raw.close()
+    upgraded = env.open()
+    assert upgraded._conn.raw.execute("PRAGMA user_version").fetchone()[0] == LATEST_VERSION == 2
+    assert [e.payload["version"] for e in upgraded.audit_events("migration")] == [2]
+    assert upgraded.outbox_attempts(1) == [{"outbox_id": 1, "attempt": 1, "dispatched_at_ms": 2, "outcome": "UNKNOWN",
+                                            "outcome_detail": None, "result_at_ms": None}]
+    assert upgraded.cursor("TRADES").retention_gap_open and not upgraded.cursor("INACTIVE_ORDERS").retention_gap_open

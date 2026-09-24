@@ -8,7 +8,10 @@ import hashlib
 from dataclasses import dataclass
 from typing import Tuple
 
-from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import m0001_initial
+from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import (
+    m0001_initial,
+    m0002_attempts_and_gaps,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,7 @@ class Migration:
 
 MIGRATIONS: Tuple[Migration, ...] = (
     Migration(m0001_initial.VERSION, m0001_initial.NAME, m0001_initial.SQL),
+    Migration(m0002_attempts_and_gaps.VERSION, m0002_attempts_and_gaps.NAME, m0002_attempts_and_gaps.SQL),
 )
 
 LATEST_VERSION = MIGRATIONS[-1].version
