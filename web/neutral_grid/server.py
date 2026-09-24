@@ -59,13 +59,21 @@ class WebContext:
     policy: SecurityPolicy = field(default_factory=SecurityPolicy)
     host_status: Callable[[], Dict[str, Any]] = lambda: {}
     health_provider: Callable[[], Dict[str, Any]] = lambda: {}
+    identity_provider: Optional[Callable[[], Dict[str, Any]]] = None
     demo: Optional[DemoControls] = None
     commands: Optional[CommandService] = None
 
     def __post_init__(self) -> None:
         if self.commands is None:
-            self.commands = CommandService(self.gateway, self.build_preview, self.engine_identity,
-                                           config_baseline=self.preview.config.expected_initial_position)
+            self.commands = CommandService(self.gateway, self.build_preview, self.identity,
+                                           config_baseline=self._config_baseline)
+
+    def identity(self) -> Dict[str, Any]:
+        return dict(self.identity_provider()) if self.identity_provider is not None else dict(self.engine_identity)
+
+    def _config_baseline(self):
+        cfg, error = self.preview.current_config()
+        return (cfg.expected_initial_position if cfg is not None else None), error
 
     async def build_preview(self, *, config_revision: int, engine_revision: int) -> Dict[str, Any]:
         snapshot = self.gateway.latest_snapshot()
@@ -146,7 +154,7 @@ async def logout(request: web.Request) -> web.Response:
 async def session_info(request: web.Request) -> web.Response:
     ctx = _ctx(request)
     return _json({"csrf_token": request["session"].csrf_token, "mode": ctx.mode,
-                  "engine_identity": ctx.engine_identity, "stale_after_s": ctx.stale_after_s,
+                  "engine_identity": ctx.identity(), "stale_after_s": ctx.stale_after_s,
                   "demo_actions": ctx.demo.actions if ctx.demo else None})
 
 
@@ -161,7 +169,7 @@ async def state(request: web.Request) -> web.Response:
                                              "committed_at")}
     return _json({
         "mode": ctx.mode,
-        "engine_identity": ctx.engine_identity,
+        "engine_identity": ctx.identity(),
         "engine": views.engine_view(snapshot, fresh),
         "freshness": fresh,
         "snapshot": meta,

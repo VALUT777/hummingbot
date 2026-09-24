@@ -17,7 +17,7 @@ import dataclasses
 import hashlib
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import grid as core_grid, risk as core_risk
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import GridConfig, TradingRules
@@ -50,6 +50,11 @@ class MarketContext:
     available_collateral: Optional[Decimal]
     fetched_at: Optional[float]
     source: str  # "fake_exchange" | "snapshot" | "unavailable"
+    errors: Tuple[str, ...] = ()   # market data problems that block Start (missing/stale rules, stale snapshot)
+
+
+# Returns (config, None) or (None, reason). Demo: a fixed config; attach: the engine's committed config.
+ConfigSource = Callable[[], Tuple[Optional[GridConfig], Optional[str]]]
 
 
 MarketSource = Callable[[], Awaitable[MarketContext]]
@@ -97,30 +102,46 @@ def _rules_dict(rules: Optional[TradingRules]) -> Optional[Dict[str, Any]]:
 
 
 class PreviewService:
-    def __init__(self, config: GridConfig, market: MarketSource, *, mode: str = "demo"):
-        self.config = config
+    def __init__(self, config: Union[GridConfig, ConfigSource], market: MarketSource, *, mode: str = "demo"):
+        self._config_source: ConfigSource = (config if callable(config) else (lambda: (config, None)))
         self._market = market
         self.mode = mode
 
-    def preview_id(self, rules: Optional[TradingRules], config_revision: int, engine_revision: int) -> str:
+    def current_config(self) -> Tuple[Optional[GridConfig], Optional[str]]:
+        return self._config_source()
+
+    @property
+    def config(self) -> Optional[GridConfig]:
+        return self.current_config()[0]
+
+    def preview_id(self, rules: Optional[TradingRules], config_revision: int, engine_revision: int,
+                   cfg: Optional[GridConfig] = None) -> str:
+        cfg = cfg if cfg is not None else self.config
         rules_view = _rules_dict(rules)
         if rules_view is not None:
             rules_view.pop("fetched_at", None)
-        material = jsonsafe.canonical({"config": _config_dict(self.config), "rules": rules_view,
+        material = jsonsafe.canonical({"config": _config_dict(cfg) if cfg is not None else None, "rules": rules_view,
                                        "config_revision": config_revision, "engine_revision": engine_revision})
         return hashlib.sha256(material.encode()).hexdigest()[:24]
 
     async def build(self, *, config_revision: int, engine_revision: int,
                     baseline_confirmed_in_ledger: bool = False) -> Dict[str, Any]:
-        cfg = self.config
+        cfg, cfg_error = self.current_config()
         ctx = await self._market()
         rules, mid = ctx.rules, ctx.mid
+        if cfg is None:
+            return {"mode": self.mode, "config_revision": config_revision, "engine_revision": engine_revision,
+                    "preview_id": self.preview_id(rules, config_revision, engine_revision, cfg=None),
+                    "config": None, "runtime_rules": _rules_dict(rules), "market_source": ctx.source,
+                    "rules_fetched_at": ctx.fetched_at, "live_confirmation_required": not baseline_confirmed_in_ledger,
+                    "errors": [f"Конфигурация движка недоступна: {cfg_error}"] + list(ctx.errors),
+                    "warnings": [], "can_start": False}
         warnings: List[str] = []
         bootstrap = not baseline_confirmed_in_ledger
         baseline = cfg.expected_initial_position
         gp = core_grid.build_preview(cfg, rules, mid, baseline, bootstrap=bootstrap)
 
-        errors: List[str] = [localize_error(message) for message in gp.errors]
+        errors: List[str] = [localize_error(message) for message in gp.errors] + list(ctx.errors)
         if self.mode != "demo" and not cfg.enabled:
             errors.append("enabled=false: live-старт невозможен без изменения конфигурации и явного подтверждения.")
         if baseline is None:
@@ -163,7 +184,7 @@ class PreviewService:
             "mode": self.mode,
             "config_revision": config_revision,
             "engine_revision": engine_revision,
-            "preview_id": self.preview_id(rules, config_revision, engine_revision),
+            "preview_id": self.preview_id(rules, config_revision, engine_revision, cfg=cfg),
             "config": _config_dict(cfg),
             "runtime_rules": _rules_dict(rules),
             "market_source": ctx.source,

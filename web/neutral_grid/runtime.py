@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
     GridConfig,
@@ -62,33 +62,77 @@ class RealClock:
         return time.time()
 
 
-def grid_config_from_mapping(data: Dict[str, Any]) -> GridConfig:
-    """Exact GridConfig from YAML/JSON (decimals via ``Decimal(str)``, never float arithmetic)."""
+_POLICY_FIELDS = {"entry_order_type", "tp_order_type"}
+_BOOL_FIELDS = {"enabled"}
+_STR_FIELDS = {"grid_id", "connector_name", "trading_pair"}
+_NULLABLE = {"expected_initial_position"}
+
+
+def grid_config_from_engine_json(data: Dict[str, Any]) -> GridConfig:
+    """Strict GridConfig from the engine's published ``summary.engine_config`` (decimals as strings).
+
+    Every GridConfig field must be present, no unknown key is accepted and no value is defaulted or coerced
+    from a float (NG-ARCH-003: the preview must describe exactly the grid the engine runs).
+    """
+    if not isinstance(data, dict):
+        raise ValueError("engine_config: ожидается объект")
     names = {f.name for f in dataclasses.fields(GridConfig)}
+    keys = set(data) - {"fingerprint"}
+    missing, unknown = sorted(names - keys), sorted(keys - names)
+    if missing:
+        raise ValueError(f"engine_config: нет полей {missing}")
+    if unknown:
+        raise ValueError(f"engine_config: неизвестные поля {unknown}")
     kwargs: Dict[str, Any] = {}
-    for key, value in data.items():
-        if key not in names:
-            continue
-        if key in _DECIMAL_FIELDS and value is not None:
-            kwargs[key] = Decimal(str(value))
+    for key in sorted(names):
+        value = data[key]
+        if key in _DECIMAL_FIELDS:
+            if value is None and key in _NULLABLE:
+                kwargs[key] = None
+                continue
+            if not isinstance(value, str):
+                raise ValueError(f"engine_config.{key}: десятичное значение должно быть строкой")
+            try:
+                parsed = Decimal(value)
+            except ArithmeticError:
+                raise ValueError(f"engine_config.{key}: не число") from None
+            if not parsed.is_finite():
+                raise ValueError(f"engine_config.{key}: не конечное число")
+            kwargs[key] = parsed
         elif key in _INT_FIELDS:
-            kwargs[key] = int(value)
-        elif key in ("entry_order_type", "tp_order_type"):
-            kwargs[key] = OrderTypePolicy(str(value).upper())
-        elif key == "enabled":
-            kwargs[key] = value is True
-        else:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"engine_config.{key}: ожидается целое")
             kwargs[key] = value
+        elif key in _POLICY_FIELDS:
+            try:
+                kwargs[key] = OrderTypePolicy(value)
+            except ValueError:
+                raise ValueError(f"engine_config.{key}: недопустимый тип ордера {value!r}") from None
+        elif key in _BOOL_FIELDS:
+            if not isinstance(value, bool):
+                raise ValueError(f"engine_config.{key}: ожидается true/false")
+            kwargs[key] = value
+        elif key in _STR_FIELDS:
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"engine_config.{key}: ожидается непустая строка")
+            kwargs[key] = value
+        else:  # pragma: no cover - a new GridConfig field must be classified above
+            raise ValueError(f"engine_config.{key}: поле не поддерживается веб-адаптером")
     return GridConfig(**kwargs)
 
 
-def load_grid_config(path: Path) -> GridConfig:
-    import yaml
+def engine_config_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> Tuple[GridConfig, str]:
+    """(config, fingerprint) from the committed snapshot; the fingerprint is re-computed by core and must match."""
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import grid as core_grid
 
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: ожидается YAML-объект с полями GridConfig")
-    return grid_config_from_mapping(data)
+    published = ((snapshot or {}).get("summary") or {}).get("engine_config")
+    if published is None:
+        raise ValueError("движок ещё не опубликовал summary.engine_config")
+    config = grid_config_from_engine_json(published)
+    fingerprint = published.get("fingerprint")
+    if not isinstance(fingerprint, str) or fingerprint != core_grid.config_fingerprint(config):
+        raise ValueError("engine_config.fingerprint не совпадает с пересчитанным core-отпечатком")
+    return config, fingerprint
 
 
 def engine_identity_view(cfg: GridConfig) -> Dict[str, Any]:
@@ -103,30 +147,62 @@ def _dec(value: Any) -> Optional[Decimal]:
         return None
 
 
-def snapshot_market(gateway: StoreGateway) -> Callable[[], Awaitable[MarketContext]]:
-    """Preview market context from the committed snapshot (attach mode never calls the exchange)."""
+def _rules_flag(rr: Dict[str, Any], name: str, errors: List[str]) -> bool:
+    value = rr.get(name)
+    if not isinstance(value, bool):
+        errors.append(f"Правила рынка: {name} неизвестен в снимке движка — поддержка не предполагается.")
+        return False
+    return value
+
+
+def snapshot_market(gateway: Any, config_source: Callable[[], Tuple[Optional[GridConfig], Optional[str]]],
+                    stale_after_s: float, clock: Callable[[], float] = time.time
+                    ) -> Callable[[], Awaitable[MarketContext]]:
+    """Preview market context from the committed snapshot (attach mode never calls the exchange).
+
+    Limit/post-only support and the rules fetch time come from ``summary.runtime_rules``; unknown support,
+    rules older than ``history_freshness_s`` or a stale snapshot are preview errors (Start disabled).
+    """
     async def source() -> MarketContext:
         snapshot = gateway.latest_snapshot() or {}
         summary = snapshot.get("summary") or {}
         rr = summary.get("runtime_rules") or None
+        errors: List[str] = []
         rules = None
+        fetched_at: Optional[float] = None
+        now = clock()
         if rr:
             try:
+                fetched_raw = rr.get("fetched_at")
+                fetched_at = float(fetched_raw) if fetched_raw not in (None, "") else None
+                supports_limit = _rules_flag(rr, "supports_limit", errors)
+                supports_post_only = _rules_flag(rr, "supports_post_only", errors)
                 rules = TradingRules(
-                    tick_size=Decimal(rr["tick_size"]), size_step=Decimal(rr["size_step"]),
-                    min_base=Decimal(rr["min_base"]), min_notional=Decimal(rr["min_notional"]),
+                    tick_size=Decimal(str(rr["tick_size"])), size_step=Decimal(str(rr["size_step"])),
+                    min_base=Decimal(str(rr["min_base"])), min_notional=Decimal(str(rr["min_notional"])),
                     max_base=_dec(rr.get("max_base")), max_leverage=_dec(rr.get("max_leverage")),
-                    supports_limit=True, supports_post_only=True,
-                    fetched_at=float(rr.get("fetched_at") or 0.0),
+                    supports_limit=supports_limit, supports_post_only=supports_post_only,
+                    fetched_at=fetched_at if fetched_at is not None else 0.0,
                     max_active_orders_venue=(int(rr["max_active_orders_venue"])
                                              if rr.get("max_active_orders_venue") not in (None, "") else None))
-            except (KeyError, ValueError, ArithmeticError):
+            except (KeyError, ValueError, ArithmeticError, TypeError):
                 rules = None
+                errors.append("Правила рынка в снимке движка неполные или повреждены.")
+        cfg, _ = config_source()
+        if rules is not None:
+            if fetched_at is None:
+                errors.append("Правила рынка: время получения (fetched_at) неизвестно.")
+            elif cfg is not None and now - fetched_at > float(cfg.history_freshness_s):
+                errors.append(f"Правила рынка устарели: получены {now - fetched_at:.0f} с назад "
+                              f"(допустимо {cfg.history_freshness_s} с).")
+        committed_at = snapshot.get("committed_at")
+        if committed_at is None or now - float(committed_at) > stale_after_s:
+            errors.append("Снимок движка устарел или отсутствует: превью по нему недостоверно.")
         bid, ask = _dec(summary.get("bid")), _dec(summary.get("ask"))
         mid = (bid + ask) / 2 if (bid is not None and ask is not None) else None
         available = _dec((summary.get("margin") or {}).get("available"))
-        return MarketContext(rules=rules, mid=mid, available_collateral=available,
-                             fetched_at=snapshot.get("committed_at"), source="snapshot")
+        return MarketContext(rules=rules, mid=mid, available_collateral=available, fetched_at=fetched_at,
+                             source="snapshot", errors=tuple(errors))
     return source
 
 
@@ -171,17 +247,28 @@ def _security_policy(args: Any) -> SecurityPolicy:
     return SecurityPolicy(extra_hostnames=frozenset(getattr(args, "allowed_host", None) or []))
 
 
+def attach_context(gateway: Any, args: Any, *, health_provider: Callable[[], Dict[str, Any]]) -> WebContext:
+    """Attach mode: config, baseline check and identity all come from the engine's committed snapshot."""
+    def config_source() -> Tuple[Optional[GridConfig], Optional[str]]:
+        try:
+            return engine_config_from_snapshot(gateway.latest_snapshot())[0], None
+        except ValueError as exc:
+            return None, str(exc)
+
+    def identity() -> Dict[str, Any]:
+        cfg, error = config_source()
+        return engine_identity_view(cfg) if cfg is not None else {"grid_id": None, "config_error": error}
+
+    preview = PreviewService(config_source, snapshot_market(gateway, config_source, args.stale_after), mode="attach")
+    return WebContext(
+        gateway=gateway, preview=preview, keystore=KeystoreService(demo=False), engine_identity={},
+        identity_provider=identity, mode="attach", bind_host=args.host, stale_after_s=args.stale_after,
+        policy=_security_policy(args), health_provider=health_provider)
+
+
 async def build_attach(args: Any) -> Bundle:
-    if args.config is None:
-        raise ValueError("--attach-db требует --config с конфигурацией сетки (для превью)")
-    config = load_grid_config(args.config)
     gateway = StoreGateway.open(args.attach_db)
-    preview = PreviewService(config, snapshot_market(gateway), mode="attach")
-    context = WebContext(
-        gateway=gateway, preview=preview, keystore=KeystoreService(demo=False),
-        engine_identity=engine_identity_view(config), mode="attach", bind_host=args.host,
-        stale_after_s=args.stale_after, policy=_security_policy(args),
-        health_provider=health_file_provider(Path(args.attach_db)))
+    context = attach_context(gateway, args, health_provider=health_file_provider(Path(args.attach_db)))
 
     async def close_gateway() -> None:
         gateway.close()
