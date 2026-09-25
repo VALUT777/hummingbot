@@ -50,6 +50,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.commands import (
     CommandOutcome,
 )
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    CellSpec,
     CellState,
     CommandKind,
     CommandStatus,
@@ -97,6 +98,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     STREAM_INACTIVE_ORDERS as B_ORDERS,
     STREAM_TRADES as B_TRADES,
     BootstrapRecord,
+    GridExtension,
     GridMigration,
     CidAllocationError,
     CidCollisionError,
@@ -709,6 +711,12 @@ class NeutralGridEngine:
             return [redact(b, 300) for b in self.store.grid_mutation_blockers()]
         except (StoreError, PersistenceError) as exc:
             return [redact(f"UNKNOWN: {type(exc).__name__}", 300)]
+
+    def active_cell_ids(self) -> List[int]:
+        """Effective price order. Historical ledgers stay loaded even when a future window excludes them."""
+        if self.store is None or self.store.closed or not self.bootstrapped:
+            return sorted(self.cells)
+        return [cell.cell_id for cell in self.store.active_cells(self.grid_id)]
 
     def transport_cids(self) -> List[int]:
         """Every durable CID whose submit may have reached transport: all legs except a never-dispatched INTENT
@@ -1594,6 +1602,135 @@ class NeutralGridEngine:
             "old_grid_id": old.grid_id, "new_grid_id": self.config.grid_id, "anchor": str(anchor),
             "cells": len(specs)}, reload=True)
 
+    def grid_extension_candidate(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Proof-bound add-only extension derived from the stored window and this process's config."""
+        now = self.clock() if now is None else now
+        blockers: List[str] = []
+        source = self.grid_record
+        if source is None:
+            return {"proof_id": hashlib.sha256(b"not-bootstrapped").hexdigest(),
+                    "blockers": ["NOT_BOOTSTRAPPED"], "source": None, "target": None,
+                    "added_cells": [], "retained_obligations": [], "observed_position": None}
+
+        def window_payload(fingerprint: str, lower: Decimal, upper: Decimal, count: int,
+                           amount: Decimal, anchor: Decimal, prices: Sequence[Decimal]) -> Dict[str, Any]:
+            return {"grid_id": source.grid_id, "fingerprint": fingerprint,
+                    "lower_price": canonical_decimal(lower), "upper_price": canonical_decimal(upper),
+                    "cell_count": count, "order_amount_base": canonical_decimal(amount),
+                    "anchor": canonical_decimal(anchor), "prices": [canonical_decimal(p) for p in prices]}
+
+        source_payload = window_payload(source.fingerprint, source.lower_price, source.upper_price,
+                                        source.cell_count, source.order_amount_base, source.anchor, source.prices)
+        source_payload["config"] = self.store.config_payload()
+        target_prices: List[Decimal] = []
+        if self.config.grid_id != source.grid_id:
+            blockers.append("GRID_ID_CHANGED")
+        if self.config.order_amount_base != source.order_amount_base:
+            blockers.append("ORDER_AMOUNT_CHANGED")
+        if self.config.lower_price > source.lower_price or self.config.upper_price < source.upper_price:
+            blockers.append("WINDOW_CONTRACTION")
+        if self.config.lower_price == source.lower_price and self.config.upper_price == source.upper_price:
+            blockers.append("NOTHING_TO_EXTEND")
+        if not self.config.lower_price <= source.anchor <= self.config.upper_price:
+            blockers.append("ANCHOR_OUTSIDE_TARGET")
+        if self.rules is None or grid.rules_blockers(self.rules) or self._rules_stale(now):
+            blockers.append("RULES_NOT_READY")
+        else:
+            try:
+                target_prices = grid.build_grid(self.config.lower_price, self.config.upper_price,
+                                                self.config.cell_count, self.rules)
+            except (ArithmeticError, grid.GridValidationError) as exc:
+                blockers.append(f"TARGET_GRID_INVALID:{type(exc).__name__}")
+        if target_prices:
+            starts = [i for i in range(len(target_prices) - len(source.prices) + 1)
+                      if tuple(target_prices[i:i + len(source.prices)]) == source.prices]
+            old_steps = {b - a for a, b in zip(source.prices, source.prices[1:])}
+            new_steps = {b - a for a, b in zip(target_prices, target_prices[1:])}
+            if len(starts) != 1:
+                blockers.append("OLD_BOUNDARIES_NOT_RETAINED")
+            if len(old_steps) != 1 or new_steps != old_steps:
+                blockers.append("STEP_CHANGED")
+        target_payload = window_payload(self.fingerprint, self.config.lower_price, self.config.upper_price,
+                                        self.config.cell_count, self.config.order_amount_base, source.anchor,
+                                        target_prices)
+        target_payload["config"] = grid_config_to_json(self.config)
+        allowed_config_changes = {"lower_price", "upper_price", "cell_count", "max_active_orders"}
+        for name in sorted(set(source_payload["config"]) | set(target_payload["config"])):
+            if source_payload["config"].get(name) != target_payload["config"].get(name) \
+                    and name not in allowed_config_changes:
+                blockers.append(f"CONFIG_CHANGE_FORBIDDEN:{name}")
+
+        existing = {(ledger.spec.low_price, ledger.spec.high_price): ledger for ledger in self.cells.values()}
+        next_id = max(self.cells, default=-1) + 1
+        added = []
+        for low, high in zip(target_prices, target_prices[1:]):
+            if (low, high) not in existing:
+                side = Side.BUY if low < source.anchor else Side.SELL
+                added.append({"cell_id": str(next_id), "low_price": canonical_decimal(low),
+                              "high_price": canonical_decimal(high),
+                              "entry_side": side.value})
+                next_id += 1
+        retained = []
+        for cell_id, ledger in sorted(self.cells.items()):
+            for cycle in ledger.cycles:
+                if cycle.generation > 0 and cycle.open_obligation > ZERO:
+                    retained.append({"cell_id": str(cell_id), "generation": str(cycle.generation),
+                                     "quantity": canonical_decimal(cycle.open_obligation),
+                                     "tp_price": canonical_decimal(ledger.spec.tp_price),
+                                     "side": ledger.spec.tp_side.value})
+
+        if not self.is_stopped or self.meta.stop_outcome not in STOPPED_OUTCOMES:
+            blockers.append("ENGINE_NOT_CLEANLY_STOPPED")
+        if not self._position_fresh_for_ledger(now):
+            blockers.append("POSITION_NOT_FRESH")
+        elif self.endpoints is None or self.position.net_base != self.endpoints.P:
+            blockers.append("POSITION_DRIFT")
+        if self.active_rows is None or self.active_at is None \
+                or now - self.active_at > float(self.config.history_freshness_s):
+            blockers.append("ACTIVE_ORDERS_NOT_FRESH")
+        elif self.active_rows:
+            blockers.append(f"ACTIVE_ORDERS_PRESENT:{len(self.active_rows)}")
+        if not self.history_complete or self._history_stale(now):
+            blockers.append("HISTORY_NOT_FRESH_COMPLETE")
+        if self.ws_pending:
+            blockers.append(f"WS_EXECUTIONS_PENDING:{len(self.ws_pending)}")
+        blockers.extend(f"COHERENT_CUT:{reason}" for reason in self._audit_evidence_unsettled(now))
+        for code in sorted(self.meta.freezes):
+            if code != FREEZE_CONFIG_MISMATCH:
+                blockers.append(f"FROZEN:{code}")
+        if self.store is not None and not self.store.closed:
+            blockers.extend(self.store.grid_extension_blockers())
+        semantic = {"source": source_payload, "target": target_payload, "added_cells": added,
+                    "retained_obligations": retained}
+        proof_id = hashlib.sha256(json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return dict(semantic, proof_id=proof_id, blockers=sorted(set(blockers)),
+                    observed_position=None if self.position is None else canonical_decimal(self.position.net_base))
+
+    def _cmd_extend_grid(self, actor: str, note: str, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
+        candidate = self.grid_extension_candidate(now)
+        if candidate["blockers"]:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "GRID_EXTENSION_NOT_ELIGIBLE",
+                                                           "blockers": candidate["blockers"]})
+        if payload.get("acknowledge") is not True:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "GRID_EXTENSION_NOT_ACKNOWLEDGED"})
+        if payload.get("proof_id") != candidate["proof_id"]:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "GRID_EXTENSION_PROOF_CHANGED",
+                                                           "proof_id": candidate["proof_id"]})
+        added = tuple(CellSpec(int(cell["cell_id"]), Decimal(cell["low_price"]), Decimal(cell["high_price"]),
+                               Side(cell["entry_side"])) for cell in candidate["added_cells"])
+        target = candidate["target"]
+        self.store.extend_grid(tx, GridExtension(
+            config_fingerprint=self.fingerprint, config=grid_config_to_json(self.config),
+            lower_price=Decimal(target["lower_price"]), upper_price=Decimal(target["upper_price"]),
+            order_amount_base=Decimal(target["order_amount_base"]),
+            prices=tuple(Decimal(value) for value in target["prices"]), added_cells=added,
+            anchor=Decimal(target["anchor"]), actor=actor, reason=note, proof_id=candidate["proof_id"]))
+        self.meta.freezes.pop(FREEZE_CONFIG_MISMATCH, None)
+        return CommandOutcome(CommandStatus.APPLIED, {"proof_id": candidate["proof_id"],
+                                                      "added_cells": candidate["added_cells"],
+                                                      "retained_obligations": candidate["retained_obligations"]},
+                              reload=True)
+
     def _cmd_reconcile(self, action: str, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
         if action not in ALL_AUDIT_ACTIONS:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "UNKNOWN_AUDIT_ACTION", "action": action})
@@ -1631,6 +1768,8 @@ class NeutralGridEngine:
                                                           "detail": detail}, reload=True)
         if action == "migrate_grid":
             return self._cmd_migrate_grid(actor, note, now, tx)
+        if action == "extend_grid":
+            return self._cmd_extend_grid(actor, note, payload, now, tx)
         if action == "settle_external_close":
             expected_confirmation = f"SETTLE EXTERNAL CLOSE {self.grid_id} AT FLAT 0"
             if payload.get("acknowledge") is not True or payload.get("confirmation") != expected_confirmation:
@@ -2735,7 +2874,7 @@ class NeutralGridEngine:
         if grid.rules_blockers(self.rules) or not self.cells:
             return None
         cells = []
-        for cell_id in sorted(self.cells):
+        for cell_id in self.active_cell_ids():
             ledger = self.cells[cell_id]
             cur = ledger.current
             open_cycle = (cur is not None and not _retry_only(cur)) or any(

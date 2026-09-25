@@ -8,6 +8,7 @@ A refresh/retry with the same key returns the original row; a command built from
 """
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -30,6 +31,7 @@ AUDIT_ACTIONS = (
 EXTENDED_AUDIT_ACTIONS = (
     "retire_colliding_cid",     # AC-43: audited retire of a CID a foreign order owns; clears the CID freeze
     "migrate_grid",             # AC-52: audited replacement of a quiescent grid (old cycles kept, no reset)
+    "extend_grid",              # audited add-only window extension retaining cells, cycles and baseline
     "settle_external_close",    # proof-bound accounting of one exact manual reduce-only close
 )
 ALL_AUDIT_ACTIONS = AUDIT_ACTIONS + EXTENDED_AUDIT_ACTIONS
@@ -65,6 +67,12 @@ def validate_kind(kind: str, payload: Dict[str, Any]) -> Optional[str]:
             return "resolve_unknown_submit requires cid"
         if action == "settle_external_close" and "proof_id" not in payload:
             return "settle_external_close requires proof_id"
+        if action == "extend_grid":
+            proof_id = payload.get("proof_id")
+            if not isinstance(proof_id, str) or not re.fullmatch(r"[0-9a-f]{64}", proof_id):
+                return "extend_grid requires a 64-character lowercase hexadecimal proof_id"
+            if payload.get("acknowledge") is not True:
+                return "extend_grid requires acknowledge=true"
     for value in payload.values():
         if isinstance(value, float):
             return "payload numbers must be strings (no float)"

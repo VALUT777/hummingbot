@@ -180,6 +180,7 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
         # web D2-17 gates (the engine re-verifies at apply time)
         "colliding_cid": _s(engine.meta.colliding_cid),
         "grid_mutation_blockers": engine.grid_mutation_blockers(),
+        "grid_extension_candidate": engine.grid_extension_candidate(now),
         "store_blockers": list(engine.store_entry_blockers),
         "open_conflicts": [{"id": c.id, "kind": c.kind, "cid": _s(c.cid), "detail": c.detail}
                            for c in engine.open_conflicts],
@@ -222,7 +223,7 @@ def _commands(engine) -> List[Dict[str, Any]]:
 
 
 def build_snapshot(engine, now: float) -> Dict[str, Any]:
-    cells = [_cell_view(engine, engine.cells[i], now) for i in sorted(engine.cells)]
+    cells = [_cell_view(engine, engine.cells[i], now) for i in engine.active_cell_ids()]
     snap = {
         "snapshot_version": None,  # assigned by the store on commit
         "schema_version": SNAPSHOT_VERSION,

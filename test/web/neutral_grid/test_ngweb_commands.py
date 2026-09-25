@@ -368,6 +368,74 @@ async def test_audit_actions_are_baseline_audit_commands(make_web):
     assert legacy.status == 400 and (await legacy.json())["error"] == "bad_kind"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("payload", "message_fragment"), [
+    ({"action": "extend_grid", "note": "audited", "acknowledge": True}, "proof_id"),
+    ({"action": "extend_grid", "proof_id": "ab" * 32, "acknowledge": True}, "note"),
+    ({"action": "extend_grid", "proof_id": "ab" * 32, "note": "audited"}, "acknowledge=true"),
+    ({"action": "extend_grid", "proof_id": "AB" * 32, "note": "audited", "acknowledge": True}, "proof_id"),
+    ({"action": "extend_grid", "proof_id": "ab" * 31, "note": "audited", "acknowledge": True}, "proof_id"),
+])
+async def test_extend_grid_rejects_incomplete_or_malformed_audit(make_web, payload, message_fragment):
+    snap = sample_snapshot("STOPPED_WITH_INVENTORY")
+    snap["summary"]["grid_extension_candidate"] = {"proof_id": "ab" * 32, "blockers": []}
+    web = await make_web(snap)
+    await web.login()
+
+    resp = await web.command("baseline_audit", "extend-invalid-00001", payload)
+
+    assert resp.status == 422, await resp.text()
+    body = await resp.json()
+    assert body["error"] == "invalid_payload"
+    assert message_fragment in body["message"]
+    assert web.gateway.commands == []
+
+
+@pytest.mark.asyncio
+async def test_extend_grid_enqueues_only_published_proof_with_revision_guard(make_web):
+    proof_id = "ab" * 32
+    snap = sample_snapshot("STOPPED_WITH_INVENTORY", config_revision=7, engine_revision=12)
+    snap["summary"]["grid_extension_candidate"] = {"proof_id": proof_id, "blockers": []}
+    web = await make_web(snap)
+    await web.login()
+    payload = {"action": "extend_grid", "proof_id": proof_id, "note": "  add 4.8–4.9 only  ",
+               "acknowledge": True}
+
+    stale = await web.command("baseline_audit", "extend-stale-000001", payload, cfg=7, eng=11)
+    assert stale.status == 409
+    assert (await stale.json())["error"] == "stale_revision"
+    assert web.gateway.commands == []
+
+    accepted = await web.command("baseline_audit", "extend-valid-000001", payload, cfg=7, eng=12)
+    assert accepted.status == 202, await accepted.text()
+    row = (await accepted.json())["command"]
+    assert row["payload"] == {"action": "extend_grid", "proof_id": proof_id,
+                              "note": "add 4.8–4.9 only", "acknowledge": True}
+    assert "confirmation" not in row["payload"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("candidate", "expected_error"), [
+    (None, "grid_extension_not_eligible"),
+    ({"proof_id": "ab" * 32, "blockers": ["ACTIVE_ORDERS"]}, "grid_extension_not_eligible"),
+    ({"proof_id": "cd" * 32, "blockers": []}, "grid_extension_proof_changed"),
+])
+async def test_extend_grid_is_bound_to_eligible_published_candidate(make_web, candidate, expected_error):
+    snap = sample_snapshot("STOPPED_WITH_INVENTORY")
+    if candidate is not None:
+        snap["summary"]["grid_extension_candidate"] = candidate
+    web = await make_web(snap)
+    await web.login()
+
+    resp = await web.command("baseline_audit", "extend-bound-000001",
+                             {"action": "extend_grid", "proof_id": "ab" * 32,
+                              "note": "audited", "acknowledge": True})
+
+    assert resp.status == 409, await resp.text()
+    assert (await resp.json())["error"] == expected_error
+    assert web.gateway.commands == []
+
+
 def test_audit_actions_match_engine():
     from hummingbot.strategy_v2.executors.neutral_grid_executor import commands as engine_commands
     from web.neutral_grid.commands import AUDIT_ACTION_BASELINE, AUDIT_ACTIONS

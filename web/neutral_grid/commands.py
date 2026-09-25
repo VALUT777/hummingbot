@@ -39,8 +39,10 @@ AUDIT_ACTIONS = (
     "resolve_unknown_submit",
 )
 # Audited operator actions beyond the base set (engine ``commands.EXTENDED_AUDIT_ACTIONS``): offered only when the
-# committed snapshot shows they apply, and only with an explicit typed confirmation phrase.
-EXTENDED_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid", "settle_external_close")
+# committed snapshot shows they apply. Destructive retirement/migration/settlement also require a typed phrase;
+# proof-bound add-only extension requires the exact published proof instead.
+EXTENDED_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid", "extend_grid", "settle_external_close")
+CONFIRMATION_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid", "settle_external_close")
 FREEZE_CID = "CID_ALLOCATION"
 COMMAND_KINDS = {k.value: k.value for k in CommandKind}
 MAX_CID = (1 << 48) - 1
@@ -232,6 +234,25 @@ class CommandService:
                 return self._error(409, "external_close_proof_changed",
                                    "Набор доказательств изменился после просмотра. Проверьте его заново.",
                                    proof_id=candidate.get("proof_id"))
+        if action == "extend_grid":
+            state = snapshot.get("engine_state")
+            if state not in ("STOPPED", "STOPPED_WITH_INVENTORY"):
+                return self._error(409, "grid_extension_not_stopped",
+                                   "Расширить сетку можно только когда движок полностью остановлен.",
+                                   engine_state=state)
+            candidate = summary.get("grid_extension_candidate")
+            if not isinstance(candidate, dict):
+                return self._error(409, "grid_extension_not_eligible",
+                                   "Движок не опубликовал проверяемое расширение сетки.",
+                                   blockers=["NO_CANDIDATE"])
+            blockers = candidate.get("blockers")
+            if not isinstance(blockers, list) or blockers:
+                return self._error(409, "grid_extension_not_eligible",
+                                   "Условия безопасного расширения сетки не выполнены.", blockers=blockers)
+            if normalized["proof_id"] != candidate.get("proof_id"):
+                return self._error(409, "grid_extension_proof_changed",
+                                   "План расширения изменился после просмотра. Проверьте его заново.",
+                                   proof_id=candidate.get("proof_id"))
         return None
 
     def _conflict_set_blocker(self, normalized: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[CommandOutcome]:
@@ -327,6 +348,9 @@ class CommandService:
                 if action == "settle_external_close":
                     raise ValueError("Нужно подтвердить запись показанного внешнего закрытия с сохранением fills, "
                                      "CID, P&L и истории и без запуска бота (acknowledge=true).")
+                if action == "extend_grid":
+                    raise ValueError("Нужно подтвердить показанное add-only расширение с сохранением всех старых "
+                                     "ячеек, циклов и TP (acknowledge=true).")
                 raise ValueError("Нужно подтвердить, что аудит проведён и не меняет обязательства ячеек "
                                  "(acknowledge=true).")
             normalized = {"action": action, "note": note, "acknowledge": True}
@@ -337,7 +361,7 @@ class CommandService:
                 if not isinstance(cid, str) or not cid.isdigit() or int(cid) > MAX_CID:
                     raise ValueError("cid: строка с 48-битным client order ID.")
                 normalized["cid"] = cid
-            if action == "settle_external_close":
+            if action in ("settle_external_close", "extend_grid"):
                 proof_id = payload.get("proof_id")
                 if not isinstance(proof_id, str) or not re.fullmatch(r"[0-9a-f]{64}", proof_id):
                     raise ValueError("proof_id: нужен SHA-256 опубликованного набора доказательств.")
@@ -356,7 +380,7 @@ class CommandService:
                 if payload.get("confirmation") != expected:
                     raise ValueError(f"Введите точную фразу подтверждения: «{expected}».")
                 normalized.update(conflict_set_id=set_id, accepted=dict(accepted), confirmation=expected)
-            if action in EXTENDED_AUDIT_ACTIONS:
+            if action in CONFIRMATION_AUDIT_ACTIONS:
                 expected = self.confirmation_phrase(action, normalized.get("cid"))
                 if payload.get("confirmation") != expected:
                     raise ValueError(f"Для этого действия введите точную фразу подтверждения: «{expected}».")

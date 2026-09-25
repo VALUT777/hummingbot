@@ -751,6 +751,22 @@ class GridMigration:
 
 
 @dataclass(frozen=True)
+class GridExtension:
+    """Audited add-only window revision. Existing cell identities and ledger rows are never rewritten."""
+    config_fingerprint: str
+    config: Any
+    lower_price: Decimal
+    upper_price: Decimal
+    order_amount_base: Decimal
+    prices: Sequence[Decimal]
+    added_cells: Sequence[CellSpec]
+    anchor: Decimal
+    actor: str
+    reason: str
+    proof_id: str
+
+
+@dataclass(frozen=True)
 class ExternalSettlementCycle:
     grid_id: str
     cell_id: int
@@ -1556,9 +1572,13 @@ class NeutralGridStore:
         # fingerprint exist since schema v1 and are immutable, so they are read with narrow queries
         pending = self._verify_existing_schema(migrations, allow_upgrade=True, integrity_check=integrity_check,
                                                evidence=evidence)
-        row = self._x("""SELECT e.db_uuid, e.engine_id, e.connector_name, e.connector_domain, e.account_index,
-                         e.trading_pair, e.cid_epoch, g.fingerprint FROM engine e
-                         LEFT JOIN grids g ON g.grid_id = e.current_grid_id WHERE e.id = 1""").fetchone()
+        has_windows = self._grid_window_schema_available()
+        fingerprint = ("COALESCE((SELECT w.fingerprint FROM grid_window_revisions w "
+                       "WHERE w.grid_id = e.current_grid_id ORDER BY w.config_revision DESC LIMIT 1), "
+                       "g.fingerprint)" if has_windows else "g.fingerprint")
+        row = self._x(f"""SELECT e.db_uuid, e.engine_id, e.connector_name, e.connector_domain, e.account_index,
+                          e.trading_pair, e.cid_epoch, {fingerprint} AS fingerprint FROM engine e
+                          LEFT JOIN grids g ON g.grid_id = e.current_grid_id WHERE e.id = 1""").fetchone()
         if row is None:
             raise StoreCorruptError(f"{self.path} has no engine row", list(evidence) + ["engine row missing"])
         identity = self.identity
@@ -2009,15 +2029,192 @@ class NeutralGridStore:
                 if grid_id is None:
                     raise BootstrapError("engine is not bootstrapped")
             row = self._x("SELECT * FROM grids WHERE grid_id = ?", (grid_id,)).fetchone()
+            has_windows = self._grid_window_schema_available()
+            window = (self._x("SELECT * FROM grid_window_revisions WHERE grid_id = ? "
+                              "ORDER BY config_revision DESC LIMIT 1", (grid_id,)).fetchone()
+                      if has_windows else None)
         if row is None:
             raise KeyError(f"unknown grid {grid_id}")
+        source = window if window is not None else row
         return GridRecord(
-            grid_id=row["grid_id"], fingerprint=row["fingerprint"], config_revision=row["config_revision"],
-            lower_price=parse_decimal(row["lower_price"]), upper_price=parse_decimal(row["upper_price"]),
-            cell_count=row["cell_count"], order_amount_base=parse_decimal(row["order_amount_base"]),
-            prices=tuple(parse_decimal(p) for p in json.loads(row["prices_json"])),
-            anchor=parse_decimal(row["anchor"]), status=row["status"], migrated_from=row["migrated_from"],
+            grid_id=row["grid_id"], fingerprint=source["fingerprint"],
+            config_revision=source["config_revision"], lower_price=parse_decimal(source["lower_price"]),
+            upper_price=parse_decimal(source["upper_price"]), cell_count=source["cell_count"],
+            order_amount_base=parse_decimal(source["order_amount_base"]),
+            prices=tuple(parse_decimal(p) for p in json.loads(source["prices_json"])),
+            anchor=parse_decimal(source["anchor"]), status=row["status"], migrated_from=row["migrated_from"],
             created_at_ms=row["created_at_ms"])
+
+    def config_payload(self, revision: Optional[int] = None) -> Dict[str, Any]:
+        revision = self.engine().config_revision if revision is None else _require_int(revision, "revision", 1)
+        with self._rlock:
+            row = self._x("SELECT config_json FROM config_revisions WHERE revision = ?", (revision,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown config revision {revision}")
+        payload = _loads(row[0])
+        if not isinstance(payload, dict):
+            raise StoreIntegrityError(f"config revision {revision} is not an object")
+        return payload
+
+    def active_cells(self, grid_id: Optional[str] = None) -> List[CellRecord]:
+        """Cells in effective price order; historical cells outside the latest window remain in ``cells()``."""
+        grid = self.grid(grid_id)
+        by_interval: Dict[Tuple[Decimal, Decimal], List[CellRecord]] = {}
+        for cell in self.cells(grid.grid_id):
+            by_interval.setdefault((cell.low_price, cell.high_price), []).append(cell)
+        active: List[CellRecord] = []
+        for low, high in zip(grid.prices, grid.prices[1:]):
+            matches = by_interval.get((low, high), [])
+            if len(matches) != 1:
+                raise StoreIntegrityError(f"effective grid interval [{low}, {high}] has {len(matches)} cells")
+            active.append(matches[0])
+        if len(active) != grid.cell_count:
+            raise StoreIntegrityError(f"effective grid has {len(active)} cells, expected {grid.cell_count}")
+        return active
+
+    def grid_extension_blockers(self, grid_id: Optional[str] = None) -> List[str]:
+        """Durable reasons an add-only window revision cannot be committed."""
+        grid = self.grid(grid_id)
+        engine = self.engine()
+        blockers: List[str] = []
+        if engine.engine_state not in (EngineState.STOPPED, EngineState.STOPPED_WITH_INVENTORY):
+            blockers.append(f"ENGINE_NOT_STOPPED:{engine.engine_state.value}")
+        for leg in self.legs(grid_id=grid.grid_id, non_final_only=True):
+            blockers.append(f"NONFINAL_LEG:{leg.cid}:{leg.state.value}")
+        for reservation in self.reservations():
+            blockers.append(f"ACTIVE_RESERVATION:{reservation.cid}")
+        for outbox in self.unresolved_outbox():
+            blockers.append(f"UNRESOLVED_OUTBOX:{outbox.id}:{outbox.cid}")
+        for cycle in self._cycles("grid_id = ?", (grid.grid_id,)):
+            if cycle.dust != 0:
+                blockers.append(f"DUST:{cycle.cell_id}:{cycle.generation}:{cycle.dust}")
+            if cycle.late_evidence == 1:
+                blockers.append(f"LATE_EVIDENCE:{cycle.cell_id}:{cycle.generation}")
+        with self._rlock:
+            conflicts = self._x("SELECT count(*) FROM history_conflicts WHERE resolved_at_ms IS NULL").fetchone()[0]
+            unallocated = self._x("SELECT count(*) FROM fills f JOIN legs l ON l.cid = f.cid "
+                                  "WHERE l.grid_id = ? AND EXISTS (SELECT 1 FROM allocations a WHERE a.cid=f.cid) "
+                                  "AND NOT EXISTS (SELECT 1 FROM fill_allocations fa WHERE fa.dedupe_key=f.dedupe_key)",
+                                  (grid.grid_id,)).fetchone()[0]
+        if conflicts:
+            blockers.append(f"HISTORY_CONFLICTS:{conflicts}")
+        if unallocated:
+            blockers.append(f"UNALLOCATED_FILLS:{unallocated}")
+        blockers.extend(f"STORE:{blocker}" for blocker in self.entry_blockers())
+        return blockers
+
+    def extend_grid(self, tx: Optional[Transaction], extension: GridExtension) -> GridRecord:
+        """Append one effective window revision while retaining every existing ledger row and cell identity."""
+        _require_text(extension.actor, "actor")
+        _require_text(extension.reason, "reason", 2000)
+        _require_text(extension.config_fingerprint, "config_fingerprint")
+        proof_id = _require_text(extension.proof_id, "proof_id", 64)
+        if len(proof_id) != 64 or any(ch not in "0123456789abcdef" for ch in proof_id):
+            raise ValueError("proof_id must be 64 lowercase hexadecimal characters")
+        lower = Decimal(canonical_decimal(extension.lower_price, "lower_price"))
+        upper = Decimal(canonical_decimal(extension.upper_price, "upper_price"))
+        amount = Decimal(canonical_decimal(extension.order_amount_base, "order_amount_base"))
+        anchor = Decimal(canonical_decimal(extension.anchor, "anchor"))
+        prices = tuple(Decimal(canonical_decimal(p, "price")) for p in extension.prices)
+        with self._scope(tx):
+            self._require_writer()
+            old = self.grid()
+            blockers = self.grid_extension_blockers(old.grid_id)
+            if blockers:
+                raise ConfigMutationError("grid extension requires a clean durable STOPPED state", blockers)
+            if old.status != "ACTIVE":
+                raise ConfigMutationError("only the active grid can be extended")
+            if lower > old.lower_price or upper < old.upper_price or \
+                    (lower == old.lower_price and upper == old.upper_price):
+                raise ConfigMutationError("grid extension must expand at least one bound and never contract")
+            if amount != old.order_amount_base or anchor != old.anchor:
+                raise ConfigMutationError("grid extension cannot change Q or anchor")
+            if len(prices) < 2 or prices[0] != lower or prices[-1] != upper or \
+                    any(b <= a for a, b in zip(prices, prices[1:])):
+                raise ConfigMutationError("extension prices must be strictly increasing and match its bounds")
+            old_prices = tuple(old.prices)
+            old_steps = {b - a for a, b in zip(old_prices, old_prices[1:])}
+            new_steps = {b - a for a, b in zip(prices, prices[1:])}
+            if len(old_steps) != 1 or new_steps != old_steps:
+                raise ConfigMutationError("grid extension must preserve the one exact existing step")
+            starts = [i for i in range(len(prices) - len(old_prices) + 1)
+                      if prices[i:i + len(old_prices)] == old_prices]
+            if len(starts) != 1:
+                raise ConfigMutationError("old boundaries must be one unchanged contiguous slice of extension")
+            existing = {(c.low_price, c.high_price): c for c in self.cells(old.grid_id)}
+            requested = {(c.low_price, c.high_price): c for c in extension.added_cells}
+            missing = [(low_price, high_price) for low_price, high_price in zip(prices, prices[1:])
+                       if (low_price, high_price) not in existing]
+            if set(missing) != set(requested) or len(requested) != len(extension.added_cells):
+                raise ConfigMutationError("added_cells must exactly cover the new boundary intervals")
+            config = extension.config
+            if not isinstance(config, Mapping):
+                raise ConfigMutationError("extension config must be a mapping")
+            prior_config = self.config_payload()
+            # ``max_active_orders`` is operational admission capacity, not a financial exposure limit. Older
+            # revisions may lag the runtime's already-reviewed value; the extension proof/audit binds that change.
+            allowed_changes = {"lower_price", "upper_price", "cell_count", "max_active_orders"}
+            config_changes = {}
+            for name in sorted(set(prior_config) | set(config)):
+                if prior_config.get(name) == config.get(name):
+                    continue
+                if name not in allowed_changes:
+                    raise ConfigMutationError(f"grid extension cannot change config field {name}: "
+                                              f"{prior_config.get(name)!r} != {config.get(name)!r}")
+                config_changes[name] = {"from": prior_config.get(name), "to": config.get(name)}
+            expected_config = {
+                "grid_id": old.grid_id, "lower_price": canonical_decimal(lower),
+                "upper_price": canonical_decimal(upper), "cell_count": len(prices) - 1,
+                "order_amount_base": canonical_decimal(amount),
+            }
+            for name, expected in expected_config.items():
+                actual = config.get(name)
+                if str(actual) != str(expected):
+                    raise ConfigMutationError(f"extension config {name}={actual!r} does not match {expected!r}")
+            used_ids = {c.cell_id for c in self.cells(old.grid_id)}
+            for interval in missing:
+                cell = requested[interval]
+                if cell.cell_id in used_ids or cell.cell_id < 0:
+                    raise ConfigMutationError(f"new cell id {cell.cell_id} is already used or invalid")
+                expected_side = Side.BUY if cell.low_price < anchor else Side.SELL
+                if cell.entry_side != expected_side:
+                    raise ConfigMutationError(f"new cell {cell.cell_id} entry side must be {expected_side.value}")
+                used_ids.add(cell.cell_id)
+            revision = self.engine().config_revision + 1
+            now = self._clock_ms()
+            self._x("INSERT INTO config_revisions(revision, grid_id, fingerprint, config_json, reason, actor, "
+                    "created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (revision, old.grid_id, extension.config_fingerprint, canonical_json(extension.config),
+                     f"grid extension: {extension.reason}", extension.actor, now))
+            for interval in missing:
+                cell = requested[interval]
+                self._x("INSERT INTO cells(grid_id, cell_id, low_price, high_price, entry_side, updated_at_ms) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (old.grid_id, cell.cell_id, canonical_decimal(cell.low_price),
+                         canonical_decimal(cell.high_price), cell.entry_side.value, now))
+            price_text = [canonical_decimal(p) for p in prices]
+            self._x("INSERT INTO grid_window_revisions(grid_id, config_revision, fingerprint, lower_price, "
+                    "upper_price, cell_count, order_amount_base, prices_json, anchor, actor, reason, proof_id, "
+                    "created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (old.grid_id, revision, extension.config_fingerprint, canonical_decimal(lower),
+                     canonical_decimal(upper), len(prices) - 1, canonical_decimal(amount),
+                     canonical_json(price_text), canonical_decimal(anchor), extension.actor, extension.reason,
+                     proof_id, now))
+            self._x("UPDATE engine SET config_revision = ?, engine_revision = engine_revision + 1, "
+                    "updated_at_ms = ? WHERE id = 1", (revision, now))
+            self._audit("grid_extension", extension.actor, {
+                "reason": extension.reason, "proof_id": proof_id, "grid_id": old.grid_id,
+                "old_fingerprint": old.fingerprint, "new_fingerprint": extension.config_fingerprint,
+                "old_bounds": [old.lower_price, old.upper_price], "new_bounds": [lower, upper],
+                "config_revision": revision, "added_cell_ids": [requested[i].cell_id for i in missing],
+                "config_changes": config_changes,
+                "retained_cycles": [
+                    {"grid_id": cycle.grid_id, "cell_id": cycle.cell_id, "generation": cycle.generation,
+                     "entry_filled": cycle.entry_filled, "exit_filled": cycle.exit_filled,
+                     "external_settled": cycle.external_settled, "open_obligation": cycle.open_obligation,
+                     "tp_price": cycle.tp_price}
+                    for cycle in self._cycles("grid_id = ? AND state = 'OPEN'", (old.grid_id,))]})
+        return self.grid(old.grid_id)
 
     def record_config_revision(self, tx: Optional[Transaction], config: Any, config_fingerprint: str, actor: str,
                                reason: str) -> int:
@@ -2321,7 +2518,30 @@ class NeutralGridStore:
         if version < 6:
             return False
         if names != required:
-            reason = f"schema v{version} is missing external settlement tables {sorted(required - names)}"
+            reason = f"schema v6 is missing external settlement tables {sorted(required - names)}"
+            self.degraded_reason = reason
+            raise StoreIntegrityError(reason)
+        return True
+
+    def _grid_window_schema_available(self) -> bool:
+        """Permit explicit pre-v7 registries, but fail closed if an applied v7 schema is damaged."""
+        version_row = self._conn.raw.execute("SELECT max(version) FROM schema_migrations").fetchone()
+        version = 0 if version_row is None or version_row[0] is None else int(version_row[0])
+        if version < 7:
+            return False
+        table = self._conn.raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grid_window_revisions'").fetchone()
+        columns = ({row[1] for row in self._conn.raw.execute("PRAGMA table_info(grid_window_revisions)")}
+                   if table is not None else set())
+        required_columns = {"grid_id", "config_revision", "fingerprint", "lower_price", "upper_price",
+                            "cell_count", "order_amount_base", "prices_json", "anchor", "actor", "reason",
+                            "proof_id", "created_at_ms"}
+        triggers = {row[0] for row in self._conn.raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN "
+            "('grid_window_revisions_append_only_u','grid_window_revisions_append_only_d')")}
+        required_triggers = {"grid_window_revisions_append_only_u", "grid_window_revisions_append_only_d"}
+        if table is None or not required_columns.issubset(columns) or triggers != required_triggers:
+            reason = "schema v7 is missing or has damaged grid window revision structures"
             self.degraded_reason = reason
             raise StoreIntegrityError(reason)
         return True
