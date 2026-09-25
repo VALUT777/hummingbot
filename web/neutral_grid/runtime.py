@@ -64,28 +64,29 @@ class RealClock:
 
 
 _POLICY_FIELDS = {"entry_order_type", "tp_order_type"}
-_BOOL_FIELDS = {"enabled"}
+_BOOL_FIELDS = {"enabled", "directional_outside_bounds_entries"}
 _STR_FIELDS = {"grid_id", "connector_name", "trading_pair"}
 _NULLABLE = {"expected_initial_position"}
+_LEGACY_DEFAULTS = {"directional_outside_bounds_entries": False}
 
 
 def grid_config_from_engine_json(data: Dict[str, Any]) -> GridConfig:
     """Strict GridConfig from the engine's published ``summary.engine_config`` (decimals as strings).
 
-    Every GridConfig field must be present, no unknown key is accepted and no value is defaulted or coerced
-    from a float (NG-ARCH-003: the preview must describe exactly the grid the engine runs).
+    No unknown key is accepted and no value is coerced from a float. Newly added default-false policy flags may
+    be absent from a legacy snapshot; every other GridConfig field must be present (NG-ARCH-003).
     """
     if not isinstance(data, dict):
         raise ValueError("engine_config: ожидается объект")
     names = {f.name for f in dataclasses.fields(GridConfig)}
     keys = set(data) - {"fingerprint"}
-    missing, unknown = sorted(names - keys), sorted(keys - names)
+    missing, unknown = sorted(names - keys - set(_LEGACY_DEFAULTS)), sorted(keys - names)
     if missing:
         raise ValueError(f"engine_config: нет полей {missing}")
     if unknown:
         raise ValueError(f"engine_config: неизвестные поля {unknown}")
-    kwargs: Dict[str, Any] = {}
-    for key in sorted(names):
+    kwargs: Dict[str, Any] = dict(_LEGACY_DEFAULTS)
+    for key in sorted(names & keys):
         value = data[key]
         if key in _DECIMAL_FIELDS:
             if value is None and key in _NULLABLE:

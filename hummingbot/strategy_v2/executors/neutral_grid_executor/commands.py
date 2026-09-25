@@ -32,6 +32,7 @@ EXTENDED_AUDIT_ACTIONS = (
     "retire_colliding_cid",     # AC-43: audited retire of a CID a foreign order owns; clears the CID freeze
     "migrate_grid",             # AC-52: audited replacement of a quiescent grid (old cycles kept, no reset)
     "extend_grid",              # audited add-only window extension retaining cells, cycles and baseline
+    "extend_grid_with_external_entry",  # atomic add-only extension + proven manual entry adoption
     "settle_external_close",    # proof-bound accounting of one exact manual reduce-only close
 )
 ALL_AUDIT_ACTIONS = AUDIT_ACTIONS + EXTENDED_AUDIT_ACTIONS
@@ -73,6 +74,12 @@ def validate_kind(kind: str, payload: Dict[str, Any]) -> Optional[str]:
                 return "extend_grid requires a 64-character lowercase hexadecimal proof_id"
             if payload.get("acknowledge") is not True:
                 return "extend_grid requires acknowledge=true"
+        if action == "extend_grid_with_external_entry":
+            proof_id = payload.get("proof_id")
+            if not isinstance(proof_id, str) or not re.fullmatch(r"[0-9a-f]{64}", proof_id):
+                return "extend_grid_with_external_entry requires a 64-character lowercase hexadecimal proof_id"
+            if payload.get("acknowledge") is not True or not isinstance(payload.get("confirmation"), str):
+                return "extend_grid_with_external_entry requires acknowledge=true and confirmation"
     for value in payload.values():
         if isinstance(value, float):
             return "payload numbers must be strings (no float)"

@@ -767,6 +767,34 @@ class GridExtension:
 
 
 @dataclass(frozen=True)
+class ExternalEntryEvidence:
+    inbox_id: int
+    evidence_role: str
+    allocated_quantity: Optional[Decimal] = None
+
+
+@dataclass(frozen=True)
+class ExternalEntryRequest:
+    extension: GridExtension
+    proof_id: str
+    cell_id: int
+    entry_side: Side
+    quantity: Decimal
+    observed_position: Decimal
+    actor: str
+    reason: str
+    expected_config_revision: int
+    expected_engine_revision: int
+    position_observed_at_ms: int
+    active_observed_at_ms: int
+    history_scan_started_at_ms: int
+    history_scan_completed_at_ms: int
+    trades_high_water: Optional[str]
+    orders_high_water: Optional[str]
+    evidence: Sequence[ExternalEntryEvidence]
+
+
+@dataclass(frozen=True)
 class ExternalSettlementCycle:
     grid_id: str
     cell_id: int
@@ -956,6 +984,7 @@ class CycleRecord:
     entry_filled: Decimal
     exit_filled: Decimal
     external_settled: Decimal
+    external_entered: Decimal
     dust: Decimal
     state: str
     late_evidence: int
@@ -1573,6 +1602,7 @@ class NeutralGridStore:
         pending = self._verify_existing_schema(migrations, allow_upgrade=True, integrity_check=integrity_check,
                                                evidence=evidence)
         has_windows = self._grid_window_schema_available()
+        self._external_entry_schema_available()
         fingerprint = ("COALESCE((SELECT w.fingerprint FROM grid_window_revisions w "
                        "WHERE w.grid_id = e.current_grid_id ORDER BY w.config_revision DESC LIMIT 1), "
                        "g.fingerprint)" if has_windows else "g.fingerprint")
@@ -2072,7 +2102,9 @@ class NeutralGridStore:
             raise StoreIntegrityError(f"effective grid has {len(active)} cells, expected {grid.cell_count}")
         return active
 
-    def grid_extension_blockers(self, grid_id: Optional[str] = None) -> List[str]:
+    def grid_extension_blockers(self, grid_id: Optional[str] = None, *,
+                                ignored_unmatched_ids: Sequence[int] = (),
+                                allow_explained_drift: bool = False) -> List[str]:
         """Durable reasons an add-only window revision cannot be committed."""
         grid = self.grid(grid_id)
         engine = self.engine()
@@ -2100,10 +2132,13 @@ class NeutralGridStore:
             blockers.append(f"HISTORY_CONFLICTS:{conflicts}")
         if unallocated:
             blockers.append(f"UNALLOCATED_FILLS:{unallocated}")
-        blockers.extend(f"STORE:{blocker}" for blocker in self.entry_blockers())
+        blockers.extend(f"STORE:{blocker}" for blocker in self.entry_blockers(
+            ignored_unmatched_ids=ignored_unmatched_ids, allow_explained_drift=allow_explained_drift))
         return blockers
 
-    def extend_grid(self, tx: Optional[Transaction], extension: GridExtension) -> GridRecord:
+    def extend_grid(self, tx: Optional[Transaction], extension: GridExtension, *,
+                    ignored_unmatched_ids: Sequence[int] = (), allow_explained_drift: bool = False,
+                    combined_audit: bool = False) -> GridRecord:
         """Append one effective window revision while retaining every existing ledger row and cell identity."""
         _require_text(extension.actor, "actor")
         _require_text(extension.reason, "reason", 2000)
@@ -2119,7 +2154,8 @@ class NeutralGridStore:
         with self._scope(tx):
             self._require_writer()
             old = self.grid()
-            blockers = self.grid_extension_blockers(old.grid_id)
+            blockers = self.grid_extension_blockers(old.grid_id, ignored_unmatched_ids=ignored_unmatched_ids,
+                                                    allow_explained_drift=allow_explained_drift)
             if blockers:
                 raise ConfigMutationError("grid extension requires a clean durable STOPPED state", blockers)
             if old.status != "ACTIVE":
@@ -2153,7 +2189,8 @@ class NeutralGridStore:
             prior_config = self.config_payload()
             # ``max_active_orders`` is operational admission capacity, not a financial exposure limit. Older
             # revisions may lag the runtime's already-reviewed value; the extension proof/audit binds that change.
-            allowed_changes = {"lower_price", "upper_price", "cell_count", "max_active_orders"}
+            allowed_changes = {"lower_price", "upper_price", "cell_count", "max_active_orders",
+                               "directional_outside_bounds_entries"}
             config_changes = {}
             for name in sorted(set(prior_config) | set(config)):
                 if prior_config.get(name) == config.get(name):
@@ -2202,7 +2239,7 @@ class NeutralGridStore:
                      proof_id, now))
             self._x("UPDATE engine SET config_revision = ?, engine_revision = engine_revision + 1, "
                     "updated_at_ms = ? WHERE id = 1", (revision, now))
-            self._audit("grid_extension", extension.actor, {
+            extension_payload = {
                 "reason": extension.reason, "proof_id": proof_id, "grid_id": old.grid_id,
                 "old_fingerprint": old.fingerprint, "new_fingerprint": extension.config_fingerprint,
                 "old_bounds": [old.lower_price, old.upper_price], "new_bounds": [lower, upper],
@@ -2213,7 +2250,9 @@ class NeutralGridStore:
                      "entry_filled": cycle.entry_filled, "exit_filled": cycle.exit_filled,
                      "external_settled": cycle.external_settled, "open_obligation": cycle.open_obligation,
                      "tp_price": cycle.tp_price}
-                    for cycle in self._cycles("grid_id = ? AND state = 'OPEN'", (old.grid_id,))]})
+                    for cycle in self._cycles("grid_id = ? AND state = 'OPEN'", (old.grid_id,))]}
+            if not combined_audit:
+                self._audit("grid_extension", extension.actor, extension_payload)
         return self.grid(old.grid_id)
 
     def record_config_revision(self, tx: Optional[Transaction], config: Any, config_fingerprint: str, actor: str,
@@ -2410,12 +2449,14 @@ class NeutralGridStore:
 
     def _cycle(self, row: sqlite3.Row) -> CycleRecord:
         external_settled = self.external_settled_quantity(row["grid_id"], row["cell_id"], row["generation"])
+        external_entered = self.external_entered_quantity(row["grid_id"], row["cell_id"], row["generation"])
         return CycleRecord(
             grid_id=row["grid_id"], cell_id=row["cell_id"], generation=row["generation"],
             entry_side=Side(row["entry_side"]), entry_price=parse_decimal(row["entry_price"]),
             tp_price=parse_decimal(row["tp_price"]), planned_amount=parse_decimal(row["planned_amount"]),
             config_revision=row["config_revision"], entry_filled=parse_decimal(row["entry_filled"]),
             exit_filled=parse_decimal(row["exit_filled"]), external_settled=external_settled,
+            external_entered=external_entered,
             dust=parse_decimal(row["dust"]), state=row["state"],
             late_evidence=row["late_evidence"], opened_at_ms=row["opened_at_ms"], closed_at_ms=row["closed_at_ms"],
             close_reason=row["close_reason"])
@@ -2556,6 +2597,82 @@ class NeutralGridStore:
                            "AND generation = ?", (grid_id, cell_id, generation)).fetchall()
         return sum((parse_decimal(row[0]) for row in rows), Decimal(0))
 
+    def _external_entry_schema_available(self) -> bool:
+        version_row = self._conn.raw.execute("SELECT max(version) FROM schema_migrations").fetchone()
+        version = 0 if version_row is None or version_row[0] is None else int(version_row[0])
+        if version < 8:
+            return False
+        required = {"external_entries", "external_entry_evidence", "manual_evidence_claims"}
+        names = {row[0] for row in self._conn.raw.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('external_entries','external_entry_evidence','manual_evidence_claims')")}
+        columns = {
+            "external_entries": {"id", "proof_id", "grid_id", "cell_id", "generation", "entry_side",
+                                 "quantity", "observed_position", "expected_config_revision",
+                                 "expected_engine_revision", "position_observed_at_ms", "active_observed_at_ms",
+                                 "history_scan_started_at_ms", "history_scan_completed_at_ms", "trades_high_water",
+                                 "orders_high_water", "actor", "reason", "audit_event_id", "created_at_ms"},
+            "external_entry_evidence": {"adoption_id", "inbox_id", "evidence_role", "allocated_quantity"},
+            "manual_evidence_claims": {"inbox_id", "owner_kind", "owner_id", "claimed_at_ms"},
+        }
+        damaged = [name for name, expected in columns.items() if name not in names or
+                   not expected.issubset({row[1] for row in self._conn.raw.execute(f"PRAGMA table_info({name})")})]
+        trigger_names = {row[0] for row in self._conn.raw.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'external_entries_append_only_%' "
+            "OR type='trigger' AND name LIKE 'external_entry_evidence_append_only_%' "
+            "OR type='trigger' AND name LIKE 'manual_evidence_claims_append_only_%'")}
+        expected_triggers = {f"{base}_append_only_{suffix}" for base in
+                             ("external_entries", "external_entry_evidence", "manual_evidence_claims")
+                             for suffix in ("u", "d")}
+        if names != required or damaged or trigger_names != expected_triggers:
+            reason = f"schema v8 is missing or damaged external entry structures {sorted(required - names)}"
+            self.degraded_reason = reason
+            raise StoreIntegrityError(reason)
+        return True
+
+    def external_entered_quantity(self, grid_id: str, cell_id: int, generation: int) -> Decimal:
+        with self._rlock:
+            self._require_open()
+            if not self._external_entry_schema_available():
+                return Decimal(0)
+            rows = self._x("SELECT quantity FROM external_entries WHERE grid_id=? AND cell_id=? AND generation=?",
+                           (grid_id, cell_id, generation)).fetchall()
+        return sum((parse_decimal(row[0]) for row in rows), Decimal(0))
+
+    def external_entry_position_totals(self, grid_id: Optional[str] = None) -> Tuple[Decimal, Decimal]:
+        with self._rlock:
+            self._require_open()
+            if not self._external_entry_schema_available():
+                return Decimal(0), Decimal(0)
+            sql = "SELECT entry_side, quantity FROM external_entries"
+            params: Tuple[Any, ...] = ()
+            if grid_id is not None:
+                sql += " WHERE grid_id=?"
+                params = (grid_id,)
+            rows = self._x(sql, params).fetchall()
+        buys = sum((parse_decimal(row[1]) for row in rows if row[0] == Side.BUY.value), Decimal(0))
+        sells = sum((parse_decimal(row[1]) for row in rows if row[0] == Side.SELL.value), Decimal(0))
+        return buys, sells
+
+    def external_entry_summary(self, grid_id: str, cell_id: int, generation: int) -> Optional[Dict[str, Any]]:
+        with self._rlock:
+            if not self._external_entry_schema_available():
+                return None
+            entry = self._x("SELECT * FROM external_entries WHERE grid_id=? AND cell_id=? AND generation=?",
+                            (grid_id, cell_id, generation)).fetchone()
+            if entry is None:
+                return None
+            rows = self._x("SELECT h.payload_json FROM external_entry_evidence e JOIN history_inbox h ON h.id=e.inbox_id "
+                           "WHERE e.adoption_id=? AND e.evidence_role='TRADE' ORDER BY h.id", (entry["id"],)).fetchall()
+        trades = [_loads(row[0]) for row in rows]
+        total = sum((parse_decimal(row.get("size")) for row in trades), Decimal(0))
+        notional = sum((parse_decimal(row.get("size")) * parse_decimal(row.get("price")) for row in trades),
+                       Decimal(0))
+        return {"origin": "EXTERNAL", "quantity": entry["quantity"],
+                "vwap": canonical_decimal(notional / total) if total else None,
+                "exchange_order_id": None if not trades else trades[0].get("own_exchange_order_id"),
+                "fee_pnl_complete": False}
+
     def external_position_totals(self, grid_id: Optional[str] = None) -> Tuple[Decimal, Decimal]:
         """Real external ``(BUY, SELL)`` execution totals included in account-position reconciliation."""
         sql = ("SELECT s.settlement_side, e.allocated_quantity FROM external_settlements s "
@@ -2578,6 +2695,167 @@ class NeutralGridStore:
             else:
                 sells += quantity
         return buys, sells
+
+    def extend_grid_with_external_entry(self, tx: Optional[Transaction], request: ExternalEntryRequest) -> int:
+        """Atomically add a grid interval and bind one real manual entry execution to its new cycle."""
+        if not isinstance(request, ExternalEntryRequest):
+            raise TypeError("request must be ExternalEntryRequest")
+        proof_id = _require_text(request.proof_id, "proof_id", 64)
+        if request.extension.proof_id != proof_id:
+            raise ValueError("extension and adoption proof ids differ")
+        actor = _require_text(request.actor, "actor")
+        reason = _require_text(request.reason, "reason", 2000)
+        if request.extension.actor != actor or request.extension.reason != reason:
+            raise ValueError("extension and adoption actor/reason differ")
+        side = _enum(Side, request.entry_side, "entry_side")
+        quantity = _require_positive(request.quantity, "quantity")
+        observed = Decimal(canonical_decimal(request.observed_position, "observed_position"))
+        cell_id = _require_int(request.cell_id, "cell_id", 0)
+        evidence = tuple(request.evidence)
+        timestamps = (request.position_observed_at_ms, request.active_observed_at_ms,
+                      request.history_scan_started_at_ms, request.history_scan_completed_at_ms)
+        if any(not isinstance(value, int) or value < 0 for value in timestamps) or timestamps[3] < timestamps[2] or \
+                not request.trades_high_water or not request.orders_high_water:
+            raise ValueError("external entry requires valid coherent-cut timestamps and high-water marks")
+        if len(evidence) < 2 or len({item.inbox_id for item in evidence}) != len(evidence):
+            raise ValueError("external entry requires distinct trade fragments and one terminal order")
+        with self._scope(tx) as scope:
+            self._require_writer()
+            engine = self.engine()
+            if engine.config_revision != request.expected_config_revision or \
+                    engine.engine_revision != request.expected_engine_revision:
+                raise InvalidTransitionError("external entry revisions changed")
+            if engine.engine_state not in (EngineState.STOPPED, EngineState.STOPPED_WITH_INVENTORY):
+                raise InvalidTransitionError("external entry requires durable stopped state")
+            if self._x("SELECT 1 FROM external_entries WHERE proof_id=?", (proof_id,)).fetchone() is not None or \
+                    self._x("SELECT 1 FROM external_settlements WHERE proof_id=?", (proof_id,)).fetchone() is not None:
+                raise InvalidTransitionError("proof id was already used by an external workflow")
+
+            normalized = []
+            trades = []
+            terminal = []
+            for item in evidence:
+                if not isinstance(item, ExternalEntryEvidence):
+                    raise TypeError("evidence must contain ExternalEntryEvidence")
+                inbox_id = _require_int(item.inbox_id, "evidence.inbox_id", 1)
+                row = self._x("SELECT * FROM history_inbox WHERE id=?", (inbox_id,)).fetchone()
+                if row is None or row["status"] != "UNMATCHED" or row["resolved_at_ms"] is not None:
+                    raise InvalidTransitionError(f"evidence inbox {inbox_id} is unavailable or already resolved")
+                if self._x("SELECT 1 FROM manual_evidence_claims WHERE inbox_id=?", (inbox_id,)).fetchone():
+                    raise InvalidTransitionError(f"evidence inbox {inbox_id} is already claimed")
+                payload = _loads(row["payload_json"])
+                allocated = None if item.allocated_quantity is None else \
+                    _require_positive(item.allocated_quantity, "allocated_quantity")
+                if item.evidence_role == "TRADE":
+                    if row["stream"] != STREAM_TRADES or allocated is None:
+                        raise InvalidTransitionError("trade evidence has wrong stream or allocation")
+                    trades.append((inbox_id, payload, allocated))
+                elif item.evidence_role == "TERMINAL_ORDER":
+                    if row["stream"] != STREAM_INACTIVE_ORDERS or allocated is not None:
+                        raise InvalidTransitionError("terminal evidence has wrong stream or allocation")
+                    terminal.append((inbox_id, payload))
+                else:
+                    raise ValueError("evidence role must be TRADE or TERMINAL_ORDER")
+                normalized.append((inbox_id, item.evidence_role, allocated))
+            if not trades or len(terminal) != 1:
+                raise InvalidTransitionError("exactly one terminal order and at least one trade are required")
+            if any(p.get("own_side") != side.value or parse_decimal(p.get("size")) != q
+                   for _, p, q in trades):
+                raise InvalidTransitionError("manual trade side or allocated quantity mismatch")
+            if sum((q for _, _, q in trades), Decimal(0)) != quantity:
+                raise InvalidTransitionError("manual trade fragments do not total adopted quantity")
+            order_ids = {str(p.get("own_exchange_order_id") or "") for _, p, _ in trades}
+            client_ids = {"" if p.get("own_client_order_id") is None else str(p.get("own_client_order_id"))
+                          for _, p, _ in trades}
+            order = terminal[0][1]
+            terminal_order_id = str(order.get("order_index") or order.get("order_id") or "")
+            terminal_clients = {str(v) for v in (order.get("client_order_id"), order.get("client_order_id_str"))
+                                if v not in (None, "")}
+            if len(order_ids) != 1 or "" in order_ids or order_ids != {terminal_order_id} or \
+                    len(client_ids) != 1 or "" in client_ids or client_ids != terminal_clients:
+                raise InvalidTransitionError("manual trade and terminal order identities differ")
+            final = str(order.get("status", "")).lower() in {"filled", "closed", "complete", "completed"}
+            if not final or order.get("reduce_only") or order.get("side") != side.value or \
+                    parse_decimal(order.get("filled_base_amount")) != quantity or \
+                    parse_decimal(order.get("initial_base_amount")) != quantity or \
+                    parse_decimal(order.get("remaining_base_amount")) != 0:
+                raise InvalidTransitionError("manual entry order must be non-reduce-only, fully final, and exact")
+            selected = {item[0] for item in normalized}
+            unresolved = {row[0] for row in self._x(
+                "SELECT id FROM history_inbox WHERE status='UNMATCHED' AND resolved_at_ms IS NULL").fetchall()}
+            if unresolved != selected:
+                raise InvalidTransitionError("external entry evidence is partial or unrelated evidence remains")
+            old_ledger = self.position_ledger().net
+            signed = quantity if side == Side.BUY else -quantity
+            if observed != old_ledger + signed:
+                raise InvalidTransitionError(f"observed position {observed} != old ledger {old_ledger}+{signed}")
+            added = [cell for cell in request.extension.added_cells if cell.cell_id == cell_id]
+            if len(added) != 1 or added[0].entry_side != side or quantity != request.extension.order_amount_base:
+                raise InvalidTransitionError("adoption must exactly target one new cell with grid Q")
+            entry_price = added[0].entry_price
+            if any((parse_decimal(p.get("price")) > entry_price if side == Side.BUY else
+                    parse_decimal(p.get("price")) < entry_price) for _, p, _ in trades):
+                raise InvalidTransitionError("manual entry execution price is worse than the target cell entry")
+
+            old_grid = self.grid()
+            old_config = self.config_payload()
+            retained = [{"cell_id": c.cell_id, "generation": c.generation,
+                         "entry_filled": c.entry_filled, "exit_filled": c.exit_filled,
+                         "external_settled": c.external_settled, "open_obligation": c.open_obligation,
+                         "tp_price": c.tp_price} for c in self.open_cycles(old_grid.grid_id)]
+            ignored = tuple(sorted(selected))
+            self.extend_grid(scope, request.extension, ignored_unmatched_ids=ignored,
+                             allow_explained_drift=True, combined_audit=True)
+            cycle = self.open_cycle(scope, request.extension.config.get("grid_id"), cell_id, quantity)
+            self._x("UPDATE cycles SET entry_filled=? WHERE grid_id=? AND cell_id=? AND generation=?",
+                    (canonical_decimal(quantity), cycle.grid_id, cell_id, cycle.generation))
+            self.set_cell_state(scope, cycle.grid_id, cell_id, CellState.TP_REQUIRED,
+                                reason="external entry adopted")
+            audit_id = self._audit("grid_extension_external_entry", actor, {
+                "proof_id": proof_id, "grid_id": cycle.grid_id, "cell_id": cell_id,
+                "generation": cycle.generation, "entry_side": side.value, "quantity": quantity,
+                "observed_position": observed, "entry_price": entry_price,
+                "tp_price": added[0].tp_price, "evidence_inbox_ids": sorted(selected),
+                "fee_pnl_complete": False, "reason": reason,
+                "source": {"fingerprint": old_grid.fingerprint, "lower": old_grid.lower_price,
+                           "upper": old_grid.upper_price, "config": old_config},
+                "target": {"fingerprint": request.extension.config_fingerprint,
+                           "lower": request.extension.lower_price, "upper": request.extension.upper_price,
+                           "config": request.extension.config}, "retained_cycles": retained,
+                "expected_config_revision": request.expected_config_revision,
+                "expected_engine_revision": request.expected_engine_revision,
+                "coherent_cut": {"position_ms": request.position_observed_at_ms,
+                                 "active_ms": request.active_observed_at_ms,
+                                 "history_start_ms": request.history_scan_started_at_ms,
+                                 "history_complete_ms": request.history_scan_completed_at_ms,
+                                 "trades_high_water": request.trades_high_water,
+                                 "orders_high_water": request.orders_high_water},
+                "trades": [{"inbox_id": inbox_id, "payload": payload} for inbox_id, payload, _ in trades],
+                "terminal_order": {"inbox_id": terminal[0][0], "payload": terminal[0][1]}})
+            now = self._clock_ms()
+            adoption_id = self._x(
+                "INSERT INTO external_entries(proof_id,grid_id,cell_id,generation,entry_side,quantity,"
+                "observed_position,expected_config_revision,expected_engine_revision,position_observed_at_ms,"
+                "active_observed_at_ms,history_scan_started_at_ms,history_scan_completed_at_ms,trades_high_water,"
+                "orders_high_water,actor,reason,audit_event_id,created_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (proof_id, cycle.grid_id, cell_id, cycle.generation, side.value, canonical_decimal(quantity),
+                 canonical_decimal(observed), request.expected_config_revision, request.expected_engine_revision,
+                 request.position_observed_at_ms, request.active_observed_at_ms,
+                 request.history_scan_started_at_ms, request.history_scan_completed_at_ms,
+                 request.trades_high_water, request.orders_high_water, actor, reason, audit_id, now)).lastrowid
+            for inbox_id, role, allocated in normalized:
+                self._x("INSERT INTO external_entry_evidence(adoption_id,inbox_id,evidence_role,allocated_quantity) "
+                        "VALUES(?,?,?,?)", (adoption_id, inbox_id, role,
+                                            None if allocated is None else canonical_decimal(allocated)))
+                self._x("INSERT INTO manual_evidence_claims(inbox_id,owner_kind,owner_id,claimed_at_ms) "
+                        "VALUES(?, 'EXTERNAL_ENTRY', ?, ?)", (inbox_id, adoption_id, now))
+                self._x("UPDATE history_inbox SET resolved_at_ms=?, resolution=? WHERE id=?",
+                        (now, f"external_entry:{adoption_id}", inbox_id))
+            if engine.manual_reconcile_required and "drift" in (engine.manual_reconcile_reason or ""):
+                self._x("UPDATE engine SET manual_reconcile_required=0, manual_reconcile_reason=NULL, "
+                        "reconciliation_revision=reconciliation_revision+1 WHERE id=1")
+            self.fault_hooks.hit("before_command_commit")
+            return adoption_id
 
     def record_external_settlement(self, tx: Transaction, request: ExternalSettlementRequest) -> int:
         """Atomically bind one full manual reduce-only terminal order to exact cycle obligations.
@@ -2655,6 +2933,9 @@ class NeutralGridStore:
 
         with self._scope(tx):
             self._require_writer()
+            if self._external_entry_schema_available() and \
+                    self._x("SELECT 1 FROM external_entries WHERE proof_id=?", (proof_id,)).fetchone():
+                raise InvalidTransitionError("proof id was already used by an external entry adoption")
             engine = self.engine()
             if grid_id != engine.current_grid_id:
                 raise InvalidTransitionError("external settlement grid is not the current grid")
@@ -2835,6 +3116,10 @@ class NeutralGridStore:
                         "allocated_quantity) VALUES (?, ?, ?, ?)",
                         (settlement_id, inbox_id, role,
                          None if allocated is None else canonical_decimal(allocated)))
+                if self._external_entry_schema_available():
+                    self._x("INSERT INTO manual_evidence_claims(inbox_id,owner_kind,owner_id,claimed_at_ms) "
+                            "VALUES(?, 'EXTERNAL_CLOSE', ?, ?)",
+                            (inbox_id, settlement_id, self._clock_ms()))
                 self._x("UPDATE history_inbox SET resolved_at_ms = ?, resolution = ? WHERE id = ?",
                         (self._clock_ms(), f"external_settlement:{settlement_id}", inbox_id))
             for cycle in cycles:
@@ -3151,16 +3436,24 @@ class NeutralGridStore:
 
     # ---------------------------------------------------------------------------------------------- intents
 
-    def entry_blockers(self) -> List[str]:
+    def entry_blockers(self, *, ignored_unmatched_ids: Sequence[int] = (),
+                       allow_explained_drift: bool = False) -> List[str]:
         """Persistence-level reasons that forbid new ENTRY intents (new exposure)."""
         blockers: List[str] = []
         engine = self.engine()
-        if engine.manual_reconcile_required:
+        if engine.manual_reconcile_required and not (
+                allow_explained_drift and "drift" in (engine.manual_reconcile_reason or "")):
             blockers.append(f"manual reconciliation required: {engine.manual_reconcile_reason}")
         with self._rlock:
             conflicts = self._x("SELECT count(*) FROM history_conflicts WHERE resolved_at_ms IS NULL").fetchone()[0]
-            unmatched = self._x("SELECT count(*) FROM history_inbox WHERE stream = 'TRADES' AND status = 'UNMATCHED' "
-                                "AND resolved_at_ms IS NULL").fetchone()[0]
+            ignored = tuple(_require_int(value, "ignored inbox id", 1) for value in ignored_unmatched_ids)
+            sql = ("SELECT count(*) FROM history_inbox WHERE stream = 'TRADES' AND status = 'UNMATCHED' "
+                   "AND resolved_at_ms IS NULL")
+            params: Tuple[Any, ...] = ()
+            if ignored:
+                sql += " AND id NOT IN (" + ",".join("?" for _ in ignored) + ")"
+                params = ignored
+            unmatched = self._x(sql, params).fetchone()[0]
             gaps = self._x("SELECT stream, required_boundary_ts_ms, oldest_available_ts_ms FROM cursors "
                            "WHERE retention_gap_open = 1 ORDER BY stream").fetchall()
         for gap in gaps:
@@ -4278,6 +4571,9 @@ class NeutralGridStore:
         external_buys, external_sells = self.external_position_totals()
         buys += external_buys
         sells += external_sells
+        entry_buys, entry_sells = self.external_entry_position_totals()
+        buys += entry_buys
+        sells += entry_sells
         return PositionLedger(baseline=engine.effective_baseline, confirmed_buys=buys, confirmed_sells=sells)
 
     def verify_ledger(self) -> List[str]:
@@ -4309,7 +4605,8 @@ class NeutralGridStore:
                 credited[key] = credited.get(key, Decimal(0)) + parse_decimal(row[4])
             cycles = self._cycles("1 = 1", ())
         for cycle in cycles:
-            entry = credited.get((cycle.grid_id, cycle.cell_id, cycle.generation, "ENTRY"), Decimal(0))
+            entry = credited.get((cycle.grid_id, cycle.cell_id, cycle.generation, "ENTRY"), Decimal(0)) \
+                + cycle.external_entered
             exit_ = credited.get((cycle.grid_id, cycle.cell_id, cycle.generation, "TP"), Decimal(0))
             if entry != cycle.entry_filled or exit_ != cycle.exit_filled:
                 problems.append(f"cycle {cycle.grid_id}/{cycle.cell_id}/{cycle.generation}: stored E/X "
@@ -4367,6 +4664,59 @@ class NeutralGridStore:
                 problems.append(f"external settlement {settlement['id']}: evidence spans multiple orders")
             if len(trade_client_ids) != 1 or trade_client_ids != terminal_client_ids:
                 problems.append(f"external settlement {settlement['id']}: evidence spans multiple client ids")
+        if self._external_entry_schema_available():
+            with self._rlock:
+                entries = self._x("SELECT * FROM external_entries ORDER BY id").fetchall()
+                claims = self._x("SELECT * FROM manual_evidence_claims ORDER BY inbox_id").fetchall()
+            expected_claims = set()
+            for entry_row in entries:
+                evidence_rows = self._x(
+                    "SELECT e.inbox_id,e.evidence_role,e.allocated_quantity,h.stream,h.payload_json,h.resolution "
+                    "FROM external_entry_evidence e JOIN history_inbox h ON h.id=e.inbox_id "
+                    "WHERE e.adoption_id=?", (entry_row["id"],)).fetchall()
+                trade_rows = [row for row in evidence_rows if row["evidence_role"] == "TRADE"]
+                terminals = [row for row in evidence_rows if row["evidence_role"] == "TERMINAL_ORDER"]
+                total = sum((parse_decimal(row["allocated_quantity"]) for row in trade_rows), Decimal(0))
+                if total != parse_decimal(entry_row["quantity"]) or len(terminals) != 1:
+                    problems.append(f"external entry {entry_row['id']}: trade total/terminal evidence invalid")
+                trade_order_ids, trade_client_ids = set(), set()
+                terminal_order_id, terminal_client_ids = None, set()
+                for row in evidence_rows:
+                    expected_claims.add((row["inbox_id"], "EXTERNAL_ENTRY", entry_row["id"]))
+                    expected_stream = STREAM_TRADES if row["evidence_role"] == "TRADE" else STREAM_INACTIVE_ORDERS
+                    if row["stream"] != expected_stream or row["resolution"] != f"external_entry:{entry_row['id']}":
+                        problems.append(f"external entry {entry_row['id']}: malformed evidence binding")
+                    payload = _loads(row["payload_json"])
+                    if row["evidence_role"] == "TRADE":
+                        allocated = parse_decimal(row["allocated_quantity"])
+                        if payload.get("own_side") != entry_row["entry_side"] or \
+                                parse_decimal(payload.get("size")) != allocated or allocated <= 0:
+                            problems.append(f"external entry {entry_row['id']}: trade allocation/payload mismatch")
+                        trade_order_ids.add(str(payload.get("own_exchange_order_id")))
+                        if payload.get("own_client_order_id") not in (None, ""):
+                            trade_client_ids.add(str(payload.get("own_client_order_id")))
+                    else:
+                        terminal_order_id = str(payload.get("order_index") or payload.get("order_id"))
+                        terminal_client_ids = {str(value) for value in
+                                               (payload.get("client_order_id"),
+                                                payload.get("client_order_id_str")) if value not in (None, "")}
+                        status = str(payload.get("status", "")).lower()
+                        if payload.get("reduce_only") or payload.get("side") != entry_row["entry_side"] or \
+                                status not in {"filled", "closed", "complete", "completed"} or \
+                                parse_decimal(payload.get("initial_base_amount")) != total or \
+                                parse_decimal(payload.get("filled_base_amount")) != total or \
+                                parse_decimal(payload.get("remaining_base_amount")) != 0:
+                            problems.append(f"external entry {entry_row['id']}: terminal order payload mismatch")
+                if len(trade_order_ids) != 1 or terminal_order_id not in trade_order_ids or \
+                        len(trade_client_ids) != 1 or trade_client_ids != terminal_client_ids:
+                    problems.append(f"external entry {entry_row['id']}: evidence identity mismatch")
+            for settlement in settlements:
+                for row in self._x("SELECT inbox_id FROM external_settlement_evidence WHERE settlement_id=?",
+                                   (settlement["id"],)).fetchall():
+                    expected_claims.add((row[0], "EXTERNAL_CLOSE", settlement["id"]))
+            actual_claims = {(row["inbox_id"], row["owner_kind"], row["owner_id"]) for row in claims}
+            if actual_claims != expected_claims:
+                problems.append("manual evidence claims do not exactly match external workflow evidence")
         return problems
 
     # ---------------------------------------------------------------------------------------------- operator audits

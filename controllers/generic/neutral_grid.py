@@ -47,6 +47,7 @@ class NeutralGridConfig(ControllerConfigBase):
     entry_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT_MAKER
     tp_order_type: OrderTypePolicy = OrderTypePolicy.LIMIT
     tp_gtt_seconds: int = 28 * 24 * 3600
+    directional_outside_bounds_entries: bool = False
     # An unknown submit is audited as "never landed" only with evidence taken this long after its dispatch (>= the
     # settlement delay); a venue active list lagging longer is an operator-audit residual risk (D2-15).
     unknown_resolution_delay_s: Decimal = Decimal("120")
@@ -124,6 +125,7 @@ class NeutralGridConfig(ControllerConfigBase):
             history_overlap_s=self.history_overlap_s, poll_interval_s=self.poll_interval_s,
             entry_order_type=self.entry_order_type, tp_order_type=self.tp_order_type,
             tp_gtt_seconds=self.tp_gtt_seconds, enabled=self.enabled, db_path=self.resolved_db_path(),
+            directional_outside_bounds_entries=self.directional_outside_bounds_entries,
             unknown_resolution_delay_s=self.unknown_resolution_delay_s,
             operator_confirmed_start=self._operator_confirmed_start,
             operator_confirmed_baseline=self._operator_confirmed_baseline,

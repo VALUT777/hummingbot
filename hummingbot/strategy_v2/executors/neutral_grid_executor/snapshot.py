@@ -54,6 +54,8 @@ def _cell_view(engine, ledger, now: float) -> Dict[str, Any]:
         for leg in cycle.entries:
             entry = _leg_view(engine, leg)
         tps.extend(_leg_view(engine, t) for t in cycle.tps)
+        if entry is None and cycle.external_entered > ZERO:
+            entry = engine.store.external_entry_summary(engine.grid_id, ledger.cell_id, cycle.generation)
     # Once a cycle is released, retain its final E/X/S in the cell view instead of replacing the audited history
     # with zeroes.  For a live cell this remains the aggregate of its open cycles.
     b = sum((cycle.buckets() for cycle in cycles), start=EMPTY_BUCKETS)
@@ -81,6 +83,7 @@ def _cell_view(engine, ledger, now: float) -> Dict[str, Any]:
         "tp_children": tps,
         "obligation": {
             "E": str(b.E), "X": str(b.X), "external_settled": str(b.external_settled),
+            "external_entered": str(b.external_entered),
             "open": str(b.open_obligation), "live_tp": str(b.live_tp_remainder),
             "reserved_unassigned": str(b.reserved_tp_unassigned), "unassigned": str(b.unassigned),
             "dust": str(b.dust),
@@ -174,13 +177,15 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
             "max_age_s": str(engine.options.rules_max_age_published_s),
         },
         # exactly the GridConfig the engine runs (decimals as strings) + the core fingerprint (W2)
-        "engine_config": dict(grid_config_to_json(engine.config), fingerprint=engine.fingerprint),
+        "engine_config": dict(grid_config_to_json(engine.config), fingerprint=engine.fingerprint,
+                              directional_outside_bounds_entries=engine.config.directional_outside_bounds_entries),
         "dust_total": str(dust_total),
         "freezes": dict(engine.meta.freezes),
         # web D2-17 gates (the engine re-verifies at apply time)
         "colliding_cid": _s(engine.meta.colliding_cid),
         "grid_mutation_blockers": engine.grid_mutation_blockers(),
         "grid_extension_candidate": engine.grid_extension_candidate(now),
+        "grid_external_entry_candidate": engine.grid_external_entry_candidate(now),
         "store_blockers": list(engine.store_entry_blockers),
         "open_conflicts": [{"id": c.id, "kind": c.kind, "cid": _s(c.cid), "detail": c.detail}
                            for c in engine.open_conflicts],

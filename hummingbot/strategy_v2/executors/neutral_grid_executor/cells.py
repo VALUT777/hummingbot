@@ -215,6 +215,7 @@ class Buckets:
     unassigned: Decimal
     dust: Decimal
     external_settled: Decimal = ZERO
+    external_entered: Decimal = ZERO
 
     @property
     def open_obligation(self) -> Decimal:
@@ -229,10 +230,10 @@ class Buckets:
 
     def _tuple(self) -> Tuple[Decimal, ...]:
         return (self.E, self.X, self.live_tp_remainder, self.reserved_tp_unassigned, self.unassigned, self.dust,
-                self.external_settled)
+                self.external_settled, self.external_entered)
 
 
-EMPTY_BUCKETS = Buckets(ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO)
+EMPTY_BUCKETS = Buckets(ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO, ZERO)
 
 
 @dataclass(frozen=True)
@@ -273,6 +274,7 @@ class Cycle:
     closed: bool = False
     late_evidence: bool = False
     external_settled: Decimal = ZERO
+    external_entered: Decimal = ZERO
     # All cycles of the owning cell (set by CellLedger): needed to see aggregate TP legs hosted in a newer cycle.
     peers: Optional[List["Cycle"]] = field(default=None, repr=False, compare=False)
 
@@ -294,7 +296,7 @@ class Cycle:
 
     @property
     def E(self) -> Decimal:
-        return sum((e.filled for e in self.entries), ZERO)
+        return sum((e.filled for e in self.entries), ZERO) + self.external_entered
 
     @property
     def X(self) -> Decimal:
@@ -310,7 +312,7 @@ class Cycle:
 
     @property
     def entry_final(self) -> bool:
-        return bool(self.entries) and all(e.is_final for e in self.entries)
+        return (bool(self.entries) or self.external_entered > ZERO) and all(e.is_final for e in self.entries)
 
     @property
     def active_entry(self) -> Optional[Leg]:
@@ -332,7 +334,7 @@ class Cycle:
         dust = min(self.dust, max(total_unassigned, ZERO))
         return Buckets(E=self.E, X=self.X, live_tp_remainder=live, reserved_tp_unassigned=unknown,
                        unassigned=total_unassigned - dust, dust=dust,
-                       external_settled=self.external_settled)
+                       external_settled=self.external_settled, external_entered=self.external_entered)
 
     def has_open_obligation_or_orders(self) -> bool:
         return (self.open_obligation != 0 or any(not leg.is_final for leg in self.legs) or self.dust > 0
@@ -349,6 +351,7 @@ class Cycle:
             "closed": self.closed,
             "late_evidence": self.late_evidence,
             "external_settled": str(self.external_settled),
+            "external_entered": str(self.external_entered),
         }
 
     @classmethod
@@ -363,6 +366,7 @@ class Cycle:
             closed=bool(rec.get("closed", False)),
             late_evidence=bool(rec.get("late_evidence", False)),
             external_settled=Decimal(rec.get("external_settled", "0")),
+            external_entered=Decimal(rec.get("external_entered", "0")),
         )
 
 

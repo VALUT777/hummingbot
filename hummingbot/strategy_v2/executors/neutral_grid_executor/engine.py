@@ -105,6 +105,8 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     CursorUpdate,
     EngineIdentity as StoreIdentity,
     EntryBlockedError,
+    ExternalEntryEvidence,
+    ExternalEntryRequest,
     ExternalSettlementCycle,
     ExternalSettlementEvidence,
     ExternalSettlementRequest,
@@ -564,7 +566,7 @@ class NeutralGridEngine:
                 cy = s.cycle(grid_id, cr.cell_id, g)
                 cycle = Cycle(generation=g, entry_side=cy.entry_side, planned_qty=cy.planned_amount, dust=cy.dust,
                               closed=cy.state == "COMPLETE", late_evidence=cy.late_evidence == 1,
-                              external_settled=cy.external_settled)
+                              external_settled=cy.external_settled, external_entered=cy.external_entered)
                 for lr in sorted((x for x in cell_legs if x.generation == g),
                                  key=lambda x: (x.role.value, x.revision)):
                     leg = self._leg_from_store(lr, fills_by_cid.get(lr.cid, []))
@@ -1654,7 +1656,8 @@ class NeutralGridEngine:
                                         self.config.cell_count, self.config.order_amount_base, source.anchor,
                                         target_prices)
         target_payload["config"] = grid_config_to_json(self.config)
-        allowed_config_changes = {"lower_price", "upper_price", "cell_count", "max_active_orders"}
+        allowed_config_changes = {"lower_price", "upper_price", "cell_count", "max_active_orders",
+                                  "directional_outside_bounds_entries"}
         for name in sorted(set(source_payload["config"]) | set(target_payload["config"])):
             if source_payload["config"].get(name) != target_payload["config"].get(name) \
                     and name not in allowed_config_changes:
@@ -1731,6 +1734,141 @@ class NeutralGridEngine:
                                                       "retained_obligations": candidate["retained_obligations"]},
                               reload=True)
 
+    def grid_external_entry_candidate(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Proof for one real manual entry coupled to the sole cell added by an extension."""
+        now = self.clock() if now is None else now
+        base = self.grid_extension_candidate(now)
+        blockers = [value for value in base["blockers"] if value != "POSITION_DRIFT" and
+                    "unmatched account trade" not in value and
+                    not (value.startswith("STORE:manual reconciliation required:") and "drift" in value)]
+        added = base.get("added_cells") or []
+        if len(added) != 1:
+            blockers.append(f"EXACTLY_ONE_ADDED_CELL_REQUIRED:{len(added)}")
+        cell = added[0] if len(added) == 1 else None
+        side = None if cell is None else Side(cell["entry_side"])
+        quantity = self.config.order_amount_base
+        tp_price = None if cell is None else (Decimal(cell["high_price"]) if side == Side.BUY
+                                              else Decimal(cell["low_price"]))
+        trades = [row for row in self.unmatched if row.stream == B_TRADES]
+        orders = [row for row in self.unmatched if row.stream == B_ORDERS]
+        order_ids = {str(row.payload.get("own_exchange_order_id") or "") for row in trades}
+        client_ids = {"" if row.payload.get("own_client_order_id") is None
+                      else str(row.payload.get("own_client_order_id")) for row in trades}
+        if not trades or len(order_ids) != 1 or "" in order_ids or len(client_ids) != 1 or "" in client_ids:
+            blockers.append("EXACTLY_ONE_MANUAL_ENTRY_ORDER_REQUIRED")
+        matching = []
+        if len(order_ids) == 1:
+            order_id = next(iter(order_ids))
+            matching = [row for row in orders
+                        if str(row.payload.get("order_index") or row.payload.get("order_id") or "") == order_id]
+        if len(matching) != 1 or len(orders) != 1:
+            blockers.append(f"EXACTLY_ONE_TERMINAL_ORDER_REQUIRED:{len(matching)}")
+        terminal = matching[0] if len(matching) == 1 else None
+        trade_quantity = sum((Decimal(str(row.payload.get("size", "0"))) for row in trades), ZERO)
+        if side is not None and any(row.payload.get("own_side") != side.value for row in trades):
+            blockers.append("WRONG_ENTRY_SIDE")
+        if trade_quantity != quantity:
+            blockers.append(f"ENTRY_QUANTITY_MISMATCH:{trade_quantity}:{quantity}")
+        if cell is not None and trades:
+            entry_price = Decimal(cell["low_price"] if side == Side.BUY else cell["high_price"])
+            if any((Decimal(str(row.payload.get("price"))) > entry_price if side == Side.BUY else
+                    Decimal(str(row.payload.get("price"))) < entry_price) for row in trades):
+                blockers.append("ENTRY_EXECUTION_WORSE_THAN_CELL")
+        if terminal is not None:
+            order = terminal.payload
+            final = str(order.get("status", "")).lower() in {"filled", "closed", "complete", "completed"}
+            terminal_clients = {str(v) for v in (order.get("client_order_id"), order.get("client_order_id_str"))
+                                if v not in (None, "")}
+            if not final or order.get("reduce_only") or side is None or order.get("side") != side.value or \
+                    Decimal(str(order.get("filled_base_amount", "-1"))) != quantity or \
+                    Decimal(str(order.get("initial_base_amount", "-1"))) != quantity or \
+                    Decimal(str(order.get("remaining_base_amount", "-1"))) != ZERO:
+                blockers.append("MANUAL_ENTRY_ORDER_NOT_EXACT_FINAL")
+            if terminal_clients != client_ids:
+                blockers.append("MANUAL_ENTRY_CLIENT_ID_MISMATCH")
+        old_p = None if self.endpoints is None else self.endpoints.P
+        expected_position = None if old_p is None or side is None else old_p + (quantity if side == Side.BUY else -quantity)
+        if self.position is None or expected_position is None or self.position.net_base != expected_position:
+            blockers.append("POSITION_NOT_EXPLAINED_BY_EXTERNAL_ENTRY")
+        scan = self.complete_scans[-1] if self.complete_scans else None
+        trade_view = [{"inbox_id": str(row.id), "payload_hash": row.payload_hash,
+                       "trade_id": str(row.payload.get("trade_id_str")),
+                       "exchange_order_id": str(row.payload.get("own_exchange_order_id")),
+                       "client_order_id": str(row.payload.get("own_client_order_id")),
+                       "side": str(row.payload.get("own_side")), "quantity": str(row.payload.get("size")),
+                       "price": str(row.payload.get("price"))} for row in sorted(trades, key=lambda value: value.id)]
+        order_view = None if terminal is None else {
+            "inbox_id": str(terminal.id), "payload_hash": terminal.payload_hash,
+            "exchange_order_id": str(terminal.payload.get("order_index") or terminal.payload.get("order_id")),
+            "client_order_id": str(terminal.payload.get("client_order_id")),
+            "side": str(terminal.payload.get("side")), "reduce_only": bool(terminal.payload.get("reduce_only")),
+            "status": str(terminal.payload.get("status")), "filled": str(terminal.payload.get("filled_base_amount"))}
+        proposed = None if cell is None else {
+            "grid_id": self.config.grid_id, "cell_id": cell["cell_id"], "generation": "1",
+            "entry_side": cell["entry_side"], "quantity": canonical_decimal(quantity),
+            "tp_price": canonical_decimal(tp_price), "entry_origin": "EXTERNAL", "fee_pnl_complete": False}
+        base_asset = self.config.trading_pair.split("-")[0]
+        confirmation = None if proposed is None else (
+            f"ADOPT EXTERNAL {side.value} {canonical_decimal(quantity)} "
+            f"{base_asset} INTO {self.config.grid_id} CELL {cell['cell_id']} TP {canonical_decimal(tp_price)}")
+        semantic = {"source": base.get("source"), "target": base.get("target"), "added_cell": cell,
+                    "proposed_cycle": proposed, "retained_obligations": base.get("retained_obligations", []),
+                    "old_ledger_position": None if old_p is None else canonical_decimal(old_p),
+                    "observed_position": None if self.position is None else canonical_decimal(self.position.net_base),
+                    "manual_order": order_view, "trades": trade_view,
+                    "config_revision": None if self.b_engine is None else self.b_engine.config_revision,
+                    "engine_revision": None if self.b_engine is None else self.b_engine.engine_revision,
+                    "position_observed_at_ms": None if self.position_at is None else _ms(self.position_at),
+                    "active_observed_at_ms": None if self.active_at is None else _ms(self.active_at),
+                    "history_scan_started_at_ms": None if scan is None else _ms(scan.started_at),
+                    "history_scan_completed_at_ms": None if scan is None else _ms(scan.completed_at),
+                    "trades_high_water": self.high_water.get(STREAM_TRADES),
+                    "orders_high_water": self.high_water.get(STREAM_ORDERS),
+                    "risk_preview": {"P": None if expected_position is None else canonical_decimal(expected_position),
+                                     "gross": canonical_decimal(sum(
+                                         (abs(c.open_obligation) for ledger in self.cells.values()
+                                          for c in ledger.cycles), ZERO) + quantity)}}
+        proof_id = hashlib.sha256(json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return dict(semantic, proof_id=proof_id, blockers=sorted(set(blockers)), confirmation=confirmation)
+
+    def _cmd_extend_grid_with_external_entry(self, actor: str, note: str, payload: Dict[str, Any], now: float,
+                                             tx) -> CommandOutcome:
+        candidate = self.grid_external_entry_candidate(now)
+        if candidate["blockers"]:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "EXTERNAL_ENTRY_NOT_ELIGIBLE",
+                                                           "blockers": candidate["blockers"]})
+        if payload.get("acknowledge") is not True or payload.get("confirmation") != candidate["confirmation"]:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "EXTERNAL_ENTRY_NOT_ACKNOWLEDGED",
+                                                           "confirmation": candidate["confirmation"]})
+        if payload.get("proof_id") != candidate["proof_id"]:
+            return CommandOutcome(CommandStatus.REJECTED, {"error": "EXTERNAL_ENTRY_PROOF_CHANGED",
+                                                           "proof_id": candidate["proof_id"]})
+        cell = candidate["added_cell"]
+        added = (CellSpec(int(cell["cell_id"]), Decimal(cell["low_price"]), Decimal(cell["high_price"]),
+                          Side(cell["entry_side"])),)
+        target = candidate["target"]
+        extension = GridExtension(self.fingerprint, grid_config_to_json(self.config),
+                                  Decimal(target["lower_price"]), Decimal(target["upper_price"]),
+                                  Decimal(target["order_amount_base"]),
+                                  tuple(Decimal(value) for value in target["prices"]), added,
+                                  Decimal(target["anchor"]), actor, note, candidate["proof_id"])
+        terminal = candidate["manual_order"]
+        evidence = tuple(ExternalEntryEvidence(int(row["inbox_id"]), "TRADE", Decimal(row["quantity"]))
+                         for row in candidate["trades"]) + (
+            ExternalEntryEvidence(int(terminal["inbox_id"]), "TERMINAL_ORDER"),)
+        adoption_id = self.store.extend_grid_with_external_entry(tx, ExternalEntryRequest(
+            extension, candidate["proof_id"], int(cell["cell_id"]), Side(cell["entry_side"]),
+            Decimal(candidate["proposed_cycle"]["quantity"]), Decimal(candidate["observed_position"]), actor, note,
+            int(candidate["config_revision"]), int(candidate["engine_revision"]),
+            int(candidate["position_observed_at_ms"]), int(candidate["active_observed_at_ms"]),
+            int(candidate["history_scan_started_at_ms"]), int(candidate["history_scan_completed_at_ms"]),
+            candidate["trades_high_water"], candidate["orders_high_water"], evidence))
+        self.meta.freezes.pop(FREEZE_CONFIG_MISMATCH, None)
+        return CommandOutcome(CommandStatus.APPLIED, {
+            "adoption_id": str(adoption_id), "proof_id": candidate["proof_id"],
+            "proposed_cycle": candidate["proposed_cycle"],
+            "retained_obligations": candidate["retained_obligations"]}, reload=True)
+
     def _cmd_reconcile(self, action: str, payload: Dict[str, Any], now: float, tx) -> CommandOutcome:
         if action not in ALL_AUDIT_ACTIONS:
             return CommandOutcome(CommandStatus.REJECTED, {"error": "UNKNOWN_AUDIT_ACTION", "action": action})
@@ -1770,6 +1908,8 @@ class NeutralGridEngine:
             return self._cmd_migrate_grid(actor, note, now, tx)
         if action == "extend_grid":
             return self._cmd_extend_grid(actor, note, payload, now, tx)
+        if action == "extend_grid_with_external_entry":
+            return self._cmd_extend_grid_with_external_entry(actor, note, payload, now, tx)
         if action == "settle_external_close":
             expected_confirmation = f"SETTLE EXTERNAL CLOSE {self.grid_id} AT FLAT 0"
             if payload.get("acknowledge") is not True or payload.get("confirmation") != expected_confirmation:
@@ -2593,6 +2733,17 @@ class NeutralGridEngine:
             return False
         return self.bid > self.config.upper_price or self.ask < self.config.lower_price
 
+    def _entry_side_allowed_by_bounds(self, side: Side) -> bool:
+        if self.bid is None or self.ask is None or self.bid > self.ask:
+            return False
+        if not self.config.directional_outside_bounds_entries:
+            return not self._outside_bounds()
+        if self.ask < self.config.lower_price:
+            return side == Side.SELL
+        if self.bid > self.config.upper_price:
+            return side == Side.BUY
+        return True
+
     def _evaluate_state(self, now: float) -> None:
         if self.fatal_reason is not None:
             # Fail closed: the store refused to open/load (missing/corrupt DB with prior-run evidence, config
@@ -2680,7 +2831,7 @@ class NeutralGridEngine:
         entry.extend(exposure)
         if self.position_gap_since is not None and now - self.position_gap_since > self.options.position_gap_grace_s:
             entry.append("POSITION_UNRECONCILED")
-        if self._outside_bounds():
+        if self._outside_bounds() and not self.config.directional_outside_bounds_entries:
             entry.append("OUTSIDE_BOUNDS")
         if self.meta.operator_paused:
             entry.append("OPERATOR_PAUSE")
@@ -2896,6 +3047,8 @@ class NeutralGridEngine:
 
     def _idle_eligibility(self, ledger: CellLedger) -> Tuple[bool, Optional[str]]:
         spec = ledger.spec
+        if not self._entry_side_allowed_by_bounds(spec.entry_side):
+            return False, "OUTSIDE_BOUNDS_SIDE"
         try:
             ledger.next_entry_identity()
         except LedgerError as exc:
@@ -3039,7 +3192,8 @@ class NeutralGridEngine:
         for leg in self.non_final_legs():
             if leg.cid is None:
                 continue
-            if outside and leg.identity.role == LegRole.ENTRY and leg.state in CANCELLABLE:
+            if outside and leg.identity.role == LegRole.ENTRY and leg.state in CANCELLABLE and \
+                    not self._entry_side_allowed_by_bounds(leg.side):
                 cancels.setdefault(leg.cid, "OUTSIDE_BOUNDS")
             elif self._cancel_retry_due(leg, now):
                 cancels.setdefault(leg.cid, "CANCEL_RETRY")
@@ -3081,6 +3235,9 @@ class NeutralGridEngine:
         entry_items = []
         for rank, cell_id in enumerate(plan.newly_armed):
             spec = self.cells[cell_id].spec
+            if not self._entry_side_allowed_by_bounds(spec.entry_side):
+                self.cell_blockers[cell_id] = "OUTSIDE_BOUNDS_SIDE"
+                continue
             entry_items.append(router.RouterIntent(key=f"entry:{cell_id}", side=spec.entry_side,
                                                    price=spec.entry_price, qty=self.config.order_amount_base,
                                                    role=LegRole.ENTRY, cell_id=cell_id, seq=now_ms * 1000 + rank))
@@ -3360,7 +3517,8 @@ class NeutralGridEngine:
             pending = self._pending_submit_outbox(leg.cid)
             if pending is None:
                 continue
-            if leg.identity.role == LegRole.ENTRY and self.entry_blockers:
+            if leg.identity.role == LegRole.ENTRY and (
+                    self.entry_blockers or not self._entry_side_allowed_by_bounds(leg.side)):
                 await self._withdraw(leg.cid, "entries blocked after restart")
                 continue
             await self._dispatch_intent(leg.cid, pending.id, self.store.leg(leg.cid).submit_request())

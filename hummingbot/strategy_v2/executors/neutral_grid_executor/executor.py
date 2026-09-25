@@ -352,6 +352,11 @@ class NeutralGridExecutor(ExecutorBase):
         if not self.config.operator_confirmed_migration or self._migration_refused or engine.store is None \
                 or engine.store.closed or "CONFIG_MISMATCH" not in engine.meta.freezes:
             return
+        # A same-grid fingerprint mismatch may be an audited maintenance operation such as add-only extension
+        # plus external-entry adoption. Its proof-bound web command owns that transition; the launcher's legacy
+        # cold-grid migration must not race it or add a misleading rejected command.
+        if engine.grid_record is not None and engine.grid_record.grid_id == self.config.grid_id:
+            return
         if self._migration_key is not None:
             record = engine.store.get_command(idempotency_key=self._migration_key)
             if record is None or record.status == CommandStatus.QUEUED:

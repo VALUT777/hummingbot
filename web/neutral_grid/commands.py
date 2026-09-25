@@ -40,8 +40,12 @@ AUDIT_ACTIONS = (
 )
 # Audited operator actions beyond the base set (engine ``commands.EXTENDED_AUDIT_ACTIONS``): offered only when the
 # committed snapshot shows they apply. Destructive retirement/migration/settlement also require a typed phrase;
-# proof-bound add-only extension requires the exact published proof instead.
-EXTENDED_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid", "extend_grid", "settle_external_close")
+# proof-bound add-only extension requires the exact published proof instead; external-entry adoption also binds
+# the typed phrase published by its candidate.
+EXTENDED_AUDIT_ACTIONS = (
+    "retire_colliding_cid", "migrate_grid", "extend_grid", "extend_grid_with_external_entry",
+    "settle_external_close",
+)
 CONFIRMATION_AUDIT_ACTIONS = ("retire_colliding_cid", "migrate_grid", "settle_external_close")
 FREEZE_CID = "CID_ALLOCATION"
 COMMAND_KINDS = {k.value: k.value for k in CommandKind}
@@ -253,6 +257,31 @@ class CommandService:
                 return self._error(409, "grid_extension_proof_changed",
                                    "План расширения изменился после просмотра. Проверьте его заново.",
                                    proof_id=candidate.get("proof_id"))
+        if action == "extend_grid_with_external_entry":
+            state = snapshot.get("engine_state")
+            if state not in ("STOPPED", "STOPPED_WITH_INVENTORY"):
+                return self._error(409, "grid_external_entry_not_stopped",
+                                   "Принять внешнюю покупку можно только когда движок полностью остановлен.",
+                                   engine_state=state)
+            candidate = summary.get("grid_external_entry_candidate")
+            if not isinstance(candidate, dict):
+                return self._error(409, "grid_external_entry_not_eligible",
+                                   "Движок не опубликовал проверяемое принятие внешней покупки.",
+                                   blockers=["NO_CANDIDATE"])
+            blockers = candidate.get("blockers")
+            expected_confirmation = candidate.get("confirmation")
+            if not isinstance(blockers, list) or blockers or not isinstance(expected_confirmation, str) \
+                    or not expected_confirmation:
+                return self._error(409, "grid_external_entry_not_eligible",
+                                   "Условия безопасного принятия внешней покупки не выполнены.",
+                                   blockers=blockers)
+            if normalized["proof_id"] != candidate.get("proof_id"):
+                return self._error(409, "grid_external_entry_proof_changed",
+                                   "Доказательства внешней покупки изменились после просмотра. Проверьте их заново.",
+                                   proof_id=candidate.get("proof_id"))
+            if normalized["confirmation"] != expected_confirmation:
+                raise ValueError(f"confirmation: введите точную фразу из опубликованного кандидата: "
+                                 f"«{expected_confirmation}».")
         return None
 
     def _conflict_set_blocker(self, normalized: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[CommandOutcome]:
@@ -351,6 +380,9 @@ class CommandService:
                 if action == "extend_grid":
                     raise ValueError("Нужно подтвердить показанное add-only расширение с сохранением всех старых "
                                      "ячеек, циклов и TP (acknowledge=true).")
+                if action == "extend_grid_with_external_entry":
+                    raise ValueError("Нужно подтвердить принятие показанной внешней покупки без изменения baseline "
+                                     "и без создания синтетических исполнений (acknowledge=true).")
                 raise ValueError("Нужно подтвердить, что аудит проведён и не меняет обязательства ячеек "
                                  "(acknowledge=true).")
             normalized = {"action": action, "note": note, "acknowledge": True}
@@ -361,11 +393,20 @@ class CommandService:
                 if not isinstance(cid, str) or not cid.isdigit() or int(cid) > MAX_CID:
                     raise ValueError("cid: строка с 48-битным client order ID.")
                 normalized["cid"] = cid
-            if action in ("settle_external_close", "extend_grid"):
+            if action in ("settle_external_close", "extend_grid", "extend_grid_with_external_entry"):
                 proof_id = payload.get("proof_id")
                 if not isinstance(proof_id, str) or not re.fullmatch(r"[0-9a-f]{64}", proof_id):
                     raise ValueError("proof_id: нужен SHA-256 опубликованного набора доказательств.")
                 normalized["proof_id"] = proof_id
+            if action == "extend_grid_with_external_entry":
+                allowed = {"action", "proof_id", "note", "acknowledge", "confirmation"}
+                forbidden = sorted(set(payload) - allowed)
+                if forbidden:
+                    raise ValueError(f"Недопустимые поля для proof-only команды: {forbidden}.")
+                confirmation = payload.get("confirmation")
+                if not isinstance(confirmation, str) or not confirmation:
+                    raise ValueError("confirmation: нужна точная фраза из опубликованного кандидата.")
+                normalized["confirmation"] = confirmation
             if action == "ack_history_conflict":
                 # M1 (AC-40): bound to the exact conflict set the operator reviewed; accepted versions explicit.
                 set_id = payload.get("conflict_set_id")

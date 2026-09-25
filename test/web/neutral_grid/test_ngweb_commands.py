@@ -436,6 +436,121 @@ async def test_extend_grid_is_bound_to_eligible_published_candidate(make_web, ca
     assert web.gateway.commands == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("payload_update", "message_fragment"), [
+    ({"proof_id": None}, "proof_id"),
+    ({"proof_id": "AB" * 32}, "proof_id"),
+    ({"note": ""}, "note"),
+    ({"acknowledge": False}, "acknowledge=true"),
+    ({"confirmation": "ADOPT SOMETHING ELSE"}, "confirmation"),
+])
+async def test_external_entry_adoption_rejects_malformed_proof_only_request(
+        make_web, payload_update, message_fragment):
+    proof_id = "ef" * 32
+    confirmation = "ADOPT EXTERNAL BUY 100 LIT INTO arbitrary-grid CELL 10 TP 4.9"
+    snap = sample_snapshot("STOPPED_WITH_INVENTORY")
+    snap["summary"]["grid_external_entry_candidate"] = {
+        "proof_id": proof_id, "blockers": [], "confirmation": confirmation,
+    }
+    web = await make_web(snap)
+    await web.login()
+    payload = {"action": "extend_grid_with_external_entry", "proof_id": proof_id,
+               "note": "reviewed exchange history", "acknowledge": True, "confirmation": confirmation}
+    payload.update(payload_update)
+
+    resp = await web.command("baseline_audit", "adopt-invalid-00001", payload)
+
+    assert resp.status == 422, await resp.text()
+    body = await resp.json()
+    assert body["error"] == "invalid_payload"
+    assert message_fragment in body["message"]
+    assert web.gateway.commands == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    {"target_config": {"lower_price": "4.7"}},
+    {"order_id": "operator-selected"},
+    {"trade_ids": ["operator-selected"]},
+    {"quantity": "200"},
+    {"price": "4.7"},
+    {"cell_id": "99"},
+])
+async def test_external_entry_adoption_rejects_caller_accounting_and_evidence_overrides(make_web, override):
+    proof_id = "ef" * 32
+    confirmation = "ADOPT EXTERNAL BUY 100 LIT INTO arbitrary-grid CELL 10 TP 4.9"
+    snap = sample_snapshot("STOPPED")
+    snap["summary"]["grid_external_entry_candidate"] = {
+        "proof_id": proof_id, "blockers": [], "confirmation": confirmation,
+    }
+    web = await make_web(snap)
+    await web.login()
+    payload = {"action": "extend_grid_with_external_entry", "proof_id": proof_id,
+               "note": "reviewed exchange history", "acknowledge": True, "confirmation": confirmation,
+               **override}
+
+    resp = await web.command("baseline_audit", "adopt-override-0001", payload)
+
+    assert resp.status == 422, await resp.text()
+    assert (await resp.json())["error"] == "invalid_payload"
+    assert web.gateway.commands == []
+
+
+@pytest.mark.asyncio
+async def test_external_entry_adoption_enqueues_only_candidate_bound_request(make_web):
+    proof_id = "ef" * 32
+    confirmation = "ADOPT EXTERNAL BUY 100 LIT INTO operator-grid CELL 10 TP 4.9"
+    snap = sample_snapshot("STOPPED_WITH_INVENTORY", config_revision=8, engine_revision=31)
+    snap["summary"]["grid_external_entry_candidate"] = {
+        "proof_id": proof_id, "blockers": [], "confirmation": confirmation,
+        "target": {"grid_id": "operator-grid", "lower_price": "4.8", "upper_price": "5.9"},
+        "proposed_cycle": {"cell_id": "10", "quantity": "100", "tp_price": "4.9"},
+        "manual_order": {"exchange_order_id": "not-from-browser"},
+        "trades": [{"trade_id": "not-from-browser"}],
+    }
+    web = await make_web(snap)
+    await web.login()
+
+    resp = await web.command(
+        "baseline_audit", "adopt-valid-0000001",
+        {"action": "extend_grid_with_external_entry", "proof_id": proof_id,
+         "note": "  reviewed exact candidate  ", "acknowledge": True, "confirmation": confirmation},
+        cfg=8, eng=31)
+
+    assert resp.status == 202, await resp.text()
+    assert (await resp.json())["command"]["payload"] == {
+        "action": "extend_grid_with_external_entry", "proof_id": proof_id,
+        "note": "reviewed exact candidate", "acknowledge": True, "confirmation": confirmation,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("candidate", "expected_error"), [
+    (None, "grid_external_entry_not_eligible"),
+    ({"proof_id": "ef" * 32, "blockers": ["ACTIVE_ORDERS"], "confirmation": "x"},
+     "grid_external_entry_not_eligible"),
+    ({"proof_id": "01" * 32, "blockers": [], "confirmation": "x"},
+     "grid_external_entry_proof_changed"),
+])
+async def test_external_entry_adoption_requires_exact_clear_candidate(make_web, candidate, expected_error):
+    proof_id = "ef" * 32
+    confirmation = "ADOPT EXTERNAL BUY 100 LIT INTO operator-grid CELL 10 TP 4.9"
+    snap = sample_snapshot("STOPPED_WITH_INVENTORY")
+    if candidate is not None:
+        snap["summary"]["grid_external_entry_candidate"] = candidate
+    web = await make_web(snap)
+    await web.login()
+
+    resp = await web.command(
+        "baseline_audit", "adopt-bound-0000001",
+        {"action": "extend_grid_with_external_entry", "proof_id": proof_id,
+         "note": "reviewed", "acknowledge": True, "confirmation": confirmation})
+
+    assert resp.status == 409, await resp.text()
+    assert (await resp.json())["error"] == expected_error
+    assert web.gateway.commands == []
+
+
 def test_audit_actions_match_engine():
     from hummingbot.strategy_v2.executors.neutral_grid_executor import commands as engine_commands
     from web.neutral_grid.commands import AUDIT_ACTION_BASELINE, AUDIT_ACTIONS

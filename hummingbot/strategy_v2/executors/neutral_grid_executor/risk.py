@@ -124,6 +124,10 @@ def endpoints_from_ledgers(baseline: Decimal, ledgers: Sequence[Any],
     for ledger in ledgers:
         for cycle in ledger.cycles:
             unpaired += abs(cycle.open_obligation)
+            if cycle.entry_side == Side.BUY:
+                buys += cycle.external_entered
+            else:
+                sells += cycle.external_entered
             # External settlement is a real account execution in the obligation-closing direction.
             if cycle.entry_side == Side.BUY:
                 sells += cycle.external_settled

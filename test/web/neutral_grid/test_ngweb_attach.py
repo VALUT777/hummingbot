@@ -192,6 +192,26 @@ def test_engine_config_parser_direct():
         engine_config_from_snapshot({"summary": {}})
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_engine_config_parser_round_trips_directional_outside_bounds_flag(enabled):
+    published = engine_config_json(directional_outside_bounds_entries=enabled)
+
+    cfg, fingerprint = engine_config_from_snapshot({"summary": {"engine_config": published}})
+
+    assert cfg.directional_outside_bounds_entries is enabled
+    assert fingerprint == core_grid.config_fingerprint(cfg)
+
+
+def test_engine_config_parser_defaults_omitted_legacy_directional_flag_to_false():
+    published = engine_config_json(directional_outside_bounds_entries=False)
+    published.pop("directional_outside_bounds_entries")
+
+    cfg, fingerprint = engine_config_from_snapshot({"summary": {"engine_config": published}})
+
+    assert cfg.directional_outside_bounds_entries is False
+    assert fingerprint == core_grid.config_fingerprint(cfg)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kwargs,needle", [
     ({"supports": (True, False)}, "post"),              # LIMIT_MAKER entry but the venue says no post-only
