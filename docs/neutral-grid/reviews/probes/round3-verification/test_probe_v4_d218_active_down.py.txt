@@ -1,0 +1,40 @@
+"""verify3 probe: D2-18 residual with the active-orders read failing (active_rows None => the 'ahead' check is vacuous)."""
+from decimal import Decimal as D
+
+import pytest
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    CommandKind, CommandStatus, LegRole, Side)
+
+ENTRY = LegRole.ENTRY
+
+
+@pytest.mark.parametrize("fails", [1000, 3])
+def test_d218_active_orders_unavailable(tmp_path, fails):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+        h.tick(8)
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("4"), history_lag_s=30, ws=False)
+        h.fx.fail_next("active_orders", fails)
+        applied = None
+        for i in range(27):
+            key = f"x{i}"
+            h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.fx.net_position), "note": "x"}, key=key)
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=key)
+            print(i, rec.status.value, rec.result.get("error"), rec.result.get("reasons"),
+                  rec.result.get("new_effective_baseline"), "active_rows None" if h.engine.active_rows is None else "")
+            if rec.status == CommandStatus.APPLIED:
+                applied = (i, rec.result)
+                break
+        if applied:
+            h.tick(40)
+            print("after history: P", h.engine.endpoints.P, "venue", h.fx.net_position, h.engine.engine_state,
+                  h.engine.reasons[:3])
+        assert applied is None, applied
+    finally:
+        h.close()

@@ -1,0 +1,89 @@
+"""Scratch pytest plugin: source-level mutation of NeutralGridEngine methods (in memory only).
+
+MUT env var selects the mutation. Nothing on disk in the worktree is modified.
+"""
+import inspect
+import os
+import textwrap
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+
+MUTATIONS = {
+    # D1-11: stop branch no longer resumes a committed-but-unsent cancel
+    "d111_stop": ("_act", [(
+        "if leg.state in CANCELLABLE or self._cancel_retry_due(leg, now) or (\n"
+        "                    leg.state == OrderState.CANCEL_PENDING and self._pending_cancel_outbox(leg.cid)):",
+        "if leg.state in CANCELLABLE or self._cancel_retry_due(leg, now):")]),
+    # D1-11: blocked branch variant (risk-reducing cancels) no longer resumes a pending cancel
+    "d111_blocked": ("_risk_reducing_cancels", [(
+        "elif leg.state == OrderState.CANCEL_PENDING and self._pending_cancel_outbox(leg.cid):",
+        "elif False:")]),
+    # D1-12: absence gate removed; original `(self.active_rows or [])` semantics
+    "d112": ("_cmd_reconcile", [(
+        "not_fresh = self._absence_not_proven(cid, now)", "not_fresh = None"), (
+        "for r in self.active_rows)", "for r in (self.active_rows or []))")]),
+    # D1-13 (full revert): no fresh-position requirement, no baseline
+    "d113_full": ("_finish_stop", [(
+        "if not open_legs and self.history_complete and self._position_fresh_for_ledger(now):",
+        "if not open_legs and self.history_complete:"), (
+        "if self.position.net_base != 0 or (self.effective_baseline or ZERO) != 0:",
+        "if self.position is not None and self.position.net_base != 0:")]),
+    # D1-13 (baseline-only revert)
+    "d113_baseline": ("_finish_stop", [(
+        "if self.position.net_base != 0 or (self.effective_baseline or ZERO) != 0:",
+        "if self.position.net_base != 0:")]),
+    # D1-13 (freshness-only revert, keeps baseline)
+    "d113_fresh": ("_finish_stop", [(
+        "if not open_legs and self.history_complete and self._position_fresh_for_ledger(now):",
+        "if not open_legs and self.history_complete:"), (
+        "if self.position.net_base != 0 or (self.effective_baseline or ZERO) != 0:",
+        "if (self.position is not None and self.position.net_base != 0) or (self.effective_baseline or ZERO) != 0:")]),
+    # D1-14: lookback over every non-final leg again
+    "d114": ("oldest_unresolved_ms", [(
+        "if leg.cid in self.order_meta and (leg.state in _LOOKBACK_STATES or leg.cid in self.terminal_rows)]",
+        "if leg.cid in self.order_meta]")]),
+    # D1-15: stale active row recorded as evidence again
+    "d115": ("_reconcile_active", [(
+        "if leg.cid in self.terminal_rows:", "if False:")]),
+    # D1-16: freeze not carried across the reload
+    "d116": ("_tick_body", [(
+        "self._sticky_freezes.setdefault(FREEZE_INVARIANT, detail)", "pass")]),
+    # D1-17: release uses last tick's flag
+    "d117": ("_settle", [(
+        "reconciled = self._position_reconciled_now(now)\n    self.position_reconciled = reconciled",
+        "reconciled = self.position_reconciled")]),
+    # D1-17b: also drop the re-read after the commit
+    "d117b": ("_settle", [(
+        "reconciled = self._position_reconciled_now(now)\n    self.position_reconciled = reconciled",
+        "reconciled = self.position_reconciled")]),
+    # D1-10b: an in-progress walk counts as complete
+    "d110b": ("_scan_history", [(
+        "    if result.complete:\n        self.history_complete = True",
+        "    if result.complete or in_progress:\n        self.history_complete = True")]),
+    # D1-10: optimistic NORMAL instead of RECONCILING
+    "d110": ("_evaluate_state", [(
+        "state = EngineState.RECONCILING", "state = EngineState.NORMAL")]),
+}
+
+
+def _apply(name, repls):
+    fn = getattr(E.NeutralGridEngine, name)
+    src = textwrap.dedent(inspect.getsource(fn))
+    for old, new in repls:
+        if old not in src:
+            raise RuntimeError(f"mutation anchor not found in {name}: {old!r}")
+        src = src.replace(old, new, 1)
+    ns = {}
+    exec(compile(src, f"<mut:{name}>", "exec"), E.__dict__, ns)
+    setattr(E.NeutralGridEngine, name, ns[name])
+
+
+mut = os.environ.get("MUT")
+if mut:
+    name, repls = MUTATIONS[mut]
+    _apply(name, repls)
+    if mut == "d117b":
+        async def _noop(self, now):
+            return None
+        E.NeutralGridEngine._reread_position_for_release = _noop
+    print(f"[ngmut] applied {mut}")

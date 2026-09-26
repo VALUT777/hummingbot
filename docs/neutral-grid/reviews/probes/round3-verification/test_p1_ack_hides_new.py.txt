@@ -1,0 +1,72 @@
+"""Probe P1: an ack_history_conflict issued for conflict X (at the revision the operator saw) also audits a NEW
+contradicting payload Y that appeared after the operator's view, with no revision change -> Y hidden forever."""
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+ENGINE_TESTS = Path("/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/"
+                    "executors/neutral_grid_executor/engine")
+sys.path.insert(0, str(ENGINE_TESTS))
+
+from ng_engine_harness import Harness  # noqa: E402
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (  # noqa: E402
+    CommandKind,
+    CommandStatus,
+    EngineState,
+    LegRole,
+)
+
+D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _host_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "ng-host"))
+
+
+@pytest.mark.parametrize("OVERRIDE", [{"filled_base_amount": "7", "remaining_base_amount": "3"}, {"nonce": 999}])
+def test_p1(tmp_path, OVERRIDE):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        a, b = h.buy_cells()[-1], h.buy_cells()[-2]
+        ea, eb = h.live_order(a, LegRole.ENTRY), h.live_order(b, LegRole.ENTRY)
+        h.fx.fill(ea.cid, D("3"))
+        h.fx.fill(eb.cid, D("10"))
+        h.tick(6)
+        ta = h.engine.store.fills(ea.cid)[0].trade_id_str
+        h.fx.inject_conflicting_trade(ta, D("1"), persistent=True)
+        h.tick(6)
+        assert h.state == EngineState.FROZEN
+        eng = h.engine.store.engine()
+        seen = (eng.config_revision, eng.engine_revision)
+        snap_seen = h.engine.last_snapshot
+        print("operator view: rev", seen, "reason:", h.engine.b_engine.manual_reconcile_reason)
+        print("operator view blockers:", h.engine.cell_blockers)
+        # a NEW contradiction of another committed fill (size 3 -> 9) appears after the operator's view
+        h.fx.order_by_cid(eb.cid).history_override = OVERRIDE
+        h.tick(6)
+        eng2 = h.engine.store.engine()
+        print("after new conflict: rev", (eng2.config_revision, eng2.engine_revision),
+              "reason:", h.engine.b_engine.manual_reconcile_reason)
+        print("open store conflicts:", [(c.kind, c.detail) for c in h.engine.open_conflicts])
+        print("walk conflicts:", h.engine.scanner.last_result.conflicts)
+        h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict",
+                                               "note": "reviewed trade A only"}, key="ack", expected=seen)
+        h.tick(8)
+        rec = h.engine.store.get_command(idempotency_key="ack")
+        print("ack status:", rec.status, rec.result)
+        print("history_complete:", h.engine.history_complete, "state:", h.state, h.engine.reasons)
+        print("cell blockers:", h.engine.cell_blockers, h.engine.tp_blocked_cells)
+        assert rec.status == CommandStatus.APPLIED
+        audited = rec.result["audited_payloads"]
+        assert any(e["stream"] == "inactive_orders" for e in audited), audited
+        h.tick(20)
+        print("later: history_complete", h.engine.history_complete, h.state, h.engine.reasons)
+        print("later cell blockers:", h.engine.cell_blockers)
+    finally:
+        h.close()

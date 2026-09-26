@@ -1,0 +1,13 @@
+import os
+MUT = os.environ.get("NG_MUT", "")
+
+
+def pytest_configure(config):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import lighter_port as P
+    if MUT == "port":
+        async def passthrough(operation, call):
+            return await call()
+        P._sanitized = passthrough
+    elif MUT == "engine":
+        E.redact = lambda text, limit=500: str(text)[:limit]

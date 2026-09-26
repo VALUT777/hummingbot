@@ -1,0 +1,5 @@
+def pytest_configure(config):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.engine import NeutralGridEngine
+    def fresh(self, now):
+        return self.position is not None and not self._position_stale(now)
+    NeutralGridEngine._position_fresh_for_ledger = fresh

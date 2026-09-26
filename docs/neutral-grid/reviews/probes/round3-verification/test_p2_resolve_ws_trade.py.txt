@@ -1,0 +1,66 @@
+"""Probe P2: resolve_unknown_submit's WS gate only looks for the CID label; a WS *trade* event for that CID is kept
+under its trade-id label, so the gate misses it and a filled order is audited as "never landed"."""
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+ENGINE_TESTS = Path("/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/"
+                    "executors/neutral_grid_executor/engine")
+sys.path.insert(0, str(ENGINE_TESTS))
+
+from ng_engine_harness import Harness  # noqa: E402
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (  # noqa: E402
+    CommandKind,
+    CommandStatus,
+    LegRole,
+    OrderState,
+)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import SubmitBehavior  # noqa: E402
+
+D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _host_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "ng-host"))
+
+
+def test_p2(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(cell, LegRole.ENTRY).cid, D("10"))
+        h.fx.script_submit(SubmitBehavior.TIMEOUT_LANDED)
+        h.run_until(lambda: any(t.state == OrderState.SUBMIT_UNKNOWN for t in h.legs(cell, LegRole.TP)),
+                    max_ticks=15)
+        tp = next(t for t in h.legs(cell, LegRole.TP) if t.state == OrderState.SUBMIT_UNKNOWN)
+        print("tp", tp.cid, "open on venue:", h.fx.order_by_cid(tp.cid).is_open)
+        trade = h.fx.fill(tp.cid, D("10"), history_lag_s=600)      # WS delivers it now, history much later
+        print("ws_pending after fill:", h.engine.ws_pending, "label cid:", h.engine._ws_label_cid)
+        applied = None
+        for i in range(40):
+            h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(tp.cid),
+                                                   "note": "operator: looks unsent"}, key=f"p2-{i}")
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=f"p2-{i}")
+            if rec.status == CommandStatus.APPLIED:
+                applied = i
+                break
+        last = h.engine.store.get_command(idempotency_key=f"p2-{i}")
+        print("applied at", applied, "last result", last.status, last.result)
+        print("ws_pending now:", h.engine.ws_pending)
+        leg = h.engine.leg_by_cid(tp.cid)
+        print("leg state:", leg.state if leg else None, "venue order filled:", h.fx.order_by_cid(tp.cid).filled)
+        assert applied is not None, "gate held (no defect)"
+        h.tick(15)
+        tps = h.legs(cell, LegRole.TP)
+        print("TP legs after resolution:", [(t.cid, t.state.value) for t in tps])
+        print("venue net position:", h.fx.net_position, "open TP orders:",
+              [(o.client_order_id, o.side.value, str(o.remaining)) for o in h.fx.orders.values() if o.is_open and o.client_order_id in {t.cid for t in tps}])
+    finally:
+        h.close()

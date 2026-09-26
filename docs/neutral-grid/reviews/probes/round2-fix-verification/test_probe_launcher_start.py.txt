@@ -1,0 +1,114 @@
+"""Scratch probe: a launcher START (resume of a durable stop) that turns CONFLICT is never re-sent."""
+import asyncio
+from decimal import Decimal
+from unittest.mock import MagicMock
+
+import pytest
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, EngineState
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import NeutralGridExecutorConfig
+from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import NeutralGridExecutor, durable_stop_ms
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeClock, FakeExchange
+from hummingbot.strategy_v2.models.executors import CloseType
+
+D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _host_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "ng-host"))
+
+
+def _strategy(clock):
+    strategy = MagicMock()
+    strategy.connectors = {}
+    type(strategy).current_timestamp = property(lambda self: clock())
+    return strategy
+
+
+def _executor(tmp_path, clock, fx, **updates):
+    values = dict(connector_name="lighter_perpetual_robinhood", trading_pair="LIT-USDG", grid_id="g-exec",
+                  lower_price=D("5"), upper_price=D("6"), cell_count=10, order_amount_base=D("10"),
+                  leverage=D("5"), expected_initial_position=D("0"), max_abs_net_position=D("1000"),
+                  max_gross_position=D("1000"), max_active_orders=120, enabled=True,
+                  db_path=str(tmp_path / "ng.sqlite3"), operator_confirmed_start=True,
+                  operator_confirmed_baseline=True, timestamp=clock())
+    values.update(updates)
+    return NeutralGridExecutor(_strategy(clock), NeutralGridExecutorConfig(**values), port=fx, clock=clock)
+
+
+def _run(loop, executor, clock, ticks):
+    for _ in range(ticks):
+        loop.run_until_complete(executor.control_task())
+        clock.advance(1.0)
+
+
+def test_probe_resume_start_lost_after_conflict(tmp_path):
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    first = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(first.on_start())
+        _run(loop, first, clock, 25)
+        assert first.engine.engine_state == EngineState.NORMAL
+        first.early_stop()
+        for _ in range(80):
+            _run(loop, first, clock, 1)
+            if first.close_type is not None:
+                break
+        assert first.close_type == CloseType.EARLY_STOP
+        first.on_stop()
+        stop_ms = durable_stop_ms(str(tmp_path / "ng.sqlite3"))
+        assert stop_ms is not None
+
+        # Next process: the operator typed the resume phrase for exactly this stop.
+        second = _executor(tmp_path, clock, fx, operator_resume_stop_ms=stop_ms)
+        loop.run_until_complete(second.on_start())            # enqueues the launcher START (resume)
+        # Some other command is already queued / arrives first (e.g. a web PAUSE enqueued from attach mode).
+        engine = second.engine
+        engine.enqueue(CommandKind.PAUSE, {"reason": "web pause"}, key="web-pause-0000000001",
+                       expected=(engine.store.engine().config_revision, engine.store.engine().engine_revision))
+        # re-order: make the PAUSE older than START is not possible; instead show the claim-time race directly:
+        _run(loop, second, clock, 40)
+        cmds = [(c.kind, c.status.value, c.idempotency_key) for c in engine.store.list_commands(limit=50)]
+        print("commands:", cmds)
+        print("state:", engine.engine_state, engine.meta.stop_requested_ms, engine.meta.stop_outcome)
+        print("start_error:", second.start_error)
+    finally:
+        loop.close()
+
+
+def test_probe_resume_start_lost_when_older_command_applies_first(tmp_path):
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    first = _executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(first.on_start())
+        _run(loop, first, clock, 25)
+        first.early_stop()
+        for _ in range(80):
+            _run(loop, first, clock, 1)
+            if first.close_type is not None:
+                break
+        assert first.close_type == CloseType.EARLY_STOP
+        # While Hummingbot is down, the operator clicks "Pause" in the attach-mode web UI (queued, not applied).
+        eng = first.engine.store.engine()
+        first.engine.store.enqueue_command("web-pause-000000000001", CommandKind.PAUSE, eng.config_revision,
+                                           eng.engine_revision, {"reason": "web pause"})
+        first.on_stop()
+        stop_ms = durable_stop_ms(str(tmp_path / "ng.sqlite3"))
+
+        second = _executor(tmp_path, clock, fx, operator_resume_stop_ms=stop_ms)
+        loop.run_until_complete(second.on_start())            # launcher START naming the stop
+        engine = second.engine
+        _run(loop, second, clock, 60)
+        cmds = [(c.kind, c.status.value, c.idempotency_key, c.result) for c in engine.store.list_commands(limit=50)]
+        print("commands:", cmds[:4])
+        print("state:", engine.engine_state, "stop_requested_ms:", engine.meta.stop_requested_ms,
+              "outcome:", engine.meta.stop_outcome)
+        print("start_error:", second.start_error, "start_refused:", second._start_refused)
+        assert engine.meta.stop_requested_ms is None, "resume START was lost"
+    finally:
+        loop.close()

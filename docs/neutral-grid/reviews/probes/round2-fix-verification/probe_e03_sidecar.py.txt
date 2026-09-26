@@ -1,0 +1,32 @@
+import json, os, stat, sys, tempfile, time
+from pathlib import Path
+from decimal import Decimal as D
+sys.path.insert(0, "test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import LegRole
+from web.neutral_grid.runtime import health_file_provider
+from web.neutral_grid.views import health_view, freshness
+
+tmp = Path(tempfile.mkdtemp(dir="/private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify"))
+h = Harness(tmp)
+data_dir = h.db_path.parent
+try:
+    h.bootstrap(D("0")); h.tick(2)
+    side = data_dir / (h.db_path.name + ".health.json")
+    print("sidecar before failure:", side.read_text())
+    # full / read-only filesystem: SQLite fails (fault hook) AND the sidecar cannot be (re)written in the same dir
+    os.chmod(data_dir, stat.S_IRUSR | stat.S_IXUSR)
+    h.hooks.simulate_disk_full()
+    cell = h.buy_cells()[-1]
+    h.fx.fill(h.live_order(cell, LegRole.ENTRY).cid, D("10"))
+    h.tick(3)
+    print("engine.persistence_error:", h.engine.persistence_error)
+    print("sidecar during failure:", side.read_text())
+    now = h.clock()
+    snap_commit = now - 600  # web sees an old committed snapshot (no commits while degraded)
+    view = health_view(health_file_provider(h.db_path)(), freshness({"committed_at": snap_commit}, now, 15), now)
+    print("health_view banner:", view["banner"], "known:", view["known"])
+finally:
+    os.chmod(data_dir, stat.S_IRWXU)
+    h.hooks.restore_storage()
+    h.close()

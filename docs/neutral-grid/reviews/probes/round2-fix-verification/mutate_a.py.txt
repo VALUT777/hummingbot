@@ -1,0 +1,108 @@
+"""Mutation probes for batch A findings: patch source in memory, run the claimed regression tests."""
+import inspect, sys, textwrap, unittest, importlib
+
+ROOT = "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid"
+sys.path.insert(0, ROOT)
+PKG = "hummingbot.strategy_v2.executors.neutral_grid_executor"
+TPKG = "test.hummingbot.strategy_v2.executors.neutral_grid_executor.core"
+
+def patch_func(owner, name, old, new, module):
+    fn = getattr(owner, name)
+    src = textwrap.dedent(inspect.getsource(fn))
+    assert old in src, (name, old)
+    src = src.replace(old, new)
+    ns = {}
+    exec(compile(src, f"<mut {name}>", "exec"), module.__dict__, ns)
+    orig = fn
+    setattr(owner, name, ns[name] if not isinstance(inspect.getattr_static(owner, name, None), staticmethod) else staticmethod(ns[name]))
+    return orig
+
+def run(ids):
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    for i in ids:
+        suite.addTests(loader.loadTestsFromName(i))
+    res = unittest.TextTestRunner(verbosity=0, stream=open("/dev/null", "w")).run(suite)
+    return res.testsRun, len(res.failures), len(res.errors)
+
+cells = importlib.import_module(PKG + ".cells")
+risk = importlib.import_module(PKG + ".risk")
+grid = importlib.import_module(PKG + ".grid")
+dust = importlib.import_module(PKG + ".dust")
+admission = importlib.import_module(PKG + ".admission")
+cid = importlib.import_module(PKG + ".cid")
+router = importlib.import_module(PKG + ".router")
+
+MUTS = [
+ ("A-01 late=is_final or closed", cells.CellLedger, "apply_fill", "late = leg.is_final\n", "late = leg.is_final or cycle.closed\n", cells,
+  [TPKG + ".test_cells.TestLateEvidenceResolution"]),
+ ("A-01 ack keeps terminal_cumulative", cells.CellLedger, "acknowledge_late_evidence",
+  "leg.terminal_cumulative = leg.filled", "pass", cells,
+  [TPKG + ".test_cells.TestLateEvidenceResolution"]),
+ ("A-01 ack leaves REJECTED", cells.CellLedger, "acknowledge_late_evidence",
+  "if leg.state in REJECTED_STATES or leg.state == OrderState.TERMINAL:", "if leg.state == OrderState.TERMINAL:", cells,
+  [TPKG + ".test_cells.TestLateEvidenceResolution"]),
+ ("A-02 unknown unfreeable", risk, "plan_tp_headroom",
+  "freeable = in_flight + unresolved +", "freeable = in_flight +", risk,
+  [TPKG + ".test_risk.TestTpHeadroom"]),
+ ("A-05 fullq entry only (admission)", admission, "_full_q_blocker",
+  '(("ENTRY", cell.entry_price), ("TP", cell.tp_price))', '(("ENTRY", cell.entry_price),)', admission,
+  [TPKG + ".test_admission.TestRuntimeMinimumChange"]),
+ ("A-05 fullq entry only (begin_entry)", cells.CellLedger, "begin_entry",
+  '(("entry", self.spec.entry_price), ("tp", self.spec.tp_price))', '(("entry", self.spec.entry_price),)', cells,
+  [TPKG + ".test_admission.TestRuntimeMinimumChange"]),
+ ("A-06 skip-ahead", admission, "plan",
+  "            head_blocked = True\n            queued.append(cid)", "            queued.append(cid)", admission,
+  [TPKG + ".test_admission.TestHeadOfLine"]),
+ ("A-07 no latch on lookup", cid.CidAllocator, "known",
+  "raise self._fail(exc)", "raise exc", cid,
+  [TPKG + ".test_cid"]),
+ ("A-08 no trim", admission, "plan",
+  "    deficit = -ledger().free\n", "    deficit = 0\n", admission,
+  [TPKG + ".test_admission.TestCapReduction"]),
+]
+
+for label, owner, name, old, new, module, tests in MUTS:
+    orig = patch_func(owner, name, old, new, module)
+    try:
+        r = run(tests)
+    finally:
+        setattr(owner, name, orig)
+    print(f"{label:40s} run={r[0]} fail={r[1]} err={r[2]} -> {'KILLED' if r[1] or r[2] else 'SURVIVED'}")
+
+# A-03 greedy split mutation: replace partition_valid everywhere
+from decimal import Decimal
+import math
+from fractions import Fraction
+orig_pv = grid.partition_valid
+def greedy(qty, price, rules):
+    step = rules.size_step
+    n = math.floor(Fraction(qty) / Fraction(step))
+    m = int(Fraction(grid.min_valid_order_qty(rules, price)) / Fraction(step))
+    if n < m: return []
+    if rules.max_base is None: chunks = [n]
+    else:
+        big = math.floor(Fraction(rules.max_base) / Fraction(step))
+        chunks = []
+        left = n
+        while left >= m:
+            c = min(left, big); chunks.append(c); left -= c
+            if c < m: chunks.pop(); break
+    out = [Decimal(c) * step for c in chunks]
+    return [qty if c == qty else c for c in out]
+for mod in (grid, cells, dust):
+    if hasattr(mod, "partition_valid"): setattr(mod, "partition_valid", greedy)
+r = run([TPKG + ".test_cells", TPKG + ".test_dust"])
+for mod in (grid, cells, dust):
+    if hasattr(mod, "partition_valid"): setattr(mod, "partition_valid", orig_pv)
+print(f"{'A-03 greedy split':40s} run={r[0]} fail={r[1]} err={r[2]} -> {'KILLED' if r[1] or r[2] else 'SURVIVED'}")
+
+# A-08 headroom removal alone (keep trim)
+orig_fp = router.SlotBudget.from_plan
+router.SlotBudget.from_plan = classmethod(lambda cls, plan: cls(free=max(plan.slots.free, 0), cell_unused={c: plan.unused(c) for c in plan.reservations}, headroom=None))
+r = run([TPKG + ".test_admission.TestCapReduction", TPKG + ".test_router"])
+router.SlotBudget.from_plan = orig_fp
+print(f"{'A-08 no headroom (trim kept)':40s} run={r[0]} fail={r[1]} err={r[2]} -> {'KILLED' if r[1] or r[2] else 'SURVIVED'}")
+# baseline
+r = run([TPKG + ".test_cells", TPKG + ".test_dust", TPKG + ".test_admission", TPKG + ".test_risk", TPKG + ".test_cid", TPKG + ".test_router"])
+print("baseline", r)

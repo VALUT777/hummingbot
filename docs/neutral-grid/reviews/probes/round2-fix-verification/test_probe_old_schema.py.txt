@@ -1,0 +1,23 @@
+import pytest
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import durable_stop_ms, register_durable_cids
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeClock, FakeExchange
+from hummingbot.strategy_v2.executors.neutral_grid_executor.migrations import MIGRATIONS
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import EngineIdentity, NeutralGridStore
+
+
+def test_probe_launcher_reads_fail_on_previous_schema(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "host"))
+    identity = EngineIdentity(connector_name="lighter_perpetual_robinhood",
+                              connector_domain="lighter_perpetual_robinhood", account_index=7, trading_pair="LIT-USDG")
+    db = tmp_path / "ng.sqlite3"
+    old = NeutralGridStore.open(db, identity, create_if_missing=True, migrations=MIGRATIONS[:-1])
+    with old.transaction() as tx:
+        old.kv_set(tx, "engine_meta", {"stop_requested_ms": 1790000000000})
+    old.close()
+    print("latest schema", MIGRATIONS[-1].version)
+    for fn in (lambda: durable_stop_ms(str(db)), lambda: register_durable_cids(FakeExchange(FakeClock()), str(db))):
+        try:
+            print("result:", fn())
+        except Exception as exc:
+            print("raised:", type(exc).__name__, exc)

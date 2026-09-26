@@ -1,0 +1,67 @@
+import sys, itertools
+from decimal import Decimal as D
+from functools import lru_cache
+sys.path.insert(0, "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid")
+from hummingbot.strategy_v2.executors.neutral_grid_executor import grid, risk, router, admission
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import LegRole, OrderState, Side
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.core.helpers import rules, Harness, BUY_CELL, Q, CoreSim
+from hummingbot.strategy_v2.executors.neutral_grid_executor.cells import FillOutcome
+
+# A-02 router-level exact scenario
+limits = risk.RiskLimits(D("20"), D("1000"))
+ep = risk.RiskEndpoints(P=D("0"), P_min=D("0"), P_max=D("20"), gross_worst=D("20"))
+owned = [router.RouterOrder(key="u", side=Side.BUY, price=D("5.05"), remaining=D("20"), state=OrderState.SUBMIT_UNKNOWN,
+                            role=LegRole.ENTRY, cell_id=3)]
+tp = router.RouterIntent("tp:30", Side.BUY, D("5.5"), D("10"), LegRole.TP, 30, 1)
+p = router.plan_submits([tp], owned, endpoints=ep, limits=limits, mid=D("5.4"))
+print("A-02 router:", [(a.kind.value, a.reason) for a in p.actions])
+owned_live = [owned[0].__class__(**{**owned[0].__dict__, "state": OrderState.LIVE})]
+p = router.plan_submits([tp], owned_live, endpoints=ep, limits=limits, mid=D("5.4"))
+print("A-02 router LIVE:", [(a.kind.value, a.reason) for a in p.actions])
+
+# A-03 exhaustive maximality: partition_valid vs brute-force optimum (step 1)
+bad = 0
+for m in range(1, 8):
+    for big in range(m, 15):
+        r = rules(step="1", min_base=str(m), min_notional="0", max_base=str(big))
+        for n in range(0, 60):
+            parts = grid.partition_valid(D(n), D("5"), r)
+            assert all(m <= p <= big for p in parts), (m, big, n, parts)
+            got = sum(parts, D(0))
+            # best achievable: max total <= n expressible as sum of k values in [m,big]
+            best = 0
+            for k in range(0, n // m + 1):
+                if k * m <= n:
+                    best = max(best, min(n, k * big))
+            if got != best:
+                bad += 1
+                print("A-03 suboptimal", m, big, n, parts, best)
+print("A-03 partition bad cases:", bad)
+# non-integer step
+r = rules(step="0.01", min_base="5", min_notional="0", max_base="6")
+print("A-03 step .01 10 ->", grid.partition_valid(D("10"), D("5.4"), r), " 13.07 ->", grid.partition_valid(D("13.07"), D("5.4"), r))
+
+# A-03 original scenario via ledger
+h = Harness(r=rules(step="1", min_base="5", min_notional="0"))
+e = h.entry(); h.fill(e, "10"); h.ledger.confirm_terminal(e, D("10"))
+tighter = rules(step="1", min_base="5", min_notional="0", max_base="6")
+plan = h.ledger.tp_obligation_to_dispatch(tighter)
+print("A-03 ledger:", plan.quantities, plan.dust, h.ledger.refresh_dust(tighter))
+
+# A-01 exact scenario: gen0 entry 4 terminal, TP 4, released, late 1, ack, resolution TP partial fills
+h = Harness(BUY_CELL, r=rules(step="0.1", min_base="0.1", min_notional="0"))
+e0 = h.entry(); h.fill(e0, "4"); h.ledger.set_state(e0, OrderState.CANCEL_PENDING); h.ledger.set_state(e0, OrderState.TERMINAL_UNKNOWN)
+print("A-01 term", h.ledger.confirm_terminal(e0, D("4")))
+_, (tp0,) = h.dispatch_tps(); h.fill(tp0, "4"); h.ledger.confirm_terminal(tp0, D("4")); h.ledger.release(True)
+print("A-01 late", h.fill(e0, "1")[0])
+print("A-01 ack", h.ledger.acknowledge_late_evidence(0), h.ledger.check_invariants())
+_, (res,) = h.dispatch_tps()
+print("A-01 res partials", h.fill(res, "0.4")[0], h.fill(res, "0.6")[0], h.ledger.confirm_terminal(res, D("1")))
+print("A-01 after", h.ledger.check_invariants(), h.ledger.can_release(True).reasons, [c.late_evidence for c in h.ledger.cycles])
+print("A-01 next entry gen", h.ledger.next_entry_identity().generation)
+
+# A-08 exact scenario via CoreSim (cap drop to 1 with live entry partial fill)
+sim = CoreSim([BUY_CELL], cap=3, r=rules(min_base="5", min_notional="0"))
+sim.tick(); (entry,) = sim.non_final(); sim.fill(entry, D("5")); sim.rules = rules(min_base="5", min_notional="0", venue_cap=1)
+p = sim.tick()
+print("A-08 venue-cap drop:", p.submits, p.cancels, len(sim.non_final()), sim.last_admission.slots)

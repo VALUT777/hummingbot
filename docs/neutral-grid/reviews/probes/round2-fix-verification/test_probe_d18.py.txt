@@ -1,0 +1,36 @@
+from decimal import Decimal as D
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    EngineState, LegRole, CommandKind, OrderState, CommandStatus, Side)
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+def run(tmp_path, ws):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+        h.tick(8)
+        print("after manual trade", h.state, h.engine.reasons[:3])
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("4"), history_lag_s=30, ws=ws)
+        h.tick(6)
+        print("venue net", h.fx.net_position, "ws_pending", dict(h.engine.ws_pending))
+        h.command(CommandKind.BASELINE_AUDIT, {"observed_position": "11", "note": "audit"}, key="d-early")
+        h.tick()
+        rec = h.engine.store.get_command(idempotency_key="d-early")
+        print("ws=", ws, "audit:", rec.status.value, rec.result)
+        print("effective baseline", h.engine.effective_baseline)
+        h.tick(40)
+        print("after history: P", h.engine.endpoints.P, "venue", h.fx.net_position, h.state, h.engine.reasons[:3])
+    finally:
+        h.close()
+
+
+def test_ws(tmp_path):
+    run(tmp_path, True)
+
+
+def test_no_ws(tmp_path):
+    run(tmp_path, False)

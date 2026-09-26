@@ -1,0 +1,45 @@
+import asyncio, os, sqlite3, sys, tempfile
+from decimal import Decimal as D
+from unittest.mock import MagicMock
+REPO = "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid"
+sys.path.insert(0, REPO)
+tmp = tempfile.mkdtemp()
+os.environ["HUMMINGBOT_NEUTRAL_GRID_HOST_DIR"] = tmp + "/host"
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import EngineState, CommandStatus
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import NeutralGridExecutorConfig
+from hummingbot.strategy_v2.executors.neutral_grid_executor.engine import open_engine_store
+from hummingbot.strategy_v2.executors.neutral_grid_executor.executor import NeutralGridExecutor
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeClock, FakeExchange
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import FaultHooks
+
+clock = FakeClock()
+fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+strategy = MagicMock(); strategy.connectors = {}
+type(strategy).current_timestamp = property(lambda self: clock())
+cfg = NeutralGridExecutorConfig(connector_name="lighter_perpetual_robinhood", trading_pair="LIT-USDG", grid_id="g-exec",
+    lower_price=D("5"), upper_price=D("6"), cell_count=10, order_amount_base=D("10"), leverage=D("5"),
+    expected_initial_position=D("0"), max_abs_net_position=D("1000"), max_gross_position=D("1000"),
+    max_active_orders=120, enabled=True, db_path=tmp + "/ng.sqlite3", operator_confirmed_start=True,
+    operator_confirmed_baseline=True, timestamp=clock())
+hooks = FaultHooks()
+store = open_engine_store(tmp + "/ng.sqlite3", cfg.to_grid_config(fx.account_index), fx, lock_dir=tmp + "/locks",
+                          fault_hooks=hooks, clock=clock)
+ex = NeutralGridExecutor(strategy, cfg, port=fx, store=store, clock=clock)
+loop = asyncio.new_event_loop()
+def run(n):
+    for _ in range(n):
+        loop.run_until_complete(ex.control_task()); clock.advance(1.0)
+loop.run_until_complete(ex.on_start())
+run(25)
+print("state", ex.engine.engine_state, "open", len(fx.open_orders(owned=True)))
+hooks.fail_statement("INSERT INTO commands", sqlite3.OperationalError("database is locked"))
+try:
+    ex.early_stop()
+    print("early_stop returned")
+except Exception as e:
+    print("early_stop raised", type(e).__name__, e)
+run(200)
+stops = [c for c in ex.engine.store.list_commands(limit=50) if c.kind == "stop"] if not ex.engine.store.closed else "closed"
+print("after 200 ticks: state", ex.engine.engine_state, "stop_requested_ms", ex.engine.meta.stop_requested_ms,
+      "open owned orders", len(fx.open_orders(owned=True)), "stop rows", stops, "close_type", ex.close_type,
+      "keys", ex._stop_keys, "stop_sent", ex._stop_command_sent)

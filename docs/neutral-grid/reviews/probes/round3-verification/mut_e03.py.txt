@@ -1,0 +1,22 @@
+import os, inspect, textwrap
+MUT = os.environ.get("NG_MUT", "")
+
+
+def _patch(mod, cls, name, old, new):
+    fn = getattr(cls, name) if cls else getattr(mod, name)
+    src = textwrap.dedent(inspect.getsource(fn))
+    assert old in src, (name, old)
+    src = src.replace(old, new)
+    ns = {}
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__, ns)
+    setattr(cls or mod, name, ns[name])
+
+
+def pytest_configure(config):
+    if MUT == "web_outdated":
+        from web.neutral_grid import views as V
+        _patch(V, None, "health_view", "and now - at > stale_bound)", "and False)")
+    elif MUT == "engine_heartbeat":
+        from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+        _patch(E, E.NeutralGridEngine, "_write_health",
+               "and now - self._health_written_at < self.options.health_heartbeat_s):", "):")

@@ -1,0 +1,101 @@
+import dataclasses
+from decimal import Decimal as D
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    CommandKind, CommandStatus, EngineState, LegRole)
+
+ENTRY = LegRole.ENTRY
+FX = {"min_base": D("0.1"), "min_notional": D("0.1")}
+
+
+def _ack(h, key):
+    h.command(CommandKind.BASELINE_AUDIT, {"action": "ack_history_conflict", "note": "reviewed"}, key=key)
+    h.tick(3)
+    rec = h.engine.store.get_command(idempotency_key=key)
+    return rec.status.value, rec.result
+
+
+def test_a_never_committed_duplicate(tmp_path):
+    h = Harness(tmp_path, fx_kwargs=FX)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, ENTRY)
+        t1 = h.fx.fill(entry.cid, D("3"))
+        h.fx.inject_conflicting_trade(t1, D("1"), persistent=True)   # both versions in the first walk
+        h.tick(10)
+        print("\n[a] before ack:", h.state.value, h.engine.history_complete, h.engine.scanner.last_result.conflicts)
+        print("[a] ack:", _ack(h, "a1"))
+        h.tick(120)
+        print("[a] after 120:", h.state.value, h.engine.history_complete, h.engine.history_incomplete_reason,
+              h.engine.reasons[:4])
+        h.command(CommandKind.STOP, {"reason": "operator"}, key="stop")
+        h.tick(200)
+        print("[a] stop outcome:", h.engine.meta.stop_outcome, h.state.value)
+    finally:
+        h.close()
+
+
+def test_b_multi_version_noise_overwrite(tmp_path):
+    h = Harness(tmp_path, fx_kwargs=FX)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, ENTRY)
+        t1 = h.fx.fill(entry.cid, D("3"))
+        h.tick(6)
+        h.fx.inject_conflicting_trade(t1, D("1"), persistent=True)
+        h.tick(6)
+        print("\n[b] v1 conflict:", h.state.value, h.engine.history_complete)
+        print("[b] ack1:", _ack(h, "b1")[0], h.engine.meta.audited_payloads)
+        h.tick(10)
+        print("[b] after ack1:", h.state.value, h.engine.history_complete)
+        h.fx._conflicting_trades[t1] = D("4")
+        h.tick(6)
+        print("[b] v2 conflict:", h.state.value, h.engine.history_complete)
+        print("[b] ack2:", _ack(h, "b2")[0])
+        h.tick(10)
+        print("[b] after ack2:", h.state.value, h.engine.history_complete,
+              {k: {kk: len(vv['noise']) for kk, vv in v.items()} for k, v in h.engine.meta.audited_payloads.items()})
+        h.fx._conflicting_trades[t1] = D("1")                    # the version audited at ack1 comes back
+        h.tick(10)
+        print("[b] v1 again:", h.state.value, h.engine.history_complete, h.engine.history_incomplete_reason,
+              h.engine.reasons[:3])
+    finally:
+        h.close()
+
+
+def test_c_orders_stream_payload_change(tmp_path):
+    h = Harness(tmp_path, fx_kwargs=FX)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        entry = h.live_order(cell, ENTRY)
+        h.fx.fill(entry.cid, D("2"))
+        h.tick(4)
+        h.fx.venue_cancel(entry.cid)
+        h.tick(20)
+        leg = h.engine.leg_by_cid(entry.cid)
+        print("\n[c] entry:", leg.state.value, h.engine.history_complete)
+        original = h.fx._order_row
+        target = entry.cid
+
+        def changed(order, active=False):
+            row = original(order, active)
+            if row.client_order_id == target and not active:
+                row = dataclasses.replace(row, nonce=str(int(row.nonce) + 1),
+                                          raw_json=row.raw_json.replace('"nonce"', '"nonce_"'))
+            return row
+        h.fx._order_row = changed
+        h.tick(8)
+        print("[c] conflict:", h.state.value, h.engine.history_complete,
+              h.engine.scanner.last_result.conflicts if h.engine.scanner.last_result else None)
+        st, res = _ack(h, "c1")
+        print("[c] ack:", st, [(a["stream"], len(a["noise"])) for a in res.get("audited_payloads", [])])
+        h.tick(60)
+        print("[c] after:", h.state.value, h.engine.history_complete, h.engine.history_incomplete_reason)
+        h.command(CommandKind.STOP, {"reason": "operator"}, key="stop")
+        h.tick(200)
+        print("[c] stop outcome:", h.engine.meta.stop_outcome)
+    finally:
+        h.close()

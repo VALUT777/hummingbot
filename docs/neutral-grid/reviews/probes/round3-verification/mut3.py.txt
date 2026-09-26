@@ -1,0 +1,79 @@
+"""Scratch pytest plugin (verify3): in-memory mutation of NeutralGridEngine, selected by MUT3. Worktree untouched."""
+import inspect
+import os
+import textwrap
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+
+MUTATIONS = {
+    # D1-11 normal/blocked paths: no RESUME_PENDING_CANCEL
+    "d111_rr": ("_risk_reducing_cancels", [(
+        "elif leg.state == OrderState.CANCEL_PENDING and self._pending_cancel_outbox(leg.cid):", "elif False:")]),
+    # D1-11 stop branch
+    "d111_stop": ("_act", [(
+        "if leg.state in CANCELLABLE or self._cancel_retry_due(leg, now) or (\n"
+        "                    leg.state == OrderState.CANCEL_PENDING and self._pending_cancel_outbox(leg.cid)):",
+        "if leg.state in CANCELLABLE or self._cancel_retry_due(leg, now):")]),
+    # D1-11: blocked branch no longer runs risk-reducing cancels at all
+    "d111_blocked_branch": ("_act", [(
+        "            self._risk_reducing_cancels(cancels, now)\n            await self._dispatch_cancels(cancels, now)\n        return",
+        "            pass\n        return")]),
+    # D1-17: _settle uses the previous tick's flag
+    "d117": ("_settle", [(
+        "reconciled = self._position_reconciled_now(now)\n    self.position_reconciled = reconciled",
+        "reconciled = self.position_reconciled")]),
+    # D1-17 sub-guard: store entry blockers ignored at release
+    "d117_storeblk": ("_position_reconciled_now", [(
+        "and not self.store_entry_blockers", "")]),
+    # D1-17 sub-guard: fresh-for-ledger ordering ignored at release (position may predate the fill commit)
+    "d117_order": ("_position_fresh_for_ledger", [(
+        "and self.position_seq > self.fills_commit_seq)", ")")]),
+    # D2-07: only the position/fill order check removed
+    "d207_line": ("_audit_evidence_unsettled", [(
+        "if self.position_seq < self.fills_commit_seq:", "if False:")]),
+    # D2-18: active-row-ahead check removed
+    "d218_ahead": ("_audit_evidence_unsettled", [(
+        "if ahead:\n        reasons.append", "if False:\n        reasons.append")]),
+    # D2-18: settled-position check removed
+    "d218_settled": ("_audit_evidence_unsettled", [(
+        "if not self._position_settled_for_audit():", "if False:")]),
+    # D2-18: both round-3 checks removed
+    "d218_both": ("_audit_evidence_unsettled", [(
+        "if ahead:\n        reasons.append", "if False:\n        reasons.append"), (
+        "if not self._position_settled_for_audit():", "if False:")]),
+}
+
+
+def _apply(name, repls):
+    fn = getattr(E.NeutralGridEngine, name)
+    src = textwrap.dedent(inspect.getsource(fn))
+    for old, new in repls:
+        if old not in src:
+            raise RuntimeError(f"mutation anchor not found in {name}: {old!r}")
+        src = src.replace(old, new, 1)
+    ns = {}
+    exec(compile(src, f"<mut:{name}>", "exec"), E.__dict__, ns)
+    setattr(E.NeutralGridEngine, name, ns[name])
+
+
+for mut in filter(None, os.environ.get("MUT3", "").split(",")):
+    if mut == "d117b":
+        _apply(*MUTATIONS["d117"])
+
+        async def _noop(self, now):
+            return None
+        E.NeutralGridEngine._reread_position_for_release = _noop
+    elif mut == "d207_all":   # whole fills_commit_seq ordering neutralised inside the audit (old probe mutation)
+        orig = E.NeutralGridEngine._audit_evidence_unsettled
+
+        def patched(self, now, _orig=orig):
+            saved = self.fills_commit_seq
+            self.fills_commit_seq = -1
+            try:
+                return _orig(self, now)
+            finally:
+                self.fills_commit_seq = saved
+        E.NeutralGridEngine._audit_evidence_unsettled = patched
+    else:
+        _apply(*MUTATIONS[mut])
+    print(f"[mut3] applied {mut}")

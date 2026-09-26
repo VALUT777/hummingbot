@@ -1,0 +1,22 @@
+import sys
+from decimal import Decimal as D
+
+sys.path.insert(0, "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid/test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+from ng_engine_harness import Harness  # noqa: E402
+
+
+def test_foreign_market_trade_signal(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0"))
+        h.tick(3)
+        # An OrderFilledEvent of another trading pair on the same connector (executor forwards it unfiltered).
+        h.engine.wake({"type": "trade", "status": "filled", "client_order_id": "HBOT-other-pair-1",
+                       "trade_id": "987654321"})
+        h.tick(120)
+        print("history_complete", h.engine.history_complete, "lag_s", h.engine.history_lag_s(),
+              "pending", h.engine.ws_pending)
+        print("audit unsettled:", h.engine._audit_evidence_unsettled(h.clock()))
+        print("snapshot lag:", h.engine.last_snapshot["summary"]["history"].get("lag_s"))
+    finally:
+        h.close()

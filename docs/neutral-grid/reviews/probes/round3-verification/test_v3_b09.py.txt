@@ -1,0 +1,103 @@
+"""Round-3 re-verification probes for B-09 (scratch; read-only against the worktree)."""
+from decimal import Decimal
+
+import pytest
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    OrderState, TransportOutcome, TransportResult,
+)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
+    FaultHooks, InvalidTransitionError, SimulatedCrash, StoreError,
+)
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store.ng_store_support import (
+    GRID_ID, Env, FakeTransport, entry_leg, record_entry_intent, submit_via_protocol,
+)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import OrderTypePolicy
+
+
+@pytest.fixture
+def env(tmp_path):
+    return Env(tmp_path)
+
+
+@pytest.fixture
+def store(env):
+    s = env.open(fault_hooks=FaultHooks())
+    env.bootstrap(s)
+    return s
+
+
+def _crash_after_dispatch(store):
+    intent = record_entry_intent(store, cell_id=3)
+    store.fault_hooks.arm("before_transport")
+    with pytest.raises(SimulatedCrash):
+        submit_via_protocol(store, FakeTransport(), intent)
+    return intent
+
+
+@pytest.mark.parametrize("outcome", [TransportOutcome.NOT_SENT, TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL])
+def test_restart_dispatched_row_release_outcome(env, store, outcome):
+    intent = _crash_after_dispatch(store)
+    s2 = env.open()
+    with s2.transaction() as tx:
+        s2.record_transport_result(tx, intent.cid, TransportResult(outcome, "fabricated"))
+    leg = s2.leg(intent.cid)
+    assert leg.state == OrderState.SUBMIT_UNKNOWN, leg.state
+    assert [r.cid for r in s2.reservations()] == [intent.cid]
+    # new ENTRY CID for the same cell must still be refused
+    with pytest.raises(Exception) as caught:
+        with s2.transaction() as tx:
+            cell = s2.cell(GRID_ID, 3)
+            s2.prepare_submit(tx, entry_leg(3, 1, 1), side=cell.entry_side, price=cell.spec().entry_price,
+                              amount=intent.request.amount if hasattr(intent.request, "amount") else Decimal("10"),
+                              order_type=OrderTypePolicy.LIMIT_MAKER)
+    print("new entry refused:", type(caught.value).__name__, caught.value)
+
+
+def test_restart_then_resend_then_not_sent(env, store):
+    intent = _crash_after_dispatch(store)
+    s2 = env.open()
+    [row] = s2.unresolved_outbox()
+    with s2.transaction() as tx:
+        s2.mark_dispatching(tx, row.id, resend_same_cid=True)
+    with s2.transaction() as tx:
+        s2.record_transport_result(tx, intent.cid, TransportResult(TransportOutcome.NOT_SENT, "presend"))
+    assert s2.leg(intent.cid).state == OrderState.SUBMIT_UNKNOWN
+    assert [r.cid for r in s2.reservations()] == [intent.cid]
+
+
+def test_restart_leg_state_refinement_cannot_finalise(env, store):
+    """UNKNOWN + leg_state=REJECTED_ZERO_FILL / REJECTED_UNSENT refinement after restart."""
+    intent = _crash_after_dispatch(store)
+    s2 = env.open()
+    for target in (OrderState.REJECTED_UNSENT, OrderState.REJECTED_ZERO_FILL):
+        try:
+            with s2.transaction() as tx:
+                s2.record_transport_result(tx, intent.cid, TransportResult(TransportOutcome.UNKNOWN, "x"),
+                                           leg_state=target)
+        except Exception as exc:  # expected: refused
+            print("refinement", target, "refused:", type(exc).__name__, exc)
+    assert not s2.leg(intent.cid).final, s2.leg(intent.cid).state
+    assert [r.cid for r in s2.reservations()] == [intent.cid]
+
+
+def test_restart_set_leg_state_direct(env, store):
+    intent = _crash_after_dispatch(store)
+    s2 = env.open()
+    for target in (OrderState.REJECTED_UNSENT, OrderState.REJECTED_ZERO_FILL, OrderState.TERMINAL):
+        try:
+            with s2.transaction() as tx:
+                s2.set_leg_state(tx, intent.cid, target, reason="probe")
+        except Exception as exc:
+            print("set_leg_state", target, "refused:", type(exc).__name__, str(exc)[:120])
+    assert not s2.leg(intent.cid).final, s2.leg(intent.cid).state
+    assert [r.cid for r in s2.reservations()] == [intent.cid]
+
+
+def test_same_process_pre_send_still_releases(store):
+    intent = record_entry_intent(store, cell_id=3)
+    with store.transaction() as tx:
+        store.mark_dispatching(tx, intent.outbox_id)
+    with store.transaction() as tx:
+        store.record_transport_result(tx, intent.cid, TransportResult(TransportOutcome.NOT_SENT, "min"))
+    assert store.leg(intent.cid).state == OrderState.REJECTED_UNSENT

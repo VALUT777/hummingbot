@@ -1,0 +1,62 @@
+import asyncio
+import sys
+from pathlib import Path
+
+WT = "/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid"
+sys.path.insert(0, WT)
+sys.path.insert(0, WT + "/test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+
+import aiohttp  # noqa: E402
+from aiohttp.client_reqrep import RequestInfo  # noqa: E402
+from multidict import CIMultiDict, CIMultiDictProxy  # noqa: E402
+from yarl import URL  # noqa: E402
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.lighter_port import LighterExchangePort  # noqa: E402
+
+SECRET = "SECRET_LIGHTER_AUTH_TOKEN_abc123"
+
+
+def _content_type_error():
+    u = URL("https://mainnet.zklighter.elliot.ai/api/v1/accountActiveOrders").with_query(
+        {"account_index": "4242", "market_id": "5", "auth": SECRET})
+    ri = RequestInfo(u, "GET", CIMultiDictProxy(CIMultiDict()), u)
+    return aiohttp.ContentTypeError(ri, (), status=200,
+                                    message="Attempt to decode JSON with unexpected mimetype: application/octet-stream")
+
+
+class _StubConnector:
+    domain = "lighter_perpetual_robinhood"
+    account_index = 4242
+
+    async def fetch_active_orders(self, trading_pair):
+        raise _content_type_error()
+
+
+def test_port_propagates_raw_aiohttp_error_with_auth_token():
+    port = LighterExchangePort(_StubConnector(), "LIT-USDG")
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(port.active_orders())
+    except Exception as exc:  # noqa: BLE001
+        assert SECRET in str(exc), str(exc)
+    else:
+        raise AssertionError("no exception")
+    finally:
+        loop.close()
+
+
+def test_engine_puts_auth_token_into_committed_snapshot(tmp_path):
+    from ng_engine_harness import Harness
+    h = Harness(tmp_path)
+    try:
+        async def boom():
+            raise _content_type_error()
+        h.fx.active_orders = boom
+        h.tick(3)
+        snap = h.engine.latest_committed_snapshot()
+        text = repr(snap)
+        assert SECRET in text, "token not in snapshot"
+        msgs = [e["message"] for e in snap["errors"] if e["code"] == "ACTIVE_ORDERS_UNAVAILABLE"]
+        print(msgs[-1])
+    finally:
+        h.close()

@@ -1,0 +1,39 @@
+from decimal import Decimal as D
+from ng_engine_harness import Harness
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    EngineState, LegRole, CommandKind, OrderState, CommandStatus)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import SubmitBehavior
+
+ENTRY, TP = LegRole.ENTRY, LegRole.TP
+
+
+def test_probe(tmp_path):
+    h = Harness(tmp_path, fx_kwargs={"active_lag_s": 7.0})
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("10"))
+        h.fx.script_submit(SubmitBehavior.TIMEOUT_LANDED)
+        h.run_until(lambda: any(t.state == OrderState.SUBMIT_UNKNOWN for t in h.legs(cell, TP)), max_ticks=10)
+        tp = next(t for t in h.legs(cell, TP) if t.state == OrderState.SUBMIT_UNKNOWN)
+        t0 = h.clock()
+        print("dispatch at", t0, "venue open:", h.fx.order_by_cid(tp.cid).is_open)
+        results = []
+        for i in range(14):
+            key = f"res-{i}"
+            h.command(CommandKind.BASELINE_AUDIT, {"action": "resolve_unknown_submit", "cid": str(tp.cid), "note": "x"}, key=key)
+            h.tick()
+            rec = h.engine.store.get_command(idempotency_key=key)
+            results.append((round(h.clock() - t0, 1), rec.status.value, (rec.result or {}).get("detail") or (rec.result or {}).get("error")))
+            if rec.status == CommandStatus.APPLIED:
+                break
+        for r in results: print(r)
+        print("leg state", h.engine.leg_by_cid(tp.cid).state, "venue open", h.fx.order_by_cid(tp.cid).is_open)
+        h.tick(4)
+        tps_open = [o for o in h.fx.open_orders(owned=True) if h.engine.leg_by_cid(o.client_order_id) and h.engine.leg_by_cid(o.client_order_id).identity.cell_id == cell and h.engine.leg_by_cid(o.client_order_id).identity.role == TP]
+        print("open TP orders at venue for cell", [(o.client_order_id, o.amount if hasattr(o,'amount') else None) for o in tps_open])
+        print("state", h.state, h.engine.reasons)
+        h.tick(20)
+        print("after 20 ticks state", h.state, h.engine.reasons[:4])
+    finally:
+        h.close()

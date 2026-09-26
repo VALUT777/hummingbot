@@ -1,0 +1,60 @@
+"""verify3 probes for D2-18 variants (read-only; harness + FakeExchange + tmp SQLite)."""
+from decimal import Decimal as D
+
+import pytest
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    CommandKind, CommandStatus, LegRole, Side)
+
+ENTRY = LegRole.ENTRY
+
+
+def _audit_loop(h, n, prefix):
+    out = []
+    for i in range(n):
+        key = f"{prefix}{i}"
+        h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.fx.net_position), "note": "x"}, key=key)
+        h.tick()
+        rec = h.engine.store.get_command(idempotency_key=key)
+        out.append((i, rec.status.value, rec.result.get("error"), rec.result.get("reasons"),
+                    rec.result.get("new_effective_baseline")))
+        if rec.status == CommandStatus.APPLIED:
+            break
+    return out
+
+
+@pytest.mark.parametrize("qty,settle,lag", [("4", None, 30), ("10", None, 30), ("4", "0", 30), ("10", "0", 30),
+                                            ("4", None, 120), ("4", "0", 120)])
+def test_d218_variants_never_apply_before_history(tmp_path, qty, settle, lag):
+    kw = {} if settle is None else {"settlement_delay_s": D(settle)}
+    h = Harness(tmp_path, **kw)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+        h.tick(8)
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D(qty), history_lag_s=lag, ws=False)
+        out = _audit_loop(h, lag - 3, "a")
+        last = out[-1]
+        print(qty, settle, lag, last)
+        assert last[1] != "APPLIED", (qty, settle, lag, last, out[:3])
+        assert h.engine.effective_baseline == D("0")
+    finally:
+        h.close()
+
+
+def test_d218_eventually_applies_after_history(tmp_path):
+    """Liveness: once history delivers the fill, the audit is accepted with the correct baseline (7)."""
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        cell = h.buy_cells()[-1]
+        h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+        h.tick(8)
+        h.fx.fill(h.live_order(cell, ENTRY).cid, D("4"), history_lag_s=30, ws=False)
+        out = _audit_loop(h, 70, "b")
+        print(out[-1])
+        assert out[-1][1] == "APPLIED" and out[-1][4] == "7", out[-3:]
+    finally:
+        h.close()

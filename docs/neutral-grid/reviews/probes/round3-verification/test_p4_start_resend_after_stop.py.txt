@@ -1,0 +1,122 @@
+"""Probe P4: _track_start keeps re-sending the launcher (resume) START after Hummingbot asked the executor to stop.
+A STOP applied while the resumed durable stop is still STOPPING keeps stop_requested_ms, so the re-sent resume START
+matches it and clears the operator's newer stop."""
+import asyncio
+import importlib.util
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+ROOT = Path("/Users/mikhail/Documents/AI workshop/hummingbot-neutral-grid")
+sys.path.insert(0, str(ROOT))
+spec = importlib.util.spec_from_file_location("tng", ROOT / "test/controllers/generic/test_neutral_grid.py")
+tng = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tng)
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind  # noqa: E402
+from hummingbot.strategy_v2.executors.neutral_grid_executor.fake_exchange import FakeClock, FakeExchange  # noqa: E402
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import PersistenceError  # noqa: E402
+
+D = Decimal
+
+
+@pytest.fixture(autouse=True)
+def _host_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HUMMINGBOT_NEUTRAL_GRID_HOST_DIR", str(tmp_path / "ng-host"))
+
+
+def test_p4(tmp_path):
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    first = tng._executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(first.on_start())
+        tng._run(loop, first, clock, 25)
+        first.early_stop()
+        tng._run(loop, first, clock, 1)
+        meta = first.engine.meta
+        print("first: stop_ms", meta.stop_requested_ms, "outcome", meta.stop_outcome)
+        assert meta.stop_requested_ms is not None and meta.stop_outcome is None     # killed while STOPPING
+        stop_ms = meta.stop_requested_ms
+        first.engine.store._die()
+    finally:
+        loop.close()
+
+    second = tng._executor(tmp_path, clock, fx, operator_resume_stop_ms=stop_ms)
+    real = second._enqueue
+    calls = {"start": 0}
+
+    def flaky(kind, payload, key=None):
+        if kind == CommandKind.START and calls["start"] == 0:
+            calls["start"] += 1
+            raise PersistenceError("database is locked (SQLITE_BUSY past the busy timeout)")
+        return real(kind, payload, key=key)
+
+    second._enqueue = flaky
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(second.on_start())
+        second.early_stop()                                  # the operator stops Hummingbot right after launch
+        for i in range(30):
+            tng._run(loop, second, clock, 1)
+            if second.close_type is not None:
+                break
+        cmds = [(c.kind, c.idempotency_key, c.status.value, c.result) for c in
+                second.engine.store.list_commands(limit=20)]
+        print("commands:", cmds)
+        m = second.engine.meta
+        print("after: stop_ms", m.stop_requested_ms, "outcome", m.stop_outcome, "close_type", second.close_type,
+              "state", second.engine.engine_state)
+        assert m.stop_requested_ms is None and second.close_type is None, "stop held (no defect)"
+    finally:
+        if second.engine.store is not None and not second.engine.store.closed:
+            second.engine.store.close()
+        loop.close()
+
+
+def test_p4b_web_pause_queued_while_down(tmp_path):
+    """No injected failure: the c4 race (a web command queued while Hummingbot was down) + an HB stop at launch."""
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import NeutralGridStore
+    clock = FakeClock()
+    fx = FakeExchange(clock, domain="lighter_perpetual_robinhood")
+    first = tng._executor(tmp_path, clock, fx)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(first.on_start())
+        tng._run(loop, first, clock, 25)
+        first.early_stop()
+        tng._run(loop, first, clock, 1)
+        stop_ms = first.engine.meta.stop_requested_ms
+        assert stop_ms is not None and first.engine.meta.stop_outcome is None
+        first.engine.store._die()
+    finally:
+        loop.close()
+    client = NeutralGridStore.open_command_client(str(tmp_path / "ng.sqlite3"))
+    try:
+        eng = client.engine()
+        client.enqueue_command("web-pause-while-down", CommandKind.PAUSE, eng.config_revision, eng.engine_revision,
+                               {"reason": "clicked while Hummingbot was down"})
+    finally:
+        client.close()
+    second = tng._executor(tmp_path, clock, fx, operator_resume_stop_ms=stop_ms)
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(second.on_start())
+        second.early_stop()
+        for i in range(30):
+            tng._run(loop, second, clock, 1)
+            if second.close_type is not None:
+                break
+        cmds = [(c.kind, c.status.value) for c in second.engine.store.list_commands(limit=20)]
+        print("commands(newest first):", cmds)
+        m = second.engine.meta
+        print("after: stop_ms", m.stop_requested_ms, "outcome", m.stop_outcome, "close_type", second.close_type,
+              "state", second.engine.engine_state)
+        assert m.stop_requested_ms is None and second.close_type is None, "stop held (no defect)"
+    finally:
+        if second.engine.store is not None and not second.engine.store.closed:
+            second.engine.store.close()
+        loop.close()

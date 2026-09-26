@@ -1,0 +1,57 @@
+"""Round-3 re-verification probes for CR-1 (scratch)."""
+import asyncio
+import json
+import logging
+from decimal import Decimal
+
+import pytest
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.snapshot import format_status
+
+D = Decimal
+TOKEN = "SeCrEtToKeN0123456789abcdefXYZ"
+FORMS = {
+    "url": f"200, message='x', url='https://mainnet.zklighter.elliot.ai/api/v1/accountActiveOrders?account_index=4242&market_id=5&auth={TOKEN}'",
+    "dict": f"request failed params={{'account_index': 4242, 'auth': '{TOKEN}'}}",
+    "json": f'request failed body={{"auth": "{TOKEN}"}}',
+    "header": f"Authorization: Bearer {TOKEN}",
+    "bare_lighter": f"token 1790000000:4242:3:{TOKEN}",
+}
+ENDPOINTS = ["active_orders", "position", "trading_rules", "inactive_orders_page", "trades_page"]
+
+
+def _db_bytes(h) -> bytes:
+    return b"".join(p.read_bytes() for p in h.db_path.parent.glob(h.db_path.name + "*"))
+
+
+@pytest.mark.parametrize("form", list(FORMS))
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_engine_level_redaction(tmp_path, caplog, form, endpoint):
+    caplog.set_level(logging.DEBUG)
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0"))
+        h.tick(2)
+        leak = FORMS[form]
+        orig = getattr(h.fx, endpoint)
+
+        async def boom(*a, **k):
+            raise RuntimeError(leak)
+        setattr(h.fx, endpoint, boom)
+        h.tick(12, dt=2.0)
+        setattr(h.fx, endpoint, orig)
+        h.tick(2)
+        texts = {"snapshot": json.dumps(h.engine.last_snapshot, default=str),
+                 "errors": json.dumps(list(h.engine.errors), default=str),
+                 "status": format_status(h.engine.last_snapshot, now=h.clock()),
+                 "log": caplog.text,
+                 "health": json.dumps(h.engine.health(), default=str)}
+        leaked = [k for k, t in texts.items() if TOKEN in t]
+        if TOKEN.encode() in _db_bytes(h):
+            leaked.append("db")
+        seen = [e["message"] for e in h.engine.errors][-2:]
+        print(endpoint, form, "leaked:", leaked, "errors:", seen)
+        assert not leaked, (leaked, seen)
+    finally:
+        h.close()

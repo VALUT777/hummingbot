@@ -1,0 +1,91 @@
+"""Offline acceptance probe: contradictory durable client/exchange identities."""
+import asyncio
+import tempfile
+from pathlib import Path
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    TransportOutcome,
+    TransportResult,
+)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.history import HistoryScanner
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store.ng_store_support import (
+    Env,
+    FakeTransport,
+    record_entry_intent,
+    submit_via_protocol,
+    trade_row,
+)
+
+
+class OneTradePort:
+    """Minimal paginated port proving the scanner does not preguard durable mappings."""
+
+    domain = "lighter_perpetual_robinhood"
+    account_index = 7
+    market_id = 5
+
+    def __init__(self, row):
+        self.row = row
+
+    def request_weight(self, endpoint):
+        return 600 if endpoint == "trades" else 100
+
+    async def trades_page(self, cursor, limit=100):
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import HistoryPage
+        return HistoryPage([self.row], None, cursor)
+
+    async def inactive_orders_page(self, cursor, limit=100):
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import HistoryPage
+        return HistoryPage([], None, cursor)
+
+
+async def main():
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.history import InMemoryHistoryCursorView
+
+    with tempfile.TemporaryDirectory(prefix="ngprobe-dualid-") as raw_tmp:
+        env = Env(Path(raw_tmp))
+        store = env.open()
+        env.bootstrap(store)
+
+        intent_a = record_entry_intent(store, 1)
+        intent_b = record_entry_intent(store, 2)
+        numeric_exchange_id = str(2**53 + 901)
+
+        transport_a = FakeTransport()
+        transport_a.results.append(TransportResult(
+            TransportOutcome.ACCEPTED, "accepted-no-order-id", exchange_order_id=None))
+        transport_b = FakeTransport()
+        transport_b.results.append(TransportResult(
+            TransportOutcome.ACCEPTED, "accepted", exchange_order_id=numeric_exchange_id))
+        submit_via_protocol(store, transport_a, intent_a)
+        submit_via_protocol(store, transport_b, intent_b)
+
+        leg_a = store.leg(intent_a.cid)
+        contradictory = trade_row(
+            "9007199254741999",
+            intent_a.cid,
+            leg_a.side,
+            "1",
+            price=str(leg_a.price),
+            exchange_order_id=numeric_exchange_id,
+        )
+
+        scanner = HistoryScanner(OneTradePort(contradictory), InMemoryHistoryCursorView(
+            domain="lighter_perpetual_robinhood"), weight_budget=700)
+        scan = await scanner.scan()
+        print("scan", scan.complete, scan.conflicts, len(scan.new_trades))
+
+        with store.transaction() as tx:
+            result = store.apply_history_batch(tx, scan.new_trades)
+        print("store_conflicts", [(c.kind, c.detail) for c in result.conflicts])
+        print("applied", [(f.cid, f.own_exchange_order_id, str(f.size)) for f in result.new_fills])
+        print("A", store.leg(intent_a.cid).filled, store.order(intent_a.cid).exchange_order_id)
+        print("B", store.leg(intent_b.cid).filled, store.order(intent_b.cid).exchange_order_id)
+        print("same_exchange_id_rows", store._x(
+            "SELECT count(*) FROM orders WHERE exchange_order_id = ?", (numeric_exchange_id,)).fetchone()[0])
+        print("ledger_problems", store.verify_ledger())
+        store.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

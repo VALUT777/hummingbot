@@ -1,0 +1,60 @@
+"""Scratch pytest plugin: in-memory source mutation of NeutralGridEngine methods (worktree untouched)."""
+import inspect
+import os
+import textwrap
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+
+MUTATIONS = {
+    # C2 revert: scanner-withheld rows no longer map to cells / fail closed
+    "c2_all": ("_withheld_conflict_cells", [(
+        "rows = self.scanner.last_conflicted_rows\n", "rows = {}\n")]),
+    # C2 partial: unattributable rows no longer fail closed
+    "c2_unattr": ("_withheld_conflict_cells", [(
+        'unattributed = f"HISTORY_CONFLICT_UNATTRIBUTED:{stream}"', "pass")]),
+    # C2 partial: withheld cells are not added to the scoped blocks
+    "c2_scope": ("_scoped_tp_blocks", [(
+        "for cell_id, why in withheld.items():\n        blocked.setdefault(cell_id, why)",
+        "for cell_id, why in withheld.items():\n        pass")]),
+    # D1-02: per-order isolation removed (refusal aborts the tick as before)
+    "d102_iso": ("_reconcile_active", [(
+        "except InvalidTransitionError as exc:\n            refused = True",
+        "except ZeroDivisionError as exc:\n            refused = True")]),
+    # D1-02 / D2-04: recovery after refusal removed
+    "d204_norecover": ("_tick_body", [(
+        "await self._recover_after_refusal(now, self._phase)", "pass")]),
+    # D2-04: recovery keeps acting but commits nothing
+    "d204_nocommit": ("_recover_after_refusal", [(
+        "self._commit_snapshot(now)", "pass")]),
+    # D1-02: recovery does not act
+    "d102_noact": ("_recover_after_refusal", [(
+        "await self._act(now)", "pass")]),
+    # D1-16 full revert: no persist in the handler and no recovery (round-2 code)
+    "d116_full": ("_tick_body", [("self._persist_freeze(FREEZE_INVARIANT, detail)", "pass"),
+                                 ("await self._recover_after_refusal(now, self._phase)", "pass")]),
+    # D1-16: handler no longer persists the freeze in its own transaction
+    "d116_nopersist": ("_tick_body", [(
+        "self._persist_freeze(FREEZE_INVARIANT, detail)", "pass")]),
+}
+
+
+def _apply(name, repls):
+    fn = getattr(E.NeutralGridEngine, name)
+    src = textwrap.dedent(inspect.getsource(fn))
+    for old, new in repls:
+        if old not in src:
+            raise RuntimeError(f"mutation anchor not found in {name}: {old!r}")
+        src = src.replace(old, new, 1)
+    ns = {}
+    exec(compile(src, f"<mut:{name}>", "exec"), E.__dict__, ns)
+    setattr(E.NeutralGridEngine, name, ns[name])
+
+
+for mut in filter(None, os.environ.get("MUT", "").split(",")):
+    if mut == "d116_both":
+        _apply("_tick_body", MUTATIONS["d116_nopersist"][1])
+        _apply("_recover_after_refusal", [("self._reload()\n", "pass\n")])
+    else:
+        name, repls = MUTATIONS[mut]
+        _apply(name, repls)
+    print(f"[ngmut3] applied {mut}")

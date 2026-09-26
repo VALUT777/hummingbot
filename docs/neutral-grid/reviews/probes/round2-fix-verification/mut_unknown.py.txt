@@ -1,0 +1,22 @@
+# pytest plugin: mutation "UNKNOWN legs dropped from the risk endpoints"
+def pytest_configure(config):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import risk
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import OrderState
+    orig = risk.endpoints_from_ledgers
+    ZERO = risk.ZERO
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import Side
+    def mutated(baseline, ledgers, extra_open_legs=()):
+        buys = ZERO; sells = ZERO; unpaired = ZERO
+        legs = list(extra_open_legs)
+        for ledger in ledgers:
+            for cycle in ledger.cycles:
+                unpaired += abs(cycle.E - cycle.X)
+                for leg in cycle.legs:
+                    if leg.side == Side.BUY:
+                        buys += leg.filled
+                    else:
+                        sells += leg.filled
+                    if not leg.is_final and leg.state not in (OrderState.SUBMIT_UNKNOWN, OrderState.CANCEL_UNKNOWN):
+                        legs.append(risk.OpenLeg.from_leg(leg))
+        return risk.endpoints(baseline, buys, sells, legs, unpaired=unpaired)
+    risk.endpoints_from_ledgers = mutated

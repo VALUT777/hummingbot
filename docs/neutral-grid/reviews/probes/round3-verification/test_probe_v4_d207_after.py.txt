@@ -1,0 +1,40 @@
+"""verify3 probe: aftermath of the D2-07 unmatched-trade variant (audit applied on a read that predates a committed
+manual trade)."""
+from decimal import Decimal as D
+
+from ng_engine_harness import Harness
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import CommandKind, CommandStatus, Side
+
+
+def test_d207_manual_variant_aftermath(tmp_path):
+    h = Harness(tmp_path)
+    try:
+        h.bootstrap(D("0")); h.tick(2)
+        h.fx.manual_trade(Side.BUY, D("7"), D("5.4"))
+        h.tick(14)
+        for _ in range(10):
+            before = h.engine._last_account_poll_at
+            h.tick()
+            if h.engine._last_account_poll_at != before:
+                break
+        print("read", h.engine.position.net_base, "at", h.engine.position_at, "now", h.clock())
+        h.fx.manual_trade(Side.BUY, D("2"), D("5.4"))
+        h.tick()
+        inbox_before = [(r.id, r.stream, r.status) for r in h.engine.unmatched]
+        print("unmatched before audit", inbox_before, "blockers", h.engine.store_entry_blockers)
+        h.command(CommandKind.BASELINE_AUDIT, {"observed_position": str(h.engine.position.net_base), "note": "x"},
+                  key="k")
+        h.tick()
+        rec = h.engine.store.get_command(idempotency_key="k")
+        print("audit", rec.status.value, rec.result)
+        subs0 = sum(1 for c in h.fx.calls if c.kind == "submit")
+        for t in range(45):
+            h.tick()
+            if t % 5 == 0 or t == 44:
+                print(t, h.engine.engine_state.value, "B", h.engine.effective_baseline, "P", h.engine.endpoints.P,
+                      "venue", h.fx.net_position, "entry_blockers", h.engine.entry_blockers[:2],
+                      "submits", sum(1 for c in h.fx.calls if c.kind == "submit") - subs0,
+                      "store_blk", h.engine.store_entry_blockers[:1])
+    finally:
+        h.close()

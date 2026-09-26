@@ -1,0 +1,192 @@
+"""Read-only probes for batch B findings (scratch; not part of the repo)."""
+import contextlib
+from decimal import Decimal
+
+import pytest
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import (
+    OrderState, OrderTypePolicy, SubmitRequest, TransportOutcome, TransportResult,
+)
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
+    ConfigMutationError, FaultHooks, GridMigration, InvalidTransitionError, PersistenceError, SimulatedCrash,
+    CursorUpdate,
+)
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store.ng_store_support import (
+    BOOT_CUT_MS, GRID_ID, Env, FakeTransport, build_grid, entry_leg, fill_and_terminate, order_row,
+    record_entry_intent, submit_via_protocol, tp_leg, trade_row,
+)
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store.test_ng_store_review_fixes import (
+    _released_cell_with_late_fill, _tp, _live, _fill, _final_row, _apply,
+)
+
+
+@pytest.fixture
+def env(tmp_path):
+    return Env(tmp_path)
+
+
+@pytest.fixture
+def store(env):
+    s = env.open(fault_hooks=FaultHooks())
+    env.bootstrap(s)
+    return s
+
+
+def _migration():
+    prices, cells = build_grid(n=40)
+    return GridMigration(new_grid_id="grid-b", config_fingerprint="fp-5-6-40-10",
+                         config={"cell_count": 40}, lower_price=Decimal("5"), upper_price=Decimal("6"),
+                         order_amount_base=Decimal("10"), prices=prices, cells=cells, anchor=Decimal("5.4"),
+                         actor="operator", reason="probe")
+
+
+def test_probe_b09_restart_dispatched_row_not_sent(env, store):
+    """B-09 restart variant: DISPATCHED row left by a dead process (attempts=1), new process records NOT_SENT."""
+    intent = record_entry_intent(store, cell_id=3)
+    store.fault_hooks.arm("before_transport")
+    with pytest.raises(SimulatedCrash):
+        submit_via_protocol(store, FakeTransport(), intent)
+    s2 = env.open()
+    [row] = s2.unresolved_outbox()
+    print("row", row.status, row.attempts)
+    with s2.transaction() as tx:
+        s2.record_transport_result(tx, intent.cid, TransportResult(TransportOutcome.NOT_SENT, "fabricated"))
+    leg = s2.leg(intent.cid)
+    print("B09-restart leg state", leg.state, "reservations", [r.cid for r in s2.reservations()])
+    # report outcome; do not assert direction, just record
+    pytest.skip(f"RESULT leg={leg.state.value} reservations={[r.cid for r in s2.reservations()]}")
+
+
+def test_probe_b07_migrate_grid_refused_with_late_obligation(store):
+    _released_cell_with_late_fill(store)
+    with pytest.raises(ConfigMutationError) as caught:
+        store.migrate_grid(None, _migration())
+    print(caught.value.blockers)
+    # after audit, still refused (E != X)
+    store.record_manual_reconciliation(None, "op", "ok", {"x": 1},
+                                       resolved_conflict_ids=[c.id for c in store.open_conflicts()])
+    with pytest.raises(ConfigMutationError) as caught2:
+        store.migrate_grid(None, _migration())
+    assert any("obligation" in b for b in caught2.value.blockers)
+
+
+def test_probe_b07_conflict_only_blocks_migration(store):
+    """Unresolved conflict alone (no obligation) blocks migrate_grid."""
+    entry = _live(store, 3)
+    _fill(store, entry, "t-1", "2")
+    _fill(store, entry, "t-1", "3")  # payload mismatch conflict
+    blockers = store.grid_mutation_blockers()
+    assert any("conflict" in b for b in blockers)
+
+
+def test_probe_b10_late_fill_after_next_gen_open_then_standalone_tp(env, store):
+    """Late fill on gen1 after gen2 already open; audited; gen1 standalone TP allowed; gen3 refused until covered."""
+    transport = FakeTransport()
+    gen1 = _live(store, 5, transport)
+    _fill(store, gen1, "g1-e", "4")
+    with store.transaction() as tx:
+        store.apply_history_batch(tx, [_final_row(store, gen1, "4")])
+        store.set_leg_state(tx, gen1.cid, OrderState.TERMINAL, reason="canceled after 4")
+    tp1 = _tp(store, 5, 0, "4", transport=transport)
+    fill_and_terminate(store, tp1.cid, "g1-t", size=Decimal("4"), ts=BOOT_CUT_MS + 20_000)
+    with store.transaction() as tx:
+        store.close_cycle(tx, GRID_ID, 5, 1, "released")
+    gen2 = _live(store, 5, transport)
+    _fill(store, gen2, "g2-e", "10", ts=BOOT_CUT_MS + 30_000)
+    res = _fill(store, gen1, "g1-late", "2", ts=BOOT_CUT_MS + 40_000)
+    assert [c.kind for c in res.conflicts] and "LATE_FILL" in [c.kind for c in res.conflicts]
+    # unaudited: no TP for gen1
+    with pytest.raises(InvalidTransitionError):
+        _tp(store, 5, 1, "2", generation=1)
+    store.record_manual_reconciliation(None, "operator", "late fill", {"t": 1},
+                                       resolved_conflict_ids=[c.id for c in store.open_conflicts()])
+    # gen2 TP of 10 and gen1 TP of 2 separately
+    tp_g1 = _tp(store, 5, 1, "2", generation=1, transport=transport)
+    # over-cover refused
+    with pytest.raises(InvalidTransitionError):
+        _tp(store, 5, 2, "1", generation=1)
+    # cannot close gen2 and open gen3 while gen1 has E != X
+    tp_g2 = _tp(store, 5, 0, "10", generation=2, transport=transport)
+    fill_and_terminate(store, tp_g2.cid, "g2-t", size=Decimal("10"), ts=BOOT_CUT_MS + 60_000)
+    with store.transaction() as tx:
+        store.apply_history_batch(tx, [_final_row(store, gen2, "10", status="filled")])
+        store.set_leg_state(tx, gen2.cid, OrderState.TERMINAL, reason="filled")
+    with store.transaction() as tx:
+        store.close_cycle(tx, GRID_ID, 5, 2, "released")
+    with pytest.raises(InvalidTransitionError):
+        with store.transaction() as tx:
+            store.open_cycle(tx, GRID_ID, 5)
+    fill_and_terminate(store, tp_g1.cid, "g1-late-t", size=Decimal("2"), ts=BOOT_CUT_MS + 70_000)
+    assert store.open_conflicts() == []
+    with store.transaction() as tx:
+        assert store.open_cycle(tx, GRID_ID, 5).generation == 3
+
+
+def test_probe_b16_entry_amount_must_equal_planned(store):
+    with store.transaction() as tx:
+        store.open_cycle(tx, GRID_ID, 3)
+    cell = store.cell(GRID_ID, 3)
+    with pytest.raises(InvalidTransitionError):
+        with store.transaction() as tx:
+            store.prepare_submit(tx, entry_leg(3), side=cell.entry_side, price=cell.spec().entry_price,
+                                 amount=Decimal("20"), order_type=OrderTypePolicy.LIMIT_MAKER)
+    # allocations dict shape on ENTRY
+    with pytest.raises(InvalidTransitionError):
+        with store.transaction() as tx:
+            cid = store.allocate_cid(tx, entry_leg(3))
+            store.record_intent(tx, entry_leg(3), SubmitRequest(cid, cell.entry_side, cell.spec().entry_price,
+                                                                Decimal("10"), OrderTypePolicy.LIMIT_MAKER),
+                                allocations={1: Decimal("10")})
+
+
+def test_probe_b11_same_cell_other_side_price(store):
+    """Allocation to own cell but request price differs from fixed TP price is refused."""
+    _live(store, 5)
+    e = store.legs(cell_id=5)[0]
+    _fill(store, e, "e5", "10")
+    cycle = store.cycle(GRID_ID, 5, 1)
+    with pytest.raises(InvalidTransitionError):
+        with store.transaction() as tx:
+            cid = store.allocate_cid(tx, tp_leg(5))
+            store.record_intent(tx, tp_leg(5), SubmitRequest(cid, cycle.tp_side, cycle.tp_price + Decimal("0.0001"),
+                                                             Decimal("10"), OrderTypePolicy.LIMIT),
+                                allocations={1: Decimal("10")})
+
+
+def test_probe_b01_dispatched_resend_zero_fill_after_restart(env, store):
+    """UNKNOWN first attempt, restart, resend -> DEFINITIVE_REJECT_ZERO_FILL: stays unknown."""
+    t = FakeTransport()
+    t.results.append(TransportResult(TransportOutcome.UNKNOWN, "timeout"))
+    intent = record_entry_intent(store, cell_id=3)
+    submit_via_protocol(store, t, intent)
+    store.close()
+    s2 = env.open()
+    with s2.transaction() as tx:
+        s2.mark_dispatching(tx, intent.outbox_id, resend_same_cid=True)
+    with s2.transaction() as tx:
+        s2.record_transport_result(tx, intent.cid, TransportResult(TransportOutcome.DEFINITIVE_REJECT_ZERO_FILL, "dup"))
+    assert s2.leg(intent.cid).state == OrderState.SUBMIT_UNKNOWN
+    assert [r.cid for r in s2.reservations()] == [intent.cid]
+
+
+def test_probe_b15_same_cumulative_again(store):
+    """after resolved conflict at filled=4, venue row cannot change; trade dup with same payload is dedup."""
+    entry = _live(store, 3)
+    _apply(store, [_final_row(store, entry, "3")])
+    first = _fill(store, entry, "t-1", "4")
+    [conflict] = first.conflicts
+    store.record_manual_reconciliation(None, "operator", "checked", {"x": 1}, resolved_conflict_ids=[conflict.id])
+    assert store.entry_blockers() == []
+    second = _fill(store, entry, "t-2", "1", ts=BOOT_CUT_MS + 20_000)
+    assert [c.kind for c in store.open_conflicts()] == ["CUMULATIVE_EXCEEDS_ORDER"]
+
+
+def test_probe_b12_own_tp_terminal_then_dup(store):
+    """Non-aggregated TP: fills credit X, TERMINAL, duplicate refused."""
+    e = _live(store, 5)
+    _fill(store, e, "e5", "10")
+    t = FakeTransport()
+    tp = _tp(store, 5, 0, "10", transport=t)
+    fill_and_terminate(store, tp.cid, "tp5", size=Decimal("10"), ts=BOOT_CUT_MS + 30_000)
+    with pytest.raises(InvalidTransitionError):
+        _tp(store, 5, 1, "10")

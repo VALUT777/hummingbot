@@ -1,0 +1,76 @@
+"""Offline acceptance probe: attach-mode Start is independent of web keystore selection/unlock."""
+import asyncio
+import time
+from decimal import Decimal
+from types import SimpleNamespace
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor import grid as core_grid
+from test.web.neutral_grid.ngweb_fakes import FakeGateway, sample_config, sample_snapshot
+from web.neutral_grid.runtime import attach_context
+
+
+def engine_config_json():
+    cfg = sample_config(grid_id="ng-engine-grid", expected_initial_position=Decimal("330"))
+    data = {}
+    for name, value in cfg.__dict__.items():
+        if isinstance(value, Decimal):
+            data[name] = str(value)
+        elif hasattr(value, "value"):
+            data[name] = value.value
+        else:
+            data[name] = value
+    data["fingerprint"] = core_grid.config_fingerprint(cfg)
+    return data
+
+
+def attach_snapshot():
+    snap = sample_snapshot("BOOTSTRAPPING")
+    snap["reasons"] = ["AWAITING_START"]
+    snap["summary"].update(
+        started=False,
+        baseline=None,
+        bid="5.3999",
+        ask="5.4001",
+        engine_config=engine_config_json(),
+        runtime_rules={
+            "tick_size": "0.0001",
+            "size_step": "0.1",
+            "min_base": "5",
+            "min_notional": "10",
+            "max_base": "100000",
+            "max_leverage": "10",
+            "max_active_orders_venue": None,
+            "fetched_at": str(time.time()),
+            "max_age_s": "180",
+            "supports_limit": True,
+            "supports_post_only": True,
+        },
+    )
+    return snap
+
+
+async def main():
+    gateway = FakeGateway(attach_snapshot())
+    args = SimpleNamespace(host="127.0.0.1", stale_after=15.0, allowed_host=[])
+    ctx = attach_context(gateway, args, health_provider=lambda: {})
+    preview = await ctx.build_preview(config_revision=1, engine_revision=1)
+    print("keystore_status_before", ctx.keystore.status())
+    outcome = await ctx.commands.submit({
+        "kind": "start",
+        "idempotency_key": "locked-start-probe-0001",
+        "expected_config_revision": 1,
+        "expected_engine_revision": 1,
+        "payload": {
+            "expected_initial_position": "330",
+            "baseline_acknowledged": True,
+            "risk_acknowledged": True,
+            "preview_id": preview["preview_id"],
+        },
+    })
+    print("start_http", outcome.status)
+    print("command_status", outcome.body.get("command", {}).get("status"))
+    print("queued", [(row["kind"], row["status"]) for row in gateway.commands])
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,142 @@
+"""Scratch pytest plugin: applies one in-memory mutation (selected by NG_MUT) to the engine for mutation probes."""
+import os
+
+MUT = os.environ.get("NG_MUT", "")
+
+
+def pytest_configure(config):
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import executor as X
+    if MUT == "audit_seq":
+        orig = E.NeutralGridEngine._audit_evidence_unsettled
+
+        def patched(self, now):
+            saved = self.fills_commit_seq
+            self.fills_commit_seq = -1
+            try:
+                return orig(self, now)
+            finally:
+                self.fills_commit_seq = saved
+        E.NeutralGridEngine._audit_evidence_unsettled = patched
+    elif MUT == "no_pending_cancel":
+        E.NeutralGridEngine._pending_cancel_outbox = lambda self, cid: False
+    elif MUT == "no_track_stop":
+        X.NeutralGridExecutor._track_stop = lambda self: setattr(self, "_stop_command_sent", True) if self._stop_requested else None
+    elif MUT == "no_sticky":
+        orig_init = E.NeutralGridEngine.__init__
+
+        class _Drop(dict):
+            def setdefault(self, k, v=None):
+                return v
+
+            def __setitem__(self, k, v):
+                pass
+        def init(self, *a, **k):
+            orig_init(self, *a, **k)
+        E.NeutralGridEngine.__init__ = init
+        orig_reload = E.NeutralGridEngine._reload
+
+        def reload(self):
+            self._sticky_freezes = {}
+            self._sticky_meta = {}
+            return orig_reload(self)
+        E.NeutralGridEngine._reload = reload
+    elif MUT == "no_offtick":
+        E.NeutralGridEngine._off_tick = lambda self, price: None
+    elif MUT == "finish_stop_old":
+        from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import EngineState, OrderState
+        ZERO = E.ZERO
+
+        def fs(self, now):
+            if self.meta.stop_requested_ms is None:
+                return
+            open_legs = self.non_final_legs()
+            previous = self.meta.stop_outcome
+            if not open_legs and self.history_complete:
+                inventory = any(c.E != c.X or c.dust > 0 for ledger in self.cells.values() for c in ledger.cycles)
+                outcome = EngineState.STOPPED_WITH_INVENTORY if inventory else EngineState.STOPPED
+            elif any(leg.state in (OrderState.CANCEL_UNKNOWN, OrderState.SUBMIT_UNKNOWN) for leg in open_legs) or \
+                    now - self.meta.stop_requested_ms / 1000 > self.options.stop_uncertain_after_s:
+                outcome = EngineState.STOP_UNCERTAIN
+            else:
+                outcome = None
+            new_value = outcome.value if outcome is not None else None
+            if new_value != previous:
+                self.meta.stop_outcome = new_value
+                with self.store.transaction() as tx:
+                    self.store.kv_set(tx, "engine_meta", self.meta.to_json())
+        E.NeutralGridEngine._finish_stop = fs
+    elif MUT == "settle_delay_zero":
+        pass  # handled below via config
+    if MUT:
+        print(f"\n[mut_plugin] mutation {MUT} applied")
+
+
+def _extra_mutations():
+    from hummingbot.strategy_v2.executors.neutral_grid_executor import engine as E
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import LegRole, SubmitRequest
+    from hummingbot.strategy_v2.executors.neutral_grid_executor.store import PersistenceError
+    if MUT == "history_blockers_ignored":
+        orig = E.NeutralGridEngine._evaluate_state
+
+        def ev(self, now):
+            orig(self, now)
+            self.entry_blockers = [b for b in self.entry_blockers if not b.startswith("HISTORY_")]
+        E.NeutralGridEngine._evaluate_state = ev
+    elif MUT == "settle_delay_zero":
+        orig = E.evaluate_terminal_release
+
+        def etr(**kw):
+            kw["settlement_delay_s"] = 0
+            return orig(**kw)
+        E.evaluate_terminal_release = etr
+    elif MUT == "send_without_intent":
+        orig_commit = E.NeutralGridEngine._commit_intent
+        orig_act = E.NeutralGridEngine._act
+
+        def commit(self, ledger, role, generation, qty, now, **kw):
+            try:
+                return orig_commit(self, ledger, role, generation, qty, now, **kw)
+            except PersistenceError:
+                spec = ledger.spec
+                side, price = (spec.entry_side, spec.entry_price) if role == LegRole.ENTRY else (spec.tp_side, spec.tp_price)
+                self._leak = getattr(self, "_leak", []) + [SubmitRequest(
+                    client_order_id=987654321, side=side, price=price, amount=qty,
+                    order_type=self.config.tp_order_type, reduce_only=False, expiry_ms=None)]
+                raise
+
+        async def act(self, now):
+            self._leak = []
+            try:
+                await orig_act(self, now)
+            finally:
+                for req in self._leak:
+                    await self.port.submit(req)
+        E.NeutralGridEngine._commit_intent = commit
+        E.NeutralGridEngine._act = act
+    elif MUT == "send_despite_mark_failure":
+        orig = E.NeutralGridEngine._dispatch_intent
+
+        async def di(self, cid, outbox_id, req):
+            try:
+                await orig(self, cid, outbox_id, req)
+            except PersistenceError:
+                await self.port.submit(req)
+                raise
+        E.NeutralGridEngine._dispatch_intent = di
+    elif MUT == "cancel_without_intent":
+        orig = E.NeutralGridEngine._dispatch_cancels
+
+        async def dc(self, cancels, now):
+            try:
+                await orig(self, cancels, now)
+            except PersistenceError:
+                for cid in cancels:
+                    leg = self.leg_by_cid(cid)
+                    await self.port.cancel(cid, leg.exchange_order_id)
+                raise
+        E.NeutralGridEngine._dispatch_cancels = dc
+
+
+def pytest_sessionstart(session):
+    _extra_mutations()

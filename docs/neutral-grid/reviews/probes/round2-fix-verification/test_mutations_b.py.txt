@@ -1,0 +1,72 @@
+"""Scratch mutation checks: patch a fix out in memory and confirm the named regression test fails."""
+import contextlib
+
+import pytest
+
+from hummingbot.strategy_v2.executors.neutral_grid_executor import store as store_mod
+from hummingbot.strategy_v2.executors.neutral_grid_executor.store import FaultHooks, NeutralGridStore
+from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import TransportOutcome
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store import test_ng_store_review_fixes as rf
+from test.hummingbot.strategy_v2.executors.neutral_grid_executor.store.ng_store_support import Env
+
+
+def _store(tmp_path):
+    env = Env(tmp_path)
+    s = env.open(fault_hooks=FaultHooks())
+    env.bootstrap(s)
+    return env, s
+
+
+def _expect_fail(fn):
+    try:
+        fn()
+    except BaseException as exc:  # noqa
+        return f"FAILS as expected: {type(exc).__name__}"
+    raise AssertionError("regression test still passes with the fix reverted")
+
+
+def test_mut_b13_no_poison(tmp_path, monkeypatch):
+    @contextlib.contextmanager
+    def scope(self, tx):
+        if tx is None:
+            with self.transaction() as own:
+                yield own
+            return
+        yield self._check_tx(tx)
+    monkeypatch.setattr(NeutralGridStore, "_scope", scope)
+    env, s = _store(tmp_path)
+    print(_expect_fail(lambda: rf.test_review6_any_store_error_after_writes_poisons_the_transaction(s)))
+
+
+def test_mut_b01_release_blocker_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(NeutralGridStore, "_release_blocker", lambda self, e, l, o: None)
+    env, s = _store(tmp_path)
+    print(_expect_fail(lambda: rf.test_review4_release_outcome_on_a_resend_keeps_unknown_and_reservation(
+        s, TransportOutcome.NOT_SENT)))
+    env2, s2 = _store(tmp_path / "b")
+    print(_expect_fail(lambda: rf.test_review4_not_sent_after_venue_evidence_does_not_release(s2)))
+
+
+def test_mut_b10_open_cycle_ignores_late(tmp_path, monkeypatch):
+    orig = NeutralGridStore.open_cycle
+    def open_cycle(self, tx, grid_id, cell_id, planned_amount=None):
+        real = self.late_obligation_cycles
+        self.late_obligation_cycles = lambda grid_id=None: []
+        try:
+            return orig(self, tx, grid_id, cell_id, planned_amount)
+        finally:
+            del self.late_obligation_cycles
+    monkeypatch.setattr(NeutralGridStore, "open_cycle", open_cycle)
+    env, s = _store(tmp_path)
+    print(_expect_fail(lambda: rf.test_review2_late_fill_on_released_cycle_is_an_outstanding_obligation(env, s)))
+
+
+def test_mut_b07_blockers_open_only(tmp_path, monkeypatch):
+    orig = NeutralGridStore._cycles
+    def cycles(self, where, params):
+        if where == "grid_id = ?":
+            return orig(self, "grid_id = ? AND state = 'OPEN'", params)
+        return orig(self, where, params)
+    monkeypatch.setattr(NeutralGridStore, "_cycles", cycles)
+    env, s = _store(tmp_path)
+    print(_expect_fail(lambda: rf.test_review2_late_fill_on_released_cycle_is_an_outstanding_obligation(env, s)))

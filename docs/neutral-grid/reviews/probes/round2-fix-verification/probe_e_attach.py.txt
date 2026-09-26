@@ -1,0 +1,39 @@
+import asyncio, sys, tempfile, types
+from pathlib import Path
+from decimal import Decimal
+sys.path.insert(0, "test/hummingbot/strategy_v2/executors/neutral_grid_executor/engine")
+sys.path.insert(0, "test/web/neutral_grid")
+from ng_engine_harness import Harness, start_payload
+from web.neutral_grid.gateway import StoreGateway
+from web.neutral_grid.runtime import engine_config_from_snapshot, snapshot_market, engine_identity_view
+from web.neutral_grid.preview import PreviewService
+from web.neutral_grid.commands import CommandService
+from web.neutral_grid.views import snapshot_revisions
+
+tmp = Path(tempfile.mkdtemp(dir="/private/tmp/claude-501/-Users-mikhail/ed31a3df-55bd-475b-8111-912d06f80d1d/scratchpad/verify"))
+h = Harness(tmp, expected_initial_position=Decimal("0"), order_amount_base=Decimal("20"), grid_id="engine-real-grid")
+try:
+    h.tick(5)
+    gw = StoreGateway.open(h.db_path)
+    snap = gw.latest_snapshot()
+    print("state", snap["engine_state"], snap["reasons"], "started", snap["summary"].get("started"))
+    cfg, fp = engine_config_from_snapshot(snap)
+    print("parsed cfg == engine cfg:", cfg == h.config, cfg.grid_id, cfg.order_amount_base)
+    rr = snap["summary"]["runtime_rules"]
+    print("rr", {k: (v, type(v).__name__) for k, v in rr.items()})
+    def config_source():
+        try:
+            return engine_config_from_snapshot(gw.latest_snapshot())[0], None
+        except ValueError as e:
+            return None, str(e)
+    market = snapshot_market(gw, config_source, 60.0, clock=h.clock)
+    prev = PreviewService(config_source, market, mode="attach")
+    cr, er = snapshot_revisions(gw.latest_snapshot())
+    p = asyncio.get_event_loop().run_until_complete(prev.build(config_revision=cr, engine_revision=er))
+    print("preview errors", p["errors"], "can_start", p["can_start"], "Q", p["config"]["order_amount_base"], "grid", p["config"]["grid_id"])
+    print("rules_fetched_at", p["rules_fetched_at"], "committed_at", snap["committed_at"])
+    # errors timestamps type from real store
+    print("errors field", snap.get("errors")[:2] if snap.get("errors") else snap.get("errors"))
+    gw.close()
+finally:
+    h.close()

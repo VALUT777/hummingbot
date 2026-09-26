@@ -1,0 +1,15 @@
+import sys, unittest
+sys.path.insert(0, ".")
+conn = "test.hummingbot.connector.derivative.lighter_perpetual.test_lighter_perpetual_history_pagination.LighterHistoryPaginationTest"
+scan = "test.hummingbot.strategy_v2.executors.neutral_grid_executor.history.test_ng_history_scanner"
+names = [f"{conn}.test_ac56_timeout_not_found_and_errors_are_unknown_and_never_retry_with_new_cid",
+         f"{conn}.test_cancel_all_and_generic_cancel_never_touch_cid_orders",
+         f"{conn}.test_restored_cid_orders_stay_excluded_from_polling_lost_orders_and_resend",
+         f"{conn}.test_released_cid_is_refused_for_process_lifetime_and_stays_unpolled",
+         f"{scan}.ConflictWithholdingTest",
+         f"{scan}.HistoryScannerTest.test_ac12_bad_pagination_makes_history_incomplete",
+         f"{scan}.HistoryScannerTest.test_ac40_trades_exceeding_terminal_order_cumulative_is_conflict"]
+loader = unittest.TestLoader(); suite = unittest.TestSuite()
+for n in names: suite.addTests(loader.loadTestsFromName(n))
+res = unittest.TextTestRunner(verbosity=0, stream=open("/dev/null", "w")).run(suite)
+print("baseline failures/errors/run:", len(res.failures), len(res.errors), res.testsRun)
