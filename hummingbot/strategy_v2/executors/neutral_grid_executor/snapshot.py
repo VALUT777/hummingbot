@@ -125,8 +125,14 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
         "P_min": _s(ep.P_min) if ep else None,
         "P_max": _s(ep.P_max) if ep else None,
         "gross_worst": _s(ep.gross_worst) if ep else None,
-        "max_abs_net_position": str(engine.config.max_abs_net_position),
-        "max_gross_position": str(engine.config.max_gross_position),
+        "long_entry_worst": _s(ep.long_entry_worst) if ep else None,
+        "short_entry_worst": _s(ep.short_entry_worst) if ep else None,
+        "directional_gross_limits_active": engine.directional_gross_limits_active,
+        "directional_gross_limits_requested": engine.config.directional_gross_limits,
+        "max_abs_net_position": str(engine.max_abs_net_position_active),
+        "max_gross_position": str(engine.max_gross_position_active),
+        "max_abs_net_position_requested": str(engine.config.max_abs_net_position),
+        "max_gross_position_requested": str(engine.config.max_gross_position),
         "leverage": str(engine.config.leverage),
         "anchor": _s(engine.grid_record.anchor) if engine.grid_record is not None else None,
         "lower_price": str(engine.config.lower_price),
@@ -178,7 +184,8 @@ def build_summary(engine, now: float) -> Dict[str, Any]:
         },
         # exactly the GridConfig the engine runs (decimals as strings) + the core fingerprint (W2)
         "engine_config": dict(grid_config_to_json(engine.config), fingerprint=engine.fingerprint,
-                              directional_outside_bounds_entries=engine.config.directional_outside_bounds_entries),
+                              directional_outside_bounds_entries=engine.config.directional_outside_bounds_entries,
+                              directional_gross_limits=engine.config.directional_gross_limits),
         "dust_total": str(dust_total),
         "freezes": dict(engine.meta.freezes),
         # web D2-17 gates (the engine re-verifies at apply time)
@@ -307,8 +314,13 @@ def format_status(snapshot: Optional[Dict[str, Any]], *, stale_after_s: float = 
         lines.append("  reasons: " + ", ".join(snapshot["reasons"]))
     lines.append(f"  baseline {s['baseline']} (effective {s['effective_baseline']}) | venue net "
                  f"{s['authoritative_net']} | ledger net {s['ledger_net']} | P_min {s['P_min']} P_max {s['P_max']}")
-    lines.append(f"  gross worst {s['gross_worst']} / cap {s['max_gross_position']} | net cap "
-                 f"±{s['max_abs_net_position']} | anchor {s['anchor']} | bid {s['bid']} ask {s['ask']}")
+    if s["directional_gross_limits_active"]:
+        lines.append(f"  directional gross long {s['long_entry_worst']} / {s['max_gross_position']} short "
+                     f"{s['short_entry_worst']} / {s['max_gross_position']} | aggregate {s['gross_worst']} info | "
+                     f"net cap ±{s['max_abs_net_position']} | anchor {s['anchor']} | bid {s['bid']} ask {s['ask']}")
+    else:
+        lines.append(f"  gross worst {s['gross_worst']} / cap {s['max_gross_position']} | net cap "
+                     f"±{s['max_abs_net_position']} | anchor {s['anchor']} | bid {s['bid']} ask {s['ask']}")
     h = s["history"]
     lines.append(f"  history complete={h['complete']} reason={h['incomplete_reason']} lag={h['lag_s']}s "
                  f"last_full_scan={h['last_full_scan_at']} weight60s={h['weight_used_60s']}")

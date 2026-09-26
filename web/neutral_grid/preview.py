@@ -172,8 +172,21 @@ class PreviewService:
             warnings.append(f"Достижимый диапазон [{p_min}, {p_max}] выходит за лимит ±{cap}: движок будет "
                             "отклонять входы, которые могут вывести позицию за лимит (AC-24/25).")
         gross_worst = gp.gross_worst
-        within_gross = None if gross_worst is None else gross_worst <= cfg.max_gross_position
-        if within_gross is False:
+        directional_gross = cfg.directional_gross_limits
+        long_entry_worst = q * gp.buy_cells if cells else None
+        short_entry_worst = q * gp.sell_cells if cells else None
+        within_long = None if long_entry_worst is None else long_entry_worst <= cfg.max_gross_position
+        within_short = None if short_entry_worst is None else short_entry_worst <= cfg.max_gross_position
+        within_gross = (None if directional_gross or gross_worst is None
+                        else gross_worst <= cfg.max_gross_position)
+        if directional_gross:
+            if within_long is False:
+                warnings.append(f"Худший long вход {long_entry_worst} больше лимита "
+                                f"на направление {cfg.max_gross_position}: часть BUY-ячеек будет отклонена.")
+            if within_short is False:
+                warnings.append(f"Худший short вход {short_entry_worst} больше лимита "
+                                f"на направление {cfg.max_gross_position}: часть SELL-ячеек будет отклонена.")
+        elif within_gross is False:
             warnings.append(f"Худший gross {gross_worst} больше лимита {cfg.max_gross_position}: часть ячеек "
                             "не сможет открыть цикл одновременно.")
         if cells and gp.queued:
@@ -225,7 +238,20 @@ class PreviewService:
             },
             "reachable": {"P_min": _s(p_min), "P_max": _s(p_max), "net_cap": _s(cap), "within_cap": within_net,
                           "baseline_used": _s(baseline_used)},
-            "gross": {"worst": _s(gross_worst), "cap": _s(cfg.max_gross_position), "within_cap": within_gross},
+            "gross": ({"worst": _s(gross_worst), "cap": _s(cfg.max_gross_position),
+                       "within_cap": within_gross, "informational": True}
+                      if directional_gross else
+                      {"worst": _s(gross_worst), "cap": _s(cfg.max_gross_position),
+                       "within_cap": within_gross}),
+            "directional_gross": ({
+                "active": True,
+                "long_entry_worst": _s(long_entry_worst),
+                "short_entry_worst": _s(short_entry_worst),
+                "cap_each": _s(cfg.max_gross_position),
+                "long_within_cap": within_long,
+                "short_within_cap": within_short,
+                "source": "full_grid_advisory",
+            } if directional_gross else {"active": False}),
             "leverage": {"configured": _s(cfg.leverage),
                          "venue_max": _s(rules.max_leverage) if rules is not None else None},
             "notional": {

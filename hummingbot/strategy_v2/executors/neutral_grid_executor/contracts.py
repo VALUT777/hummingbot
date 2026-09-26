@@ -134,6 +134,7 @@ class GridConfig:
     tp_gtt_seconds: int = 28 * 24 * 3600
     enabled: bool = False
     directional_outside_bounds_entries: bool = False
+    directional_gross_limits: bool = False
 
     def fingerprint(self) -> str:
         """Stable identity of grid dimensions (bounds, N, Q, pair, account). Implemented by core."""

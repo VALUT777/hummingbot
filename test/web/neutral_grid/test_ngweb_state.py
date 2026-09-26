@@ -104,6 +104,60 @@ async def test_summary_gauges_are_computed_server_side_as_strings(make_web):
 
 
 @pytest.mark.asyncio
+async def test_directional_gross_gauges_use_each_cap_and_keep_sum_informational(make_web):
+    snap = sample_snapshot("NORMAL")
+    snap["summary"].update({
+        "directional_gross_limits_active": True,
+        "long_entry_worst": "500",
+        "short_entry_worst": "600",
+        "gross_worst": "1100",
+        "max_gross_position": "1000",
+    })
+    web = await make_web(snap)
+    await web.login()
+
+    summary = _strict_json(await (await web.get("/api/state")).text())["summary"]
+
+    assert summary["gauges"]["long_entry"] == {"pct": "50.0", "breach": "no"}
+    assert summary["gauges"]["short_entry"] == {"pct": "60.0", "breach": "no"}
+    assert summary["gauges"]["gross"] is None
+    assert summary["gross_worst"] == "1100"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, "", "unknown", True, "NaN", "Infinity"])
+async def test_directional_gross_unknown_metrics_do_not_render_as_zero(make_web, bad):
+    snap = sample_snapshot("NORMAL")
+    snap["summary"].update({
+        "directional_gross_limits_active": True,
+        "long_entry_worst": bad,
+        "short_entry_worst": "600",
+    })
+    web = await make_web(snap)
+    await web.login()
+
+    gauges = _strict_json(await (await web.get("/api/state")).text())["summary"]["gauges"]
+
+    assert gauges["long_entry"] is None
+    assert gauges["short_entry"] == {"pct": "60.0", "breach": "no"}
+    assert gauges["gross"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_flag", [None, "true", 1])
+async def test_malformed_directional_mode_is_unknown_not_legacy(make_web, bad_flag):
+    snap = sample_snapshot("NORMAL")
+    snap["summary"]["directional_gross_limits_active"] = bad_flag
+    web = await make_web(snap)
+    await web.login()
+
+    gauges = _strict_json(await (await web.get("/api/state")).text())["summary"]["gauges"]
+
+    assert gauges["directional_mode"] == "unknown"
+    assert gauges["gross"] is None
+
+
+@pytest.mark.asyncio
 async def test_ids_beyond_js_safe_range_survive_as_exact_strings(make_web):
     snap = sample_snapshot("NORMAL")
     huge = (1 << 63) + 5

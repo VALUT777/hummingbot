@@ -3,6 +3,7 @@ import unittest
 
 from hummingbot.strategy_v2.executors.neutral_grid_executor import grid
 from hummingbot.strategy_v2.executors.neutral_grid_executor.contracts import OrderTypePolicy, Side
+from hummingbot.strategy_v2.executors.neutral_grid_executor.data_types import grid_config_from_json, grid_config_to_json
 from hummingbot.strategy_v2.executors.neutral_grid_executor.grid import GridValidationError
 
 from .helpers import D, config, rules
@@ -167,6 +168,14 @@ class TestValidateConfig(unittest.TestCase):
         self.assertNotEqual(a, grid.config_fingerprint(config(cell_count=54)))
         self.assertNotEqual(a, grid.config_fingerprint(config(upper_price=D("6.1"))))
         self.assertEqual(a, config().fingerprint())                    # contracts.GridConfig delegates here
+
+    def test_directional_gross_false_preserves_legacy_json_and_true_round_trips(self):
+        legacy = grid_config_to_json(config())
+        self.assertNotIn("directional_gross_limits", legacy)
+        self.assertFalse(grid_config_from_json(legacy).directional_gross_limits)
+        enabled = grid_config_to_json(config(directional_gross_limits=True))
+        self.assertIs(enabled["directional_gross_limits"], True)
+        self.assertTrue(grid_config_from_json(enabled).directional_gross_limits)
 
 
 class TestPreview(unittest.TestCase):

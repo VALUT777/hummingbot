@@ -116,6 +116,7 @@ from hummingbot.strategy_v2.executors.neutral_grid_executor.store import (
     Reservation,
     StoreClosedError,
     StoreError,
+    StoreIntegrityError,
     order_dedupe_key as b_order_key,
 )
 
@@ -373,7 +374,13 @@ class NeutralGridEngine:
         self.options = options or EngineOptions()
         self.offline_demo = offline_demo
         self.store = store
-        self.limits = risk.RiskLimits(config.max_abs_net_position, config.max_gross_position)
+        if type(config.directional_gross_limits) is not bool:
+            raise ValueError("directional_gross_limits must be a bool")
+        self.directional_gross_limits_active = False
+        self.risk_policy_review_required = False
+        self.max_abs_net_position_active = config.max_abs_net_position
+        self.max_gross_position_active = config.max_gross_position
+        self.limits = risk.RiskLimits(config.max_abs_net_position, config.max_gross_position, False)
         self.fingerprint = grid.config_fingerprint(config)
         self.fatal_reason = fatal_reason if (fatal_reason or store is not None) else "NO_STORE"
         # ---------------- durable model (projection of the store) ----------------
@@ -532,6 +539,29 @@ class NeutralGridEngine:
         if not self.bootstrapped:
             return
         self.grid_record = s.grid()
+        persisted_config = s.config_payload()
+        persisted_policy = persisted_config.get("directional_gross_limits", False)
+        if type(persisted_policy) is not bool:
+            raise StoreIntegrityError("persisted directional_gross_limits must be a bool")
+        persisted_limits = []
+        for name in ("max_abs_net_position", "max_gross_position"):
+            raw = persisted_config.get(name)
+            if isinstance(raw, (bool, float)):
+                raise StoreIntegrityError(f"persisted {name} must be an exact positive decimal")
+            try:
+                value = Decimal(str(raw))
+            except ArithmeticError:
+                raise StoreIntegrityError(f"persisted {name} must be an exact positive decimal") from None
+            if not value.is_finite() or value <= ZERO:
+                raise StoreIntegrityError(f"persisted {name} must be an exact positive decimal")
+            persisted_limits.append(value)
+        self.directional_gross_limits_active = persisted_policy
+        self.max_abs_net_position_active, self.max_gross_position_active = persisted_limits
+        self.risk_policy_review_required = persisted_policy != self.config.directional_gross_limits or \
+            self.max_abs_net_position_active != self.config.max_abs_net_position or \
+            self.max_gross_position_active != self.config.max_gross_position
+        self.limits = risk.RiskLimits(self.max_abs_net_position_active, self.max_gross_position_active,
+                                      persisted_policy)
         if self.grid_record.fingerprint != self.fingerprint:
             self.meta.freezes[FREEZE_CONFIG_MISMATCH] = "running grid dimensions/Q differ from config (AC-52)"
         self._rebuild_ledgers()
@@ -1063,9 +1093,29 @@ class NeutralGridEngine:
                     "error": "DURABLE_STOP_ACTIVE", "stop_requested_ms": self.meta.stop_requested_ms,
                     "latest_stop_ms": latest_stop, "stop_outcome": self.meta.stop_outcome,
                     "detail": "an explicit operator START or a launcher resume naming the latest stop is required"})
+            policy_revision = None
+            if self.risk_policy_review_required:
+                if payload.get("source") == "launcher":
+                    return CommandOutcome(CommandStatus.REJECTED, {
+                        "error": "RISK_POLICY_REVIEW_REQUIRED",
+                        "detail": "directional gross policy changes require an explicit reviewed operator START"})
+                source_config = dict(self.store.config_payload())
+                target_config = grid_config_to_json(self.config)
+                source_compare, target_compare = dict(source_config), dict(target_config)
+                source_compare.setdefault("directional_gross_limits", False)
+                target_compare.setdefault("directional_gross_limits", False)
+                changes = {name for name in set(source_compare) | set(target_compare)
+                           if source_compare.get(name) != target_compare.get(name)}
+                if changes != {"directional_gross_limits"}:
+                    return CommandOutcome(CommandStatus.REJECTED, {
+                        "error": "RISK_POLICY_CONFIG_CHANGE_FORBIDDEN", "changes": sorted(changes)})
+                policy_revision = self.store.record_config_revision(
+                    tx, target_config, self.fingerprint, "operator-reviewed-start",
+                    "reviewed directional gross risk policy change")
             rebind = False
             if self.meta.started and self.meta.stop_requested_ms is None:
-                if self.bootstrapped or self.meta.start_config_fingerprint == self.full_fingerprint:
+                if (self.bootstrapped and not self.risk_policy_review_required) or \
+                        (not self.bootstrapped and self.meta.start_config_fingerprint == self.full_fingerprint):
                     return CommandOutcome(CommandStatus.APPLIED, {"already_started": True, "grid_id": self.grid_id,
                                                                   "engine_state": self.engine_state.value})
                 # Before bootstrap a START for a changed config re-binds the acknowledgement to it (audited); the
@@ -1084,6 +1134,8 @@ class NeutralGridEngine:
             self.meta.stop_outcome = None
             self.meta.stop_reason = None
             result = {"started": True, "grid_id": self.grid_id}
+            if policy_revision is not None:
+                result["risk_policy_config_revision"] = policy_revision
             if rebind:
                 result["rebound"] = True
             return CommandOutcome(CommandStatus.APPLIED, result,
@@ -1092,7 +1144,7 @@ class NeutralGridEngine:
                                                         "config_fingerprint": self.full_fingerprint,
                                                         "material_id": self.meta.start_material_id,
                                                         "source": payload.get("source") or "operator"},
-                                                       **resumed)))
+                                                       **resumed)), reload=policy_revision is not None)
         if kind == CommandKind.PAUSE.value:
             self.meta.operator_paused = True
             self.meta.pause_reason = str(payload.get("reason") or "operator pause")
@@ -2772,6 +2824,8 @@ class NeutralGridEngine:
             tp.append("BASELINE_NOT_CONFIRMED")
         if not self.meta.started:
             entry.append("AWAITING_START")
+        if self.risk_policy_review_required:
+            entry.append("RISK_POLICY_REVIEW_REQUIRED")
         if not self.startup_reconciled:
             entry.append("RECONCILING")
             if not self.startup_scoped:

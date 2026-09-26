@@ -35,6 +35,7 @@ async def test_sample_preview_counts_range_caps_floors(make_web):
     assert p["reachable"] == {"P_min": "-330", "P_max": "220", "net_cap": "1000", "within_cap": True,
                               "baseline_used": "0"}
     assert p["gross"] == {"worst": "550", "cap": "1000", "within_cap": True}
+    assert p["directional_gross"] == {"active": False}
     assert p["leverage"] == {"configured": "5", "venue_max": "10"}
     n = p["notional"]
     assert n["mark"] == "5.4" and n["gross_notional_estimate"] == "2970.0"
@@ -47,6 +48,31 @@ async def test_sample_preview_counts_range_caps_floors(make_web):
     assert p["errors"] == [] and p["can_start"] is True
     assert p["live_confirmation_required"] is True
     assert any("40 из 55" in w for w in p["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_directional_preview_caps_each_side_and_allows_aggregate_above_cap(make_web):
+    cfg = sample_config(lower_price=Decimal("4.8"), upper_price=Decimal("5.9"), cell_count=11,
+                        order_amount_base=Decimal("100"), max_gross_position=Decimal("1000"),
+                        directional_gross_limits=True)
+    web = await make_web(None, config=cfg)
+    web.market["mid"] = Decimal("5.3")
+
+    p = await _preview(web)
+
+    assert p["gross"] == {"worst": "1100", "cap": "1000", "within_cap": None,
+                          "informational": True}
+    assert p["directional_gross"] == {
+        "active": True,
+        "long_entry_worst": "500",
+        "short_entry_worst": "600",
+        "cap_each": "1000",
+        "long_within_cap": True,
+        "short_within_cap": True,
+        "source": "full_grid_advisory",
+    }
+    assert not any("Худший gross 1100" in warning for warning in p["warnings"])
+    assert p["can_start"] is True
 
 
 @pytest.mark.asyncio
@@ -146,7 +172,8 @@ def test_ui_is_russian_responsive_and_has_preview_fields():
         assert label in html
     for label in ("Границы / ячейки", "Первые стороны BUY / SELL", "Вооружено / в очереди",
                   "Слоты: заняты / резерв / свободны", "Достижимые P_min … P_max", "Gross худший / лимит",
-                  "Плечо", "Notional / маржа (оценка)", "Минимумы площадки"):
+                  "Long входы / лимит", "Short входы / лимит", "Плечо",
+                  "Notional / маржа (оценка)", "Минимумы площадки"):
         assert label in js
     assert "@media (max-width: 700px)" in css and "prefers-color-scheme: dark" in css
     assert ":focus-visible" in css

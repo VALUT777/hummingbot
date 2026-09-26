@@ -407,8 +407,10 @@
     } else {
       g.hidden = true;
     }
-    var gross = s.gauges && s.gauges.gross;
-    kv($("risk-kv"), [
+    var gauges = s.gauges || {};
+    var gross = gauges.gross;
+    var directionMode = gauges.directional_mode || "legacy";
+    var riskRows = [
       ["Baseline B", s.baseline === null && s.bootstrap ? "не подтверждён" : s.baseline],
       ["Эффективный baseline", s.effective_baseline],
       ["Авторитетная позиция (биржа)", s.authoritative_net],
@@ -416,11 +418,23 @@
       ["P (журнал + baseline)", s.P],
       ["P_min … P_max", (s.P_min !== undefined || s.P_max !== undefined) ? txt(s.P_min) + " … " + txt(s.P_max) : null,
         net && net.breach === "yes" ? "bad" : ""],
-      ["Лимит |net|", s.max_abs_net_position],
-      ["Gross (худший)", s.gross_worst, gross && gross.breach === "yes" ? "bad" : ""],
-      ["Лимит gross", s.max_gross_position],
-      ["Якорь / bid / ask", s.anchor !== undefined ? txt(s.anchor) + " / " + txt(s.bid) + " / " + txt(s.ask) : null]
-    ]);
+      ["Лимит |net|", s.max_abs_net_position]
+    ];
+    if (directionMode === "active") {
+      riskRows.push(["Long входы / лимит", txt(s.long_entry_worst) + " / " + txt(s.max_gross_position),
+        gauges.long_entry && gauges.long_entry.breach === "yes" ? "bad" : ""]);
+      riskRows.push(["Short входы / лимит", txt(s.short_entry_worst) + " / " + txt(s.max_gross_position),
+        gauges.short_entry && gauges.short_entry.breach === "yes" ? "bad" : ""]);
+      riskRows.push(["Gross (сумма, справочно)", s.gross_worst]);
+    } else if (directionMode === "legacy") {
+      riskRows.push(["Gross (худший)", s.gross_worst, gross && gross.breach === "yes" ? "bad" : ""]);
+      riskRows.push(["Лимит gross", s.max_gross_position]);
+    } else {
+      riskRows.push(["Режим лимита gross", null, "warn"]);
+      riskRows.push(["Gross (сумма, справочно)", s.gross_worst]);
+    }
+    riskRows.push(["Якорь / bid / ask", s.anchor !== undefined ? txt(s.anchor) + " / " + txt(s.bid) + " / " + txt(s.ask) : null]);
+    kv($("risk-kv"), riskRows);
     renderBlockers(s);
     var slots = s.slots || {};
     kv($("orders-kv"), [
@@ -950,6 +964,7 @@
       warns.appendChild(wl);
     }
     var g = p.grid || {}, sides = p.sides || {}, adm = p.admission || {}, reach = p.reachable || {}, gross = p.gross || {};
+    var directional = p.directional_gross || { active: false };
     var lev = p.leverage || {}, notional = p.notional || {}, floors = p.floors || {}, base = p.baseline || {};
     var cards = $("preview-cards");
     clear(cards);
@@ -963,7 +978,16 @@
     cards.appendChild(statCard("Baseline B", base.signed, base.source === "missing" ? "не задан — введите при старте" : "источник: " + base.source));
     cards.appendChild(statCard("Достижимые P_min … P_max", txt(reach.P_min) + " … " + txt(reach.P_max),
       "лимит |net| ±" + txt(reach.net_cap) + " при B=" + txt(reach.baseline_used), reach.within_cap === false));
-    cards.appendChild(statCard("Gross худший / лимит", txt(gross.worst) + " / " + txt(gross.cap), null, gross.within_cap === false));
+    if (directional.active) {
+      cards.appendChild(statCard("Long входы / лимит", txt(directional.long_entry_worst) + " / " + txt(directional.cap_each),
+        "по фиксированной сетке; до старта — оценка", directional.long_within_cap === false));
+      cards.appendChild(statCard("Short входы / лимит", txt(directional.short_entry_worst) + " / " + txt(directional.cap_each),
+        "по фиксированной сетке; до старта — оценка", directional.short_within_cap === false));
+      cards.appendChild(statCard("Gross сумма (справочно)", txt(gross.worst),
+        "лимит применяется к каждому направлению отдельно"));
+    } else {
+      cards.appendChild(statCard("Gross худший / лимит", txt(gross.worst) + " / " + txt(gross.cap), null, gross.within_cap === false));
+    }
     cards.appendChild(statCard("Плечо", txt(lev.configured) + "x", "максимум площадки: " + txt(lev.venue_max)));
     cards.appendChild(statCard("Notional / маржа (оценка)", txt(notional.gross_notional_estimate) + " / " + txt(notional.margin_estimate),
       notional.warning || ("доступно " + txt(notional.available_collateral) + " USDG")));
@@ -1009,7 +1033,10 @@
       ["Сетка", txt(p.grid && p.grid.boundaries) + " цен / " + txt(p.grid && p.grid.cells) + " ячеек"],
       ["BUY / SELL (оценка)", p.sides && p.sides.known ? p.sides.buy + " / " + p.sides.sell : null],
       ["Вооружено / очередь", txt(p.admission && p.admission.armed) + " / " + txt(p.admission && p.admission.queued)],
-      ["Лимиты net / gross", txt(p.reachable && p.reachable.net_cap) + " / " + txt(p.gross && p.gross.cap)],
+      [directional.active ? "Лимиты net / long / short" : "Лимиты net / gross",
+        directional.active
+          ? txt(p.reachable && p.reachable.net_cap) + " / " + txt(directional.cap_each) + " / " + txt(directional.cap_each)
+          : txt(p.reachable && p.reachable.net_cap) + " / " + txt(p.gross && p.gross.cap)],
       ["Плечо", txt(p.leverage && p.leverage.configured) + "x"],
       ["Ревизии превью", "config r" + p.config_revision + " · engine r" + p.engine_revision],
       ["preview_id", p.preview_id]

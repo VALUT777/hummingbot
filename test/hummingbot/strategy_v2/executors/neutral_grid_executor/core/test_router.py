@@ -140,6 +140,15 @@ class TestFifo(unittest.TestCase):
 
 
 class TestCapsAndHeadroom(unittest.TestCase):
+    def test_directional_mode_admits_opposite_entries_with_aggregate_above_cap(self):
+        limits = risk.RiskLimits(D("1000"), D("20"), directional_gross_limits=True)
+        ep = risk.RiskEndpoints(P=D("0"), P_min=D("-10"), P_max=D("15"), gross_worst=D("25"),
+                                long_entry_worst=D("15"), short_entry_worst=D("10"))
+        candidates = [entry("buy", Side.BUY, "5.1", qty="5", cell=1, seq=1),
+                      entry("sell", Side.SELL, "5.9", qty="10", cell=50, seq=2)]
+        plan = plan_submits(candidates, [], endpoints=ep, limits=limits)
+        self.assertEqual(("buy", "sell"), plan.submits)
+
     def test_entries_respect_net_and_gross_caps_across_the_plan(self):
         ep = risk.RiskEndpoints(P=D("0"), P_min=D("0"), P_max=D("985"), gross_worst=D("0"))
         cands = [entry("e1", Side.BUY, "5.1", cell=1, seq=1), entry("e2", Side.BUY, "5.0", cell=0, seq=2)]

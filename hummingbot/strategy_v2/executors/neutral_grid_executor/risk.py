@@ -67,18 +67,23 @@ class RiskEndpoints(NamedTuple):
     P_min: Decimal
     P_max: Decimal
     gross_worst: Decimal
+    long_entry_worst: Optional[Decimal] = None
+    short_entry_worst: Optional[Decimal] = None
 
 
 @dataclass(frozen=True)
 class RiskLimits:
     max_abs_net_position: Decimal
     max_gross_position: Decimal
+    directional_gross_limits: bool = False
 
     def __post_init__(self):
         for name in ("max_abs_net_position", "max_gross_position"):
             value = getattr(self, name)
             if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
                 raise ValueError(f"{name} must be a positive finite Decimal, got {value!r}")
+        if type(self.directional_gross_limits) is not bool:
+            raise ValueError("directional_gross_limits must be a bool")
 
 
 def _dec(value: Any, name: str) -> Decimal:
@@ -88,7 +93,8 @@ def _dec(value: Any, name: str) -> Decimal:
 
 
 def endpoints(baseline: Decimal, confirmed_buys: Decimal, confirmed_sells: Decimal, open_legs: Iterable[OpenLeg],
-              *, unpaired: Decimal = ZERO) -> RiskEndpoints:
+              *, unpaired: Decimal = ZERO, long_unpaired: Optional[Decimal] = None,
+              short_unpaired: Optional[Decimal] = None) -> RiskEndpoints:
     """Conservative reachable net interval and worst-case gross (NG-RISK-002).
 
     ``unpaired`` is the confirmed virtual gross ``sum(E - X - S)`` over all durable cycles (baseline excluded).
@@ -97,6 +103,16 @@ def endpoints(baseline: Decimal, confirmed_buys: Decimal, confirmed_sells: Decim
     buys = _dec(confirmed_buys, "confirmed_buys")
     sells = _dec(confirmed_sells, "confirmed_sells")
     gross = _dec(unpaired, "unpaired")
+    if gross < ZERO:
+        raise ValueError("unpaired must be non-negative")
+    if long_unpaired is None and short_unpaired is None and gross == ZERO:
+        long_unpaired = short_unpaired = ZERO
+    if (long_unpaired is None) != (short_unpaired is None):
+        raise ValueError("long_unpaired and short_unpaired must be given together")
+    long_worst = None if long_unpaired is None else _dec(long_unpaired, "long_unpaired")
+    short_worst = None if short_unpaired is None else _dec(short_unpaired, "short_unpaired")
+    if long_worst is not None and (long_worst < ZERO or short_worst < ZERO or long_worst + short_worst != gross):
+        raise ValueError("directional unpaired exposure must be non-negative and sum to unpaired")
     p = b + buys - sells
     up = ZERO
     down = ZERO
@@ -111,7 +127,12 @@ def endpoints(baseline: Decimal, confirmed_buys: Decimal, confirmed_sells: Decim
             down += leg.remaining
         if leg.role != LegRole.TP:
             gross_extra += leg.remaining
-    return RiskEndpoints(P=p, P_min=p - down, P_max=p + up, gross_worst=gross + gross_extra)
+            if leg.side == Side.BUY and long_worst is not None:
+                long_worst += leg.remaining
+            elif leg.side == Side.SELL and short_worst is not None:
+                short_worst += leg.remaining
+    return RiskEndpoints(P=p, P_min=p - down, P_max=p + up, gross_worst=gross + gross_extra,
+                         long_entry_worst=long_worst, short_entry_worst=short_worst)
 
 
 def endpoints_from_ledgers(baseline: Decimal, ledgers: Sequence[Any],
@@ -120,10 +141,16 @@ def endpoints_from_ledgers(baseline: Decimal, ledgers: Sequence[Any],
     buys = ZERO
     sells = ZERO
     unpaired = ZERO
+    long_unpaired = ZERO
+    short_unpaired = ZERO
     legs: List[OpenLeg] = list(extra_open_legs)
     for ledger in ledgers:
         for cycle in ledger.cycles:
             unpaired += abs(cycle.open_obligation)
+            if cycle.entry_side == Side.BUY:
+                long_unpaired += abs(cycle.open_obligation)
+            else:
+                short_unpaired += abs(cycle.open_obligation)
             if cycle.entry_side == Side.BUY:
                 buys += cycle.external_entered
             else:
@@ -140,7 +167,8 @@ def endpoints_from_ledgers(baseline: Decimal, ledgers: Sequence[Any],
                     sells += leg.filled
                 if not leg.is_final:
                     legs.append(OpenLeg.from_leg(leg))
-    return endpoints(baseline, buys, sells, legs, unpaired=unpaired)
+    return endpoints(baseline, buys, sells, legs, unpaired=unpaired,
+                     long_unpaired=long_unpaired, short_unpaired=short_unpaired)
 
 
 def obligation_totals(ledgers: Sequence[Any]) -> Tuple[Decimal, Decimal]:
@@ -197,8 +225,16 @@ def check_submit(ep: RiskEndpoints, side: Side, qty: Decimal, role: Optional[Leg
         return f"NET_CAP_LONG:P_max {ep.P_max}+{q}>{cap}"
     if side == Side.SELL and ep.P_min - q < -cap:
         return f"NET_CAP_SHORT:P_min {ep.P_min}-{q}<-{cap}"
-    if role != LegRole.TP and ep.gross_worst + q > limits.max_gross_position:
-        return f"GROSS_CAP:{ep.gross_worst}+{q}>{limits.max_gross_position}"
+    if role != LegRole.TP:
+        if limits.directional_gross_limits:
+            directional = ep.long_entry_worst if side == Side.BUY else ep.short_entry_worst
+            if directional is None:
+                return "GROSS_CAP_DIRECTIONAL_UNKNOWN"
+            if directional + q > limits.max_gross_position:
+                label = "GROSS_CAP_LONG" if side == Side.BUY else "GROSS_CAP_SHORT"
+                return f"{label}:{directional}+{q}>{limits.max_gross_position}"
+        elif ep.gross_worst + q > limits.max_gross_position:
+            return f"GROSS_CAP:{ep.gross_worst}+{q}>{limits.max_gross_position}"
     return None
 
 
@@ -210,6 +246,10 @@ def add_to_endpoints(ep: RiskEndpoints, side: Side, qty: Decimal, role: Optional
         ep = ep._replace(P_min=ep.P_min - qty)
     if role != LegRole.TP:
         ep = ep._replace(gross_worst=ep.gross_worst + qty)
+        if side == Side.BUY and ep.long_entry_worst is not None:
+            ep = ep._replace(long_entry_worst=ep.long_entry_worst + qty)
+        elif side == Side.SELL and ep.short_entry_worst is not None:
+            ep = ep._replace(short_entry_worst=ep.short_entry_worst + qty)
     return ep
 
 
@@ -220,7 +260,15 @@ def cap_violations(ep: RiskEndpoints, limits: RiskLimits) -> List[str]:
         out.append(f"NET_CAP_LONG_EXCEEDED:{ep.P_max}>{limits.max_abs_net_position}")
     if ep.P_min < -limits.max_abs_net_position:
         out.append(f"NET_CAP_SHORT_EXCEEDED:{ep.P_min}<-{limits.max_abs_net_position}")
-    if ep.gross_worst > limits.max_gross_position:
+    if limits.directional_gross_limits:
+        if ep.long_entry_worst is None or ep.short_entry_worst is None:
+            out.append("GROSS_CAP_DIRECTIONAL_UNKNOWN")
+        else:
+            if ep.long_entry_worst > limits.max_gross_position:
+                out.append(f"GROSS_CAP_LONG_EXCEEDED:{ep.long_entry_worst}>{limits.max_gross_position}")
+            if ep.short_entry_worst > limits.max_gross_position:
+                out.append(f"GROSS_CAP_SHORT_EXCEEDED:{ep.short_entry_worst}>{limits.max_gross_position}")
+    elif ep.gross_worst > limits.max_gross_position:
         out.append(f"GROSS_CAP_EXCEEDED:{ep.gross_worst}>{limits.max_gross_position}")
     return out
 

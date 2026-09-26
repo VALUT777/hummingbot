@@ -62,6 +62,7 @@ def test_manual_buy_is_atomically_adopted_into_new_cell_and_routes_five_tps(tmp_
         record = h.engine.store.get_command(idempotency_key="adopt-manual-buy")
         assert record.status == CommandStatus.APPLIED, record.result
         assert h.engine.effective_baseline == D("0") and h.engine.endpoints.P == D("500")
+        assert h.engine.endpoints.long_entry_worst == D("500")
         cycle = h.engine.cells[10].current
         assert cycle.E == D("100") and cycle.open_obligation == D("100") and cycle.entries == []
 

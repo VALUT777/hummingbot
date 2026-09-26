@@ -61,7 +61,7 @@ def grid_config_to_json(cfg: GridConfig) -> Dict[str, Any]:
     """Exact JSON form of a GridConfig (Decimals as strings)."""
     out: Dict[str, Any] = {}
     for name, value in cfg.__dict__.items():
-        if name == "directional_outside_bounds_entries" and value is False:
+        if name in ("directional_outside_bounds_entries", "directional_gross_limits") and value is False:
             continue  # preserve canonical legacy config JSON; true is explicitly proof-bound
         if isinstance(value, Decimal):
             out[name] = str(value)
@@ -199,6 +199,7 @@ class NeutralGridExecutorConfig(ExecutorConfigBase):
     tp_gtt_seconds: int = 28 * 24 * 3600
     enabled: bool = False
     directional_outside_bounds_entries: bool = False
+    directional_gross_limits: bool = False
     db_path: Optional[str] = None                       # None = the store's default per account/market
     unknown_resolution_delay_s: Decimal = Decimal("120")   # see EngineOptions.unknown_resolution_delay_s
     # Explicit operator confirmations collected by the launcher (never implied by enabled=true).
@@ -229,4 +230,5 @@ class NeutralGridExecutorConfig(ExecutorConfigBase):
             entry_order_type=self.entry_order_type, tp_order_type=self.tp_order_type,
             tp_gtt_seconds=self.tp_gtt_seconds, enabled=self.enabled,
             directional_outside_bounds_entries=self.directional_outside_bounds_entries,
+            directional_gross_limits=self.directional_gross_limits,
         )

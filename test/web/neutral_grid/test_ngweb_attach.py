@@ -212,6 +212,26 @@ def test_engine_config_parser_defaults_omitted_legacy_directional_flag_to_false(
     assert fingerprint == core_grid.config_fingerprint(cfg)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_engine_config_parser_round_trips_directional_gross_limits(enabled):
+    published = engine_config_json(directional_gross_limits=enabled)
+
+    cfg, fingerprint = engine_config_from_snapshot({"summary": {"engine_config": published}})
+
+    assert cfg.directional_gross_limits is enabled
+    assert fingerprint == core_grid.config_fingerprint(cfg)
+
+
+def test_engine_config_parser_defaults_omitted_legacy_directional_gross_limits_to_false():
+    published = engine_config_json(directional_gross_limits=False)
+    published.pop("directional_gross_limits")
+
+    cfg, fingerprint = engine_config_from_snapshot({"summary": {"engine_config": published}})
+
+    assert cfg.directional_gross_limits is False
+    assert fingerprint == core_grid.config_fingerprint(cfg)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kwargs,needle", [
     ({"supports": (True, False)}, "post"),              # LIMIT_MAKER entry but the venue says no post-only

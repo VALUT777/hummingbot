@@ -138,9 +138,26 @@ def summary_view(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return {}
     payload = snapshot.get("summary") or {}
     view = dict(payload)
+    directional_flag = payload.get("directional_gross_limits_active")
+    if directional_flag is True:
+        directional_mode = "active"
+        gross_gauge = None  # the sum is informational when each direction has its own cap
+        long_gauge = ratio_gauge(payload.get("long_entry_worst"), payload.get("max_gross_position"))
+        short_gauge = ratio_gauge(payload.get("short_entry_worst"), payload.get("max_gross_position"))
+    elif directional_flag is False or "directional_gross_limits_active" not in payload:
+        # Legacy snapshots omitted the flag; an explicit null or other malformed value is unknown.
+        directional_mode = "legacy"
+        gross_gauge = ratio_gauge(payload.get("gross_worst"), payload.get("max_gross_position"))
+        long_gauge = short_gauge = None
+    else:
+        directional_mode = "unknown"
+        gross_gauge = long_gauge = short_gauge = None
     view["gauges"] = {
         "net": net_gauge(payload),
-        "gross": ratio_gauge(payload.get("gross_worst"), payload.get("max_gross_position")),
+        "gross": gross_gauge,
+        "long_entry": long_gauge,
+        "short_entry": short_gauge,
+        "directional_mode": directional_mode,
     }
     return view
 

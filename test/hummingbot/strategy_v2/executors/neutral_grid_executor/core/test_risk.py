@@ -54,9 +54,11 @@ class TestEndpoints(unittest.TestCase):
         h.fill(e, "4")
         ep = risk.endpoints_from_ledgers(D("0"), [h.ledger])
         self.assertEqual((D("4"), D("10")), (ep.P, ep.P_max))        # 4 confirmed + 6 still executable
+        self.assertEqual((D("10"), D("0")), (ep.long_entry_worst, ep.short_entry_worst))
         h.ledger.set_state(e, OrderState.CANCEL_PENDING)
         h.ledger.set_state(e, OrderState.TERMINAL_UNKNOWN)            # cancel ack is not a proof
-        self.assertEqual(D("10"), risk.endpoints_from_ledgers(D("0"), [h.ledger]).P_max)
+        pending = risk.endpoints_from_ledgers(D("0"), [h.ledger])
+        self.assertEqual((D("10"), D("10")), (pending.P_max, pending.long_entry_worst))
         h.ledger.confirm_terminal(e, D("4"))
         self.assertEqual(D("4"), risk.endpoints_from_ledgers(D("0"), [h.ledger]).P_max)
 
@@ -80,6 +82,7 @@ class TestEndpoints(unittest.TestCase):
         ep = risk.endpoints(D("0"), D("0"), D("0"), [OpenLeg(Side.SELL, D("7"), role=None,
                                                              state=OrderState.SUBMIT_UNKNOWN)])
         self.assertEqual((D("-7"), D("0"), D("7")), (ep.P_min, ep.P_max, ep.gross_worst))
+        self.assertEqual((D("0"), D("7")), (ep.long_entry_worst, ep.short_entry_worst))
         tp = risk.endpoints(D("0"), D("0"), D("0"), [OpenLeg(Side.SELL, D("7"), role=LegRole.TP)])
         self.assertEqual((D("-7"), D("0")), (tp.P_min, tp.gross_worst))  # TP moves net, adds no gross
 
@@ -88,6 +91,13 @@ class TestEndpoints(unittest.TestCase):
             risk.endpoints(0.0, D("0"), D("0"), [])
         with self.assertRaises(ValueError):
             RiskLimits(max_abs_net_position=1000, max_gross_position=D("1"))
+        with self.assertRaises(ValueError):
+            RiskLimits(D("1"), D("1"), directional_gross_limits=1)
+        with self.assertRaises(ValueError):
+            risk.endpoints(D("0"), D("0"), D("0"), [], unpaired=D("1"),
+                           long_unpaired=D("0"), short_unpaired=D("0"))
+        with self.assertRaises(ValueError):
+            risk.endpoints(D("0"), D("0"), D("0"), [], unpaired=D("-1"))
 
 
 class TestCaps(unittest.TestCase):
@@ -117,6 +127,25 @@ class TestCaps(unittest.TestCase):
         self.assertTrue(risk.check_submit(ep, Side.BUY, D("10"), LegRole.ENTRY, limits).startswith("GROSS_CAP"))
         self.assertIsNone(risk.check_submit(ep, Side.SELL, D("10"), LegRole.TP, limits))  # TP never blocked by gross
 
+    def test_directional_gross_caps_are_independent_and_unknown_is_fail_closed(self):
+        ep = risk.RiskEndpoints(P=D("400"), P_min=D("-600"), P_max=D("400"), gross_worst=D("1000"),
+                                long_entry_worst=D("400"), short_entry_worst=D("600"))
+        limits = RiskLimits(D("1000"), D("1000"), directional_gross_limits=True)
+        self.assertIsNone(risk.check_submit(ep, Side.BUY, D("100"), LegRole.ENTRY, limits))
+        reserved = risk.add_to_endpoints(ep, Side.BUY, D("100"), LegRole.ENTRY)
+        self.assertEqual((D("500"), D("600"), D("1100")),
+                         (reserved.long_entry_worst, reserved.short_entry_worst, reserved.gross_worst))
+        self.assertTrue(risk.check_submit(reserved._replace(P_min=D("0")), Side.SELL, D("401"),
+                                          LegRole.ENTRY, limits).startswith(
+            "GROSS_CAP_SHORT"))
+        legacy = risk.RiskEndpoints(P=D("0"), P_min=D("0"), P_max=D("0"), gross_worst=D("0"))
+        self.assertEqual("GROSS_CAP_DIRECTIONAL_UNKNOWN", risk.check_submit(
+            legacy, Side.BUY, D("1"), LegRole.ENTRY, limits))
+        unclassified = risk.endpoints(D("0"), D("0"), D("0"), [], unpaired=D("10"))
+        self.assertIsNone(unclassified.long_entry_worst)
+        self.assertEqual("GROSS_CAP_DIRECTIONAL_UNKNOWN", risk.check_submit(
+            unclassified, Side.SELL, D("1"), LegRole.ENTRY, limits))
+
     def test_ac27_virtual_tp_crosses_zero_non_reduce_only(self):
         long_cell = Harness(CellSpec(1, D("5.0181"), D("5.0363"), Side.BUY))
         short_cell = Harness(CellSpec(40, D("5.7272"), D("5.7454"), Side.SELL))
@@ -129,11 +158,13 @@ class TestCaps(unittest.TestCase):
         self.assertEqual((Side.SELL, D("10"), False), (req.side, req.amount, req.reduce_only))
         ep = risk.endpoints_from_ledgers(D("0"), [long_cell.ledger, short_cell.ledger])
         self.assertEqual((D("0"), D("-10")), (ep.P, ep.P_min))        # SELL TP at venue net 0 can go net short
+        self.assertEqual((D("10"), D("10")), (ep.long_entry_worst, ep.short_entry_worst))
         long_cell.ledger.record_transport(tp, TransportResult(TransportOutcome.ACCEPTED, exchange_order_id="t"))
         long_cell.fill(tp, "10")
         long_cell.ledger.confirm_terminal(tp, D("10"))
         ep = risk.endpoints_from_ledgers(D("0"), [long_cell.ledger, short_cell.ledger])
         self.assertEqual((D("-10"), D("10")), (ep.P, ep.gross_worst))  # venue short 10; only short cell unpaired
+        self.assertEqual((D("0"), D("10")), (ep.long_entry_worst, ep.short_entry_worst))
         self.assertTrue(long_cell.ledger.can_release(True).ok)
         self.assertFalse(short_cell.ledger.can_release(True).ok)
 

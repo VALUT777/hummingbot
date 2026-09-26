@@ -64,10 +64,10 @@ class RealClock:
 
 
 _POLICY_FIELDS = {"entry_order_type", "tp_order_type"}
-_BOOL_FIELDS = {"enabled", "directional_outside_bounds_entries"}
+_BOOL_FIELDS = {"enabled", "directional_outside_bounds_entries", "directional_gross_limits"}
 _STR_FIELDS = {"grid_id", "connector_name", "trading_pair"}
 _NULLABLE = {"expected_initial_position"}
-_LEGACY_DEFAULTS = {"directional_outside_bounds_entries": False}
+_LEGACY_DEFAULTS = {"directional_outside_bounds_entries": False, "directional_gross_limits": False}
 
 
 def grid_config_from_engine_json(data: Dict[str, Any]) -> GridConfig:
